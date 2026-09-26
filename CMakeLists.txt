@@ -38,4 +38,11 @@ if(WARPDECODE_BUILD_ENGINE)
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
   )
   set_target_properties(warpdecode PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+  add_executable(warpdecode-lowbit-test tests/lowbit_cuda_test.cu)
+  target_include_directories(warpdecode-lowbit-test PRIVATE src)
+  target_compile_options(warpdecode-lowbit-test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
+  )
+  set_target_properties(warpdecode-lowbit-test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 endif()
