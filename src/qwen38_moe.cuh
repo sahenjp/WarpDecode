@@ -54,7 +54,7 @@ __global__ void q38_topk_softmax_kernel(
     int best_id[KMAX];
 #pragma unroll
     for (int j = 0; j < KMAX; ++j) {
-        best[j] = -CUDART_INF_F;
+        best[j] = -3.402823466e+38F;
         best_id[j] = -1;
     }
 
