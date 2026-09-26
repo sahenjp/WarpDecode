@@ -294,7 +294,7 @@ private:
 };
 
 inline void q38_select_experts(
-        const LowBitMatrix & router,
+        const GpuMatrix & router,
         const __half * x,
         Qwen38MoeScratch & scratch,
         float expert_scale,
@@ -303,7 +303,7 @@ inline void q38_select_experts(
         throw std::runtime_error("Qwen3.8 router matrix geometry mismatch");
     }
 
-    launch_lowbit_gemv_float(router, x, scratch.d_logits(), stream);
+    launch_matrix_gemv_float(router, x, scratch.d_logits(), stream);
 
     q38_topk_softmax_kernel<<<1, 1, 0, stream>>>(
         scratch.d_logits(), scratch.n_experts(), scratch.k(), expert_scale,
@@ -336,7 +336,7 @@ inline void q38_finish_moe(
 inline void run_qwen38_routed_moe_fused(
         int layer,
         const __half * x,
-        const LowBitMatrix & router,
+        const GpuMatrix & router,
         const TensorInfo & gate_up_exps,
         const TensorInfo & down_exps,
         GpuFusedExpertCache & cache,
@@ -380,7 +380,7 @@ inline void run_qwen38_routed_moe_fused(
 inline void run_qwen38_routed_moe_separate(
         int layer,
         const __half * x,
-        const LowBitMatrix & router,
+        const GpuMatrix & router,
         const TensorInfo & gate_exps,
         const TensorInfo & up_exps,
         const TensorInfo & down_exps,
