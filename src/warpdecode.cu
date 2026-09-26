@@ -3,6 +3,7 @@
 #include "lowbit.cuh"
 #include "qwen38_layout.hpp"
 #include "qwen38_hc.cuh"
+#include "qwen38_gdn.cuh"
 #include "qwen38_moe.cuh"
 #include "qwen38_tuning.hpp"
 
