@@ -198,7 +198,7 @@ ModelInfo inspect_model(const fs::path& p) {
     std::error_code ec;
     m.bytes = fs::file_size(p, ec);
     try {
-        wd::GgufFile g(p.string());
+        wd::GgufFile g(p.string(), false);
         m.profile = wd::profile_model(g, p);
         m.arch = m.profile.arch;
         m.quant = m.profile.quant_hint;
