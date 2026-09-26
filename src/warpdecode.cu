@@ -2,7 +2,6 @@
 #include "gpu_arch.hpp"
 #include "lowbit.cuh"
 #include "qwen38_layout.hpp"
-#include "qwen38_decode.cuh"
 #include "qwen38_hc.cuh"
 #include "qwen38_gdn.cuh"
 #include "qwen38_forward.cuh"
