@@ -131,12 +131,18 @@ private:
 };
 
 struct MetaValue {
-    enum class Kind { None, U64, I64, F64, Bool, String } kind = Kind::None;
+    enum class Kind {
+        None, U64, I64, F64, Bool, String,
+        U64Array, I64Array, F64Array,
+    } kind = Kind::None;
     uint64_t u64 = 0;
     int64_t i64 = 0;
     double f64 = 0.0;
     bool boolean = false;
     std::string str;
+    std::vector<uint64_t> u64s;
+    std::vector<int64_t> i64s;
+    std::vector<double> f64s;
 };
 
 inline MetaValue read_scalar(Cursor& c, GgufValueType t);
@@ -156,6 +162,52 @@ inline void skip_value(Cursor& c, GgufValueType t) {
             break;
         }
         default: throw std::runtime_error("未対応のGGUFメタデータ型です");
+    }
+}
+
+inline MetaValue read_array(Cursor& c) {
+    const auto elem = static_cast<GgufValueType>(c.read<uint32_t>());
+    const uint64_t n = c.read<uint64_t>();
+    if (n > (1ull << 30)) throw std::runtime_error("GGUF配列が異常に大きいです");
+
+    MetaValue out;
+    auto reserve_size = static_cast<size_t>(n);
+    switch (elem) {
+        case GgufValueType::U8:
+        case GgufValueType::U16:
+        case GgufValueType::U32:
+        case GgufValueType::U64:
+        case GgufValueType::Bool: {
+            out.kind = MetaValue::Kind::U64Array;
+            out.u64s.reserve(reserve_size);
+            for (uint64_t i = 0; i < n; ++i) {
+                auto v = read_scalar(c, elem);
+                out.u64s.push_back(v.kind == MetaValue::Kind::Bool ? (v.boolean ? 1u : 0u) : v.u64);
+            }
+            return out;
+        }
+        case GgufValueType::I8:
+        case GgufValueType::I16:
+        case GgufValueType::I32:
+        case GgufValueType::I64: {
+            out.kind = MetaValue::Kind::I64Array;
+            out.i64s.reserve(reserve_size);
+            for (uint64_t i = 0; i < n; ++i) out.i64s.push_back(read_scalar(c, elem).i64);
+            return out;
+        }
+        case GgufValueType::F32:
+        case GgufValueType::F64: {
+            out.kind = MetaValue::Kind::F64Array;
+            out.f64s.reserve(reserve_size);
+            for (uint64_t i = 0; i < n; ++i) out.f64s.push_back(read_scalar(c, elem).f64);
+            return out;
+        }
+        case GgufValueType::String:
+        case GgufValueType::Array:
+            for (uint64_t i = 0; i < n; ++i) skip_value(c, elem);
+            return out;
+        default:
+            throw std::runtime_error("未対応のGGUF配列要素型です");
     }
 }
 
@@ -261,6 +313,52 @@ public:
         return it->second.str;
     }
 
+    std::vector<uint64_t> uint_array_meta(const std::string& key) const {
+        const auto& v = meta(key);
+        if (v.kind == MetaValue::Kind::U64Array) return v.u64s;
+        if (v.kind == MetaValue::Kind::I64Array) {
+            std::vector<uint64_t> out;
+            out.reserve(v.i64s.size());
+            for (int64_t x : v.i64s) {
+                if (x < 0) throw std::runtime_error("負数をuint配列として取得できません: " + key);
+                out.push_back(static_cast<uint64_t>(x));
+            }
+            return out;
+        }
+        throw std::runtime_error("整数配列メタデータではありません: " + key);
+    }
+
+    std::vector<int64_t> int_array_meta(const std::string& key) const {
+        const auto& v = meta(key);
+        if (v.kind == MetaValue::Kind::I64Array) return v.i64s;
+        if (v.kind == MetaValue::Kind::U64Array) {
+            std::vector<int64_t> out;
+            out.reserve(v.u64s.size());
+            for (uint64_t x : v.u64s) {
+                if (x > static_cast<uint64_t>(INT64_MAX)) throw std::runtime_error("int64に収まらない配列値です: " + key);
+                out.push_back(static_cast<int64_t>(x));
+            }
+            return out;
+        }
+        throw std::runtime_error("整数配列メタデータではありません: " + key);
+    }
+
+    std::vector<double> number_array_meta(const std::string& key) const {
+        const auto& v = meta(key);
+        if (v.kind == MetaValue::Kind::F64Array) return v.f64s;
+        if (v.kind == MetaValue::Kind::I64Array) {
+            std::vector<double> out; out.reserve(v.i64s.size());
+            for (int64_t x : v.i64s) out.push_back(static_cast<double>(x));
+            return out;
+        }
+        if (v.kind == MetaValue::Kind::U64Array) {
+            std::vector<double> out; out.reserve(v.u64s.size());
+            for (uint64_t x : v.u64s) out.push_back(static_cast<double>(x));
+            return out;
+        }
+        throw std::runtime_error("数値配列メタデータではありません: " + key);
+    }
+
     bool has_meta(const std::string& key) const { return metadata_.count(key) != 0; }
     const std::vector<TensorInfo>& tensors() const { return tensors_; }
     uint32_t version() const { return version_; }
@@ -291,7 +389,7 @@ private:
             const std::string key = c.read_string();
             const auto type = static_cast<GgufValueType>(c.read<uint32_t>());
             if (type == GgufValueType::Array) {
-                skip_value(c, type);
+                metadata_.emplace(key, read_array(c));
             } else {
                 metadata_.emplace(key, read_scalar(c, type));
             }
