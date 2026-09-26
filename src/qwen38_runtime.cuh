@@ -118,6 +118,9 @@ inline Qwen38Runtime load_qwen38_runtime(
 
     rt.layers.reserve(static_cast<size_t>(rt.layout.trunk_layers));
     bool expert_mode_set = false;
+    size_t max_gate_bytes = 0;
+    size_t max_up_bytes = 0;
+    size_t max_down_bytes = 0;
 
     for (int il = 0; il < rt.layout.trunk_layers; ++il) {
         Qwen38RuntimeLayer layer;
@@ -138,6 +141,11 @@ inline Qwen38Runtime load_qwen38_runtime(
         layer.routed = qwen38_moe_tensors(g, il);
         qwen38_check_expert_tensors(layer.routed, rt.layout, il);
         const bool fused = layer.routed.fused_gate_up();
+        if (!fused) {
+            max_gate_bytes = std::max(max_gate_bytes, expert_slice(*layer.routed.gate, 0).bytes);
+            max_up_bytes = std::max(max_up_bytes, expert_slice(*layer.routed.up, 0).bytes);
+            max_down_bytes = std::max(max_down_bytes, expert_slice(*layer.routed.down, 0).bytes);
+        }
         if (!expert_mode_set) {
             rt.fused_experts = fused;
             expert_mode_set = true;
@@ -165,7 +173,8 @@ inline Qwen38Runtime load_qwen38_runtime(
     } else {
         rt.expert_cache.initialize(
             static_cast<size_t>(rt.tuning.expert_cache_mib),
-            *sample.gate, *sample.up, *sample.down);
+            *sample.gate, *sample.up, *sample.down,
+            max_gate_bytes, max_up_bytes, max_down_bytes);
         rt.expert_cache_slots = rt.expert_cache.slot_count();
     }
 
