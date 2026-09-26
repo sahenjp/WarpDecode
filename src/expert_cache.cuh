@@ -234,4 +234,163 @@ private:
     std::unordered_map<uint64_t, size_t> index_;
 };
 
+struct ExpertDeviceFusedWeights {
+    LowBitMatrix gate_up;
+    LowBitMatrix down;
+    bool cache_hit = false;
+    size_t slot = 0;
+};
+
+class GpuFusedExpertCache {
+public:
+    GpuFusedExpertCache() = default;
+    GpuFusedExpertCache(const GpuFusedExpertCache &) = delete;
+    GpuFusedExpertCache & operator=(const GpuFusedExpertCache &) = delete;
+
+    ~GpuFusedExpertCache() {
+        if (pool_) cudaFree(pool_);
+    }
+
+    void initialize(
+            size_t capacity_mib,
+            const TensorInfo & sample_gate_up,
+            const TensorInfo & sample_down) {
+        if (pool_) throw std::runtime_error("fused expert cache already initialized");
+        if (capacity_mib == 0) throw std::runtime_error("fused expert cache capacity is zero");
+
+        const auto gu = expert_slice(sample_gate_up, 0);
+        const auto d  = expert_slice(sample_down, 0);
+
+        gate_up_bytes_ = gu.bytes;
+        down_bytes_ = d.bytes;
+        slot_bytes_ = gate_up_bytes_ + down_bytes_;
+        if (slot_bytes_ == 0) throw std::runtime_error("fused expert cache slot is empty");
+
+        gate_up_rows_ = gu.rows;
+        gate_up_cols_ = gu.cols;
+        gate_up_type_ = gu.type;
+        down_rows_ = d.rows;
+        down_cols_ = d.cols;
+        down_type_ = d.type;
+
+        const size_t capacity_bytes = capacity_mib * 1024ull * 1024ull;
+        n_slots_ = capacity_bytes / slot_bytes_;
+        if (n_slots_ == 0) {
+            throw std::runtime_error("fused expert cache capacity is smaller than one expert slot");
+        }
+
+        const cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&pool_), n_slots_ * slot_bytes_);
+        if (e != cudaSuccess) {
+            throw std::runtime_error(std::string("cudaMalloc fused expert cache failed: ") + cudaGetErrorString(e));
+        }
+        slots_.resize(n_slots_);
+    }
+
+    size_t slot_count() const { return n_slots_; }
+    size_t resident_count() const { return index_.size(); }
+
+    ExpertDeviceFusedWeights acquire(
+            int layer,
+            int expert,
+            const TensorInfo & gate_up,
+            const TensorInfo & down,
+            cudaStream_t stream) {
+        if (!pool_) throw std::runtime_error("fused expert cache is not initialized");
+
+        const uint64_t key = make_key(layer, expert);
+        ++clock_;
+
+        auto it = index_.find(key);
+        if (it != index_.end()) {
+            slots_[it->second].last_use = clock_;
+            return views(it->second, true);
+        }
+
+        const auto guh = expert_slice(gate_up, expert);
+        const auto dh = expert_slice(down, expert);
+        if (guh.bytes != gate_up_bytes_ || guh.rows != gate_up_rows_ || guh.cols != gate_up_cols_ || guh.type != gate_up_type_ ||
+            dh.bytes != down_bytes_ || dh.rows != down_rows_ || dh.cols != down_cols_ || dh.type != down_type_) {
+            throw std::runtime_error("fused expert tensor geometry changed between layers");
+        }
+
+        const size_t slot = choose_slot();
+        Slot & meta = slots_[slot];
+        if (meta.valid) index_.erase(meta.key);
+
+        uint8_t * base = pool_ + slot * slot_bytes_;
+        copy_async(base, guh.data, gate_up_bytes_, stream, gate_up.name);
+        copy_async(base + gate_up_bytes_, dh.data, down_bytes_, stream, down.name);
+
+        meta.key = key;
+        meta.last_use = clock_;
+        meta.valid = true;
+        index_[key] = slot;
+        return views(slot, false);
+    }
+
+private:
+    struct Slot {
+        uint64_t key = 0;
+        uint64_t last_use = 0;
+        bool valid = false;
+    };
+
+    static uint64_t make_key(int layer, int expert) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(layer)) << 32)
+             | static_cast<uint32_t>(expert);
+    }
+
+    static void copy_async(
+            void * dst,
+            const void * src,
+            size_t bytes,
+            cudaStream_t stream,
+            const std::string & name) {
+        const cudaError_t e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
+        if (e != cudaSuccess) {
+            throw std::runtime_error("fused expert stage failed for " + name + ": " + cudaGetErrorString(e));
+        }
+    }
+
+    size_t choose_slot() const {
+        for (size_t i = 0; i < slots_.size(); ++i) if (!slots_[i].valid) return i;
+        size_t best = 0;
+        uint64_t oldest = std::numeric_limits<uint64_t>::max();
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            if (slots_[i].last_use < oldest) {
+                oldest = slots_[i].last_use;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    ExpertDeviceFusedWeights views(size_t slot, bool hit) const {
+        uint8_t * base = pool_ + slot * slot_bytes_;
+        ExpertDeviceFusedWeights out;
+        out.gate_up = borrow_lowbit_matrix(
+            base, gate_up_rows_, gate_up_cols_, gate_up_type_, gate_up_bytes_);
+        out.down = borrow_lowbit_matrix(
+            base + gate_up_bytes_, down_rows_, down_cols_, down_type_, down_bytes_);
+        out.cache_hit = hit;
+        out.slot = slot;
+        return out;
+    }
+
+    uint8_t * pool_ = nullptr;
+    size_t n_slots_ = 0;
+    size_t slot_bytes_ = 0;
+    size_t gate_up_bytes_ = 0;
+    size_t down_bytes_ = 0;
+
+    int gate_up_rows_ = 0, gate_up_cols_ = 0;
+    int down_rows_ = 0, down_cols_ = 0;
+    GgmlType gate_up_type_ = GgmlType::F32;
+    GgmlType down_type_ = GgmlType::F32;
+
+    uint64_t clock_ = 0;
+    std::vector<Slot> slots_;
+    std::unordered_map<uint64_t, size_t> index_;
+};
+
 } // namespace wd
