@@ -1,6 +1,7 @@
 #include "../src/qwen38_layout.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <iostream>
 
 int main(int argc, char ** argv) {
@@ -23,6 +24,10 @@ int main(int argc, char ** argv) {
     assert(q.is_mtp(48));
     assert(q.is_ple(0));
     assert(q.ple_head_count() == 16);
+    assert(std::fabs(q.rms_eps - 1e-6f) < 1e-9f);
+    assert(std::fabs(q.rope_freq_base - 1000000.0f) < 1.0f);
+    assert(std::fabs(q.expert_weights_scale - 1.25f) < 1e-6f);
+    assert((q.rope_sections == std::vector<int64_t>{16, 24, 24, 0}));
 
     std::cout << "PASS\n";
     return 0;
