@@ -19,16 +19,18 @@ struct LowBitMatrix {
     GgmlType type = GgmlType::F32;
     uint8_t * data = nullptr;
     size_t bytes = 0;
+    bool owns = true;
 
     LowBitMatrix() = default;
     LowBitMatrix(const LowBitMatrix &) = delete;
     LowBitMatrix & operator=(const LowBitMatrix &) = delete;
 
     LowBitMatrix(LowBitMatrix && o) noexcept
-        : rows(o.rows), cols(o.cols), type(o.type), data(o.data), bytes(o.bytes) {
+        : rows(o.rows), cols(o.cols), type(o.type), data(o.data), bytes(o.bytes), owns(o.owns) {
         o.data = nullptr;
         o.rows = o.cols = 0;
         o.bytes = 0;
+        o.owns = true;
     }
 
     LowBitMatrix & operator=(LowBitMatrix && o) noexcept {
@@ -39,9 +41,11 @@ struct LowBitMatrix {
             type = o.type;
             data = o.data;
             bytes = o.bytes;
+            owns = o.owns;
             o.data = nullptr;
             o.rows = o.cols = 0;
             o.bytes = 0;
+            o.owns = true;
         }
         return *this;
     }
@@ -49,15 +53,32 @@ struct LowBitMatrix {
     ~LowBitMatrix() { reset(); }
 
     void reset() {
-        if (data) cudaFree(data);
+        if (data && owns) cudaFree(data);
         data = nullptr;
         rows = cols = 0;
         bytes = 0;
+        owns = true;
     }
 };
 
 inline bool lowbit_gemv_supported(GgmlType type) {
     return type == GgmlType::Q8_0 || type == GgmlType::IQ4_NL || type == GgmlType::IQ2_S;
+}
+
+inline LowBitMatrix borrow_lowbit_matrix(
+        uint8_t * data,
+        int rows,
+        int cols,
+        GgmlType type,
+        size_t bytes) {
+    LowBitMatrix out;
+    out.data = data;
+    out.rows = rows;
+    out.cols = cols;
+    out.type = type;
+    out.bytes = bytes;
+    out.owns = false;
+    return out;
 }
 
 inline LowBitMatrix upload_lowbit_matrix(const TensorInfo & t) {
