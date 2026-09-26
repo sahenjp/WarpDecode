@@ -42,6 +42,7 @@ struct Qwen38Layout {
 
     float rms_eps = 1e-6f;
     float rope_freq_base = 10000.0f;
+    float attention_scale = 0.0f;
     float expert_weights_scale = 1.0f;
     std::vector<int64_t> rope_sections;
 
@@ -132,6 +133,7 @@ inline Qwen38Layout qwen38_layout_from_gguf(const GgufFile & g) {
 
     q.rms_eps = static_cast<float>(g.number_meta("qwen4exp.attention.layer_norm_rms_epsilon", 1e-6));
     q.rope_freq_base = static_cast<float>(g.number_meta("qwen4exp.rope.freq_base", 10000.0));
+    q.attention_scale = static_cast<float>(g.number_meta("qwen4exp.attention.scale", 0.0));
     q.expert_weights_scale = static_cast<float>(g.number_meta("qwen4exp.expert_weights_scale", 1.0));
     if (g.has_meta("qwen4exp.rope.dimension_sections")) {
         q.rope_sections = g.int_array_meta("qwen4exp.rope.dimension_sections");
