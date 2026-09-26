@@ -75,5 +75,15 @@ int main() {
         std::cout << "IQ2_S PASS " << y << "\n";
     }
 
+    {
+        // IQ3_S: d=1, scale nibble=0 => 1. Grid entry 0 is
+        // {1,1,1,1}, high bits and signs are zero, so all 256 values are 1.
+        std::vector<uint8_t> raw(110, 0);
+        put_half(raw, 0, 1.0f);
+        const float y = run_case(wd::GgmlType::IQ3_S, 256, raw);
+        if (std::fabs(y - 256.0f) > 0.02f) throw std::runtime_error("IQ3_S mismatch");
+        std::cout << "IQ3_S PASS " << y << "\n";
+    }
+
     return 0;
 }
