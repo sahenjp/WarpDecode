@@ -86,7 +86,10 @@ public:
             size_t capacity_mib,
             const TensorInfo & sample_gate,
             const TensorInfo & sample_up,
-            const TensorInfo & sample_down) {
+            const TensorInfo & sample_down,
+            size_t gate_capacity_bytes = 0,
+            size_t up_capacity_bytes = 0,
+            size_t down_capacity_bytes = 0) {
         if (pool_) throw std::runtime_error("expert cache already initialized");
         if (capacity_mib == 0) throw std::runtime_error("expert cache capacity is zero");
 
@@ -94,15 +97,18 @@ public:
         const auto u = expert_slice(sample_up, 0);
         const auto d = expert_slice(sample_down, 0);
 
-        gate_bytes_ = g.bytes;
-        up_bytes_ = u.bytes;
-        down_bytes_ = d.bytes;
+        gate_bytes_ = gate_capacity_bytes ? gate_capacity_bytes : g.bytes;
+        up_bytes_ = up_capacity_bytes ? up_capacity_bytes : u.bytes;
+        down_bytes_ = down_capacity_bytes ? down_capacity_bytes : d.bytes;
+        if (gate_bytes_ < g.bytes || up_bytes_ < u.bytes || down_bytes_ < d.bytes) {
+            throw std::runtime_error("expert cache slot capacity is smaller than sample tensors");
+        }
         slot_bytes_ = gate_bytes_ + up_bytes_ + down_bytes_;
         if (slot_bytes_ == 0) throw std::runtime_error("expert cache slot is empty");
 
-        gate_rows_ = g.rows; gate_cols_ = g.cols; gate_type_ = g.type;
-        up_rows_   = u.rows; up_cols_   = u.cols; up_type_   = u.type;
-        down_rows_ = d.rows; down_cols_ = d.cols; down_type_ = d.type;
+        gate_rows_ = g.rows; gate_cols_ = g.cols;
+        up_rows_   = u.rows; up_cols_   = u.cols;
+        down_rows_ = d.rows; down_cols_ = d.cols;
 
         const size_t capacity_bytes = capacity_mib * 1024ull * 1024ull;
         n_slots_ = capacity_bytes / slot_bytes_;
@@ -150,13 +156,19 @@ public:
         if (meta.valid) index_.erase(meta.key);
 
         uint8_t * base = pool_ + slot * slot_bytes_;
-        copy_async(base, gh.data, gate_bytes_, stream, gate.name);
-        copy_async(base + gate_bytes_, uh.data, up_bytes_, stream, up.name);
-        copy_async(base + gate_bytes_ + up_bytes_, dh.data, down_bytes_, stream, down.name);
+        copy_async(base, gh.data, gh.bytes, stream, gate.name);
+        copy_async(base + gate_bytes_, uh.data, uh.bytes, stream, up.name);
+        copy_async(base + gate_bytes_ + up_bytes_, dh.data, dh.bytes, stream, down.name);
 
         meta.key = key;
         meta.last_use = clock_;
         meta.valid = true;
+        meta.gate_type = gh.type;
+        meta.up_type = uh.type;
+        meta.down_type = dh.type;
+        meta.gate_actual_bytes = gh.bytes;
+        meta.up_actual_bytes = uh.bytes;
+        meta.down_actual_bytes = dh.bytes;
         index_[key] = slot;
         return views(slot, false);
     }
@@ -181,9 +193,6 @@ private:
         gate_rows_ = o.gate_rows_; gate_cols_ = o.gate_cols_;
         up_rows_ = o.up_rows_; up_cols_ = o.up_cols_;
         down_rows_ = o.down_rows_; down_cols_ = o.down_cols_;
-        gate_type_ = o.gate_type_;
-        up_type_ = o.up_type_;
-        down_type_ = o.down_type_;
         clock_ = o.clock_;
         slots_ = std::move(o.slots_);
         index_ = std::move(o.index_);
@@ -198,6 +207,12 @@ private:
         uint64_t key = 0;
         uint64_t last_use = 0;
         bool valid = false;
+        GgmlType gate_type = GgmlType::F32;
+        GgmlType up_type = GgmlType::F32;
+        GgmlType down_type = GgmlType::F32;
+        size_t gate_actual_bytes = 0;
+        size_t up_actual_bytes = 0;
+        size_t down_actual_bytes = 0;
     };
 
     static uint64_t make_key(int layer, int expert) {
@@ -221,10 +236,13 @@ private:
             const ExpertHostSlice & g,
             const ExpertHostSlice & u,
             const ExpertHostSlice & d) const {
-        if (g.bytes != gate_bytes_ || g.rows != gate_rows_ || g.cols != gate_cols_ || g.type != gate_type_ ||
-            u.bytes != up_bytes_   || u.rows != up_rows_     || u.cols != up_cols_     || u.type != up_type_ ||
-            d.bytes != down_bytes_ || d.rows != down_rows_   || d.cols != down_cols_   || d.type != down_type_) {
+        if (g.rows != gate_rows_ || g.cols != gate_cols_ ||
+            u.rows != up_rows_ || u.cols != up_cols_ ||
+            d.rows != down_rows_ || d.cols != down_cols_) {
             throw std::runtime_error("expert tensor geometry changed between layers");
+        }
+        if (g.bytes > gate_bytes_ || u.bytes > up_bytes_ || d.bytes > down_bytes_) {
+            throw std::runtime_error("expert tensor exceeds cache slot capacity");
         }
     }
 
@@ -245,11 +263,15 @@ private:
 
     ExpertDeviceWeights views(size_t slot, bool hit) const {
         uint8_t * base = pool_ + slot * slot_bytes_;
+        const Slot & meta = slots_[slot];
         ExpertDeviceWeights out;
-        out.gate = borrow_lowbit_matrix(base, gate_rows_, gate_cols_, gate_type_, gate_bytes_);
-        out.up = borrow_lowbit_matrix(base + gate_bytes_, up_rows_, up_cols_, up_type_, up_bytes_);
+        out.gate = borrow_lowbit_matrix(
+            base, gate_rows_, gate_cols_, meta.gate_type, meta.gate_actual_bytes);
+        out.up = borrow_lowbit_matrix(
+            base + gate_bytes_, up_rows_, up_cols_, meta.up_type, meta.up_actual_bytes);
         out.down = borrow_lowbit_matrix(
-            base + gate_bytes_ + up_bytes_, down_rows_, down_cols_, down_type_, down_bytes_);
+            base + gate_bytes_ + up_bytes_, down_rows_, down_cols_,
+            meta.down_type, meta.down_actual_bytes);
         out.cache_hit = hit;
         out.slot = slot;
         return out;
@@ -265,10 +287,6 @@ private:
     int gate_rows_ = 0, gate_cols_ = 0;
     int up_rows_ = 0, up_cols_ = 0;
     int down_rows_ = 0, down_cols_ = 0;
-    GgmlType gate_type_ = GgmlType::F32;
-    GgmlType up_type_ = GgmlType::F32;
-    GgmlType down_type_ = GgmlType::F32;
-
     uint64_t clock_ = 0;
     std::vector<Slot> slots_;
     std::unordered_map<uint64_t, size_t> index_;
