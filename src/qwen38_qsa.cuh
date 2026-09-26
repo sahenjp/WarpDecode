@@ -84,10 +84,6 @@ inline Qwen38QsaWeights load_qwen38_qsa_weights(
     if (q.key_length != q.value_length) {
         throw std::runtime_error("Qwen3.8 fast QSA currently requires key_length == value_length");
     }
-    if (q.indexer_key_length != q.key_length) {
-        throw std::runtime_error("Qwen3.8 fast QSA currently requires indexer_key_length == key_length");
-    }
-
     Qwen38QsaWeights out;
     out.q = upload_matrix(wq);
     out.k = upload_matrix(wk);
@@ -117,8 +113,11 @@ public:
         if (max_ctx <= 0 || ratio <= 0 || ratio > 64) {
             throw std::runtime_error("invalid QSA cache geometry");
         }
-        if (q.key_length != q.value_length || q.indexer_key_length != q.key_length) {
-            throw std::runtime_error("unsupported QSA fast-path head geometry");
+        if (q.key_length != q.value_length) {
+            throw std::runtime_error("unsupported QSA fast-path K/V geometry");
+        }
+        if (q.indexer_key_length <= 0 || q.indexer_key_length > 256) {
+            throw std::runtime_error("unsupported QSA indexer key length");
         }
 
         max_ctx_ = max_ctx;
