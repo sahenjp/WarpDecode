@@ -16,9 +16,13 @@ def kv_string(k,v):
 def kv_u32(k,v):
     return s(k)+struct.pack('<I',U32)+struct.pack('<I',v)
 
+def kv_f32(k,v):
+    return s(k)+struct.pack('<I',F32)+struct.pack('<f',v)
+
 ARRAY = 9
 I32 = 5
 U64 = 10
+F32 = 6
 
 def kv_array_i32(k, values):
     return (
@@ -61,6 +65,10 @@ def write(path: Path):
         kv_u32('qwen4exp.attention.indexer.head_count',4),
         kv_u32('qwen4exp.attention.indexer.key_length',128),
         kv_u32('qwen4exp.attention.indexer.top_k',2048),
+        kv_f32('qwen4exp.attention.layer_norm_rms_epsilon',1e-6),
+        kv_f32('qwen4exp.rope.freq_base',1000000.0),
+        kv_f32('qwen4exp.expert_weights_scale',1.25),
+        kv_array_i32('qwen4exp.rope.dimension_sections', [16, 24, 24, 0]),
         kv_u32('qwen4exp.nextn_predict_layers',1),
         kv_array_i32('qwen4exp.attention.compress_ratios', [0, 0, 0, 8] * 12 + [0]),
         kv_array_i32('qwen4exp.ple.layers', [0]),
