@@ -27,6 +27,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_tuning_test.cpp -o /tmp
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/model_profile_test.cpp -o /tmp/warpdecode-model-profile-test
 /tmp/warpdecode-model-profile-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
 
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_layout_test.cpp -o /tmp/warpdecode-qwen38-layout-test
+/tmp/warpdecode-qwen38-layout-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
+
 ./build-ui/warpdecode-tui --dump-state \
   --gpu-fixture tests/nvidia-smi.fixture.csv \
   --model-dir tests > /tmp/warpdecode-state.json
