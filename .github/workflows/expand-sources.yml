@@ -1,0 +1,37 @@
+name: Expand source payload
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  expand:
+    if: contains(github.event.head_commit.message, 'Bootstrap source payload')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Expand exact source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src tools
+          gzip -dc bootstrap/warpdecode.cu.gz > src/warpdecode.cu
+          gzip -dc bootstrap/warpdecode_tui.cpp.gz > tools/warpdecode_tui.cpp
+          test "$(git hash-object src/warpdecode.cu)" = "bba67391a941d74e527df1b5a5d30422a74a59d1"
+          test "$(git hash-object tools/warpdecode_tui.cpp)" = "45821cda845000d15354c5c3cab8e6d547f051c5"
+          rm -rf bootstrap
+      - name: Commit expanded sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "Expand CUDA and TUI sources [skip ci]"
+          git push

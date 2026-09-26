@@ -1,0 +1,6 @@
+build*/
+*.pyc
+__pycache__/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
