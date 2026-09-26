@@ -20,7 +20,7 @@ def write(path: Path):
     kvs=[
         kv_string('general.architecture','qwen4exp'),
         kv_string('general.name','Qwen3.8-Flash-Next test'),
-        kv_u32('qwen4exp.block_count',48),
+        kv_u32('qwen4exp.block_count',49),
         kv_u32('qwen4exp.embedding_length',2560),
         kv_u32('qwen4exp.expert_count',512),
         kv_u32('qwen4exp.expert_used_count',10),
