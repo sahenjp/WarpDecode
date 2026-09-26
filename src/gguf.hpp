@@ -202,7 +202,7 @@ struct TensorInfo {
 
 class GgufFile {
 public:
-    explicit GgufFile(const std::string& path) : mapped_(path) { parse(); }
+    explicit GgufFile(const std::string& path, bool validate_tensor_data = true) : mapped_(path) { parse(validate_tensor_data); }
 
     const TensorInfo& tensor(const std::string& name) const {
         auto it = tensor_index_.find(name);
@@ -262,7 +262,7 @@ private:
         return (x + a - 1) & ~(a - 1);
     }
 
-    void parse() {
+    void parse(bool validate_tensor_data) {
         Cursor c(mapped_.data(), mapped_.size());
         if (c.read<uint32_t>() != GGUF_MAGIC) throw std::runtime_error("GGUF magicが一致しません");
         version_ = c.read<uint32_t>();
@@ -306,9 +306,14 @@ private:
 
         for (auto& t : tensors_) {
             const size_t abs = data_offset_ + static_cast<size_t>(t.relative_offset);
-            const size_t bytes = t.byte_size();
-            if (abs > mapped_.size() || bytes > mapped_.size() - abs) {
+            if (abs > mapped_.size()) {
                 throw std::runtime_error("テンソルがファイル外を参照しています: " + t.name);
+            }
+            if (validate_tensor_data) {
+                const size_t bytes = t.byte_size();
+                if (bytes > mapped_.size() - abs) {
+                    throw std::runtime_error("テンソルがファイル外を参照しています: " + t.name);
+                }
             }
             t.data = mapped_.data() + abs;
         }
