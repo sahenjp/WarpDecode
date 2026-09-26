@@ -1,5 +1,6 @@
 #include "gguf.hpp"
 #include "gpu_arch.hpp"
+#include "lowbit.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
