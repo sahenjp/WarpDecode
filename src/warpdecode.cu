@@ -5,6 +5,8 @@
 #include "qwen38_hc.cuh"
 #include "qwen38_gdn.cuh"
 #include "qwen38_moe.cuh"
+#include "qwen38_runtime.cuh"
+#include "qwen38_state.cuh"
 #include "qwen38_tuning.hpp"
 
 #include <cuda_fp16.h>
