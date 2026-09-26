@@ -75,6 +75,8 @@ def write(path: Path):
         kv_u32('qwen4exp.ple.ngram_size',3),
         kv_u32('qwen4exp.ple.heads_per_ngram',8),
         kv_u32('qwen4exp.ple.conv_kernel',4),
+        kv_u32('qwen4exp.ple.eos_token_id',248044),
+        kv_u32('qwen4exp.ple.image_token_id',248056),
         kv_u32('qwen4exp.embedding_length_per_layer_input',160),
         kv_array_u64('qwen4exp.ple.layer_multipliers', [3, 5, 7]),
         kv_array_u64('qwen4exp.ple.head_offsets', list(range(0, 160, 10))),
