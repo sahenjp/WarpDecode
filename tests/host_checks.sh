@@ -12,6 +12,12 @@ cmake --build build-ui -j"$(nproc)" >/dev/null
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/gguf_parser_test.cpp -o /tmp/warpdecode-gguf-parser-test
 /tmp/warpdecode-gguf-parser-test tests/min.gguf >/dev/null
 
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/gguf_type_size_test.cpp -o /tmp/warpdecode-gguf-type-size-test
+/tmp/warpdecode-gguf-type-size-test >/dev/null
+
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/gguf_array_test.cpp -o /tmp/warpdecode-gguf-array-test
+/tmp/warpdecode-gguf-array-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
+
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/ple_reader_test.cpp -o /tmp/warpdecode-ple-reader-test
 /tmp/warpdecode-ple-reader-test >/dev/null
 
