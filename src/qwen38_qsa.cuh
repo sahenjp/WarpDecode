@@ -611,11 +611,12 @@ inline __half * run_qwen38_qsa(
             scratch.idx_q(), state.index_block(), state.scores(),
             full_blocks, idx_dim, q.indexer_heads);
 
+        size_t sort_temp_bytes = state.sort_temp_bytes();
         e = cub::DeviceRadixSort::SortPairsDescending(
-            state.sort_temp(), state.sort_temp_bytes(),
+            state.sort_temp(), sort_temp_bytes,
             state.scores(), state.scores_sorted(),
             state.ids(), state.ids_sorted(),
-            full_blocks, 0, sizeof(float) * 8, stream);
+            full_blocks, 0, 32, stream);
         if (e != cudaSuccess) throw std::runtime_error(std::string("QSA block sort failed: ") + cudaGetErrorString(e));
         selected_ids = state.ids_sorted();
     }
