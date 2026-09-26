@@ -40,6 +40,11 @@ struct Qwen38Layout {
     int indexer_key_length = 0;
     int indexer_top_k = 0;
 
+    float rms_eps = 1e-6f;
+    float rope_freq_base = 10000.0f;
+    float expert_weights_scale = 1.0f;
+    std::vector<int64_t> rope_sections;
+
     int ple_ngram_size = 0;
     int ple_heads_per_ngram = 0;
     int ple_conv_kernel = 0;
@@ -125,6 +130,13 @@ inline Qwen38Layout qwen38_layout_from_gguf(const GgufFile & g) {
     q.indexer_key_length = q38_u32(g, "qwen4exp.attention.indexer.key_length");
     q.indexer_top_k = q38_u32(g, "qwen4exp.attention.indexer.top_k");
 
+    q.rms_eps = static_cast<float>(g.number_meta("qwen4exp.attention.layer_norm_rms_epsilon", 1e-6));
+    q.rope_freq_base = static_cast<float>(g.number_meta("qwen4exp.rope.freq_base", 10000.0));
+    q.expert_weights_scale = static_cast<float>(g.number_meta("qwen4exp.expert_weights_scale", 1.0));
+    if (g.has_meta("qwen4exp.rope.dimension_sections")) {
+        q.rope_sections = g.int_array_meta("qwen4exp.rope.dimension_sections");
+    }
+
     if (g.has_meta("qwen4exp.attention.compress_ratios")) {
         q.compress_ratios = g.int_array_meta("qwen4exp.attention.compress_ratios");
     }
@@ -148,8 +160,13 @@ inline Qwen38Layout qwen38_layout_from_gguf(const GgufFile & g) {
         q.ssm_conv_kernel <= 0 || q.ssm_state_size <= 0 ||
         q.ssm_group_count <= 0 || q.ssm_dt_rank <= 0 || q.ssm_inner_size <= 0 ||
         q.hc_count <= 1 || q.hc_low_rank <= 0 ||
-        q.indexer_heads <= 0 || q.indexer_key_length <= 0 || q.indexer_top_k <= 0) {
+        q.indexer_heads <= 0 || q.indexer_key_length <= 0 || q.indexer_top_k <= 0 ||
+        !(q.rms_eps > 0.0f) || !(q.rope_freq_base > 0.0f) || !(q.expert_weights_scale > 0.0f)) {
         throw std::runtime_error("invalid qwen3.8 layout metadata");
+    }
+
+    if (!q.rope_sections.empty() && q.rope_sections.size() != 4) {
+        throw std::runtime_error("qwen4exp.rope.dimension_sections must have 4 entries");
     }
 
     if (!q.compress_ratios.empty() && q.compress_ratios.size() != static_cast<size_t>(q.total_blocks)) {
