@@ -96,6 +96,41 @@ int main() {
     wd::run_qwen38_routed_moe_fused(
         0, dx, router, gate_up_t, down_t, cache, scratch, dy, 1.0f, nullptr);
 
+    // Shared expert: identical all-one Q8 matrices. A zero gate-input vector
+    // gives sigmoid(0)=0.5, so it contributes half of the routed expert output.
+    auto shared_gate_raw = make_q8_0_2d(32, 32, 1);
+    auto shared_up_raw = make_q8_0_2d(32, 32, 1);
+    auto shared_down_raw = make_q8_0_2d(32, 32, 1);
+    std::vector<float> shared_gate_input_raw(32, 0.0f);
+
+    wd::TensorInfo shared_gate_input_t;
+    shared_gate_input_t.name = "shared_gate_input";
+    shared_gate_input_t.dims = {32};
+    shared_gate_input_t.type = wd::GgmlType::F32;
+    shared_gate_input_t.data = reinterpret_cast<const uint8_t *>(shared_gate_input_raw.data());
+
+    wd::TensorInfo shared_gate_t;
+    shared_gate_t.name = "shared_gate";
+    shared_gate_t.dims = {32, 32};
+    shared_gate_t.type = wd::GgmlType::Q8_0;
+    shared_gate_t.data = shared_gate_raw.data();
+
+    wd::TensorInfo shared_up_t = shared_gate_t;
+    shared_up_t.name = "shared_up";
+    shared_up_t.data = shared_up_raw.data();
+
+    wd::TensorInfo shared_down_t = shared_gate_t;
+    shared_down_t.name = "shared_down";
+    shared_down_t.data = shared_down_raw.data();
+
+    wd::Qwen38SharedExpertWeights shared;
+    shared.gate_input = wd::upload_half_vector(shared_gate_input_t);
+    shared.gate = wd::upload_lowbit_matrix(shared_gate_t);
+    shared.up = wd::upload_lowbit_matrix(shared_up_t);
+    shared.down = wd::upload_lowbit_matrix(shared_down_t);
+
+    wd::run_qwen38_shared_expert(dx, shared, scratch, dy, nullptr);
+
     ck(cudaGetLastError(), "MoE launch");
     ck(cudaDeviceSynchronize(), "MoE sync");
 
@@ -109,12 +144,13 @@ int main() {
     std::vector<__half> hy(32);
     ck(cudaMemcpy(hy.data(), dy, 32 * sizeof(__half), cudaMemcpyDeviceToHost), "copy y");
     const float y0 = __half2float(hy[0]);
-    // gate=32, up=32, silu(32) ~= 32, down sums 32 identical activations.
-    if (std::fabs(y0 - 32768.0f) > 64.0f) {
-        throw std::runtime_error("fused MoE numerical mismatch: " + std::to_string(y0));
+    // Routed ~=32768. Shared is identical but gated by sigmoid(0)=0.5,
+    // so the combined result is ~=49152.
+    if (std::fabs(y0 - 49152.0f) > 96.0f) {
+        throw std::runtime_error("Qwen3.8 MoE numerical mismatch: " + std::to_string(y0));
     }
 
-    std::cout << "Qwen3.8 fused routed MoE PASS top=" << scratch.h_ids()[0]
+    std::cout << "Qwen3.8 routed+shared MoE PASS top=" << scratch.h_ids()[0]
               << "," << scratch.h_ids()[1] << " y=" << y0
               << " slots=" << cache.slot_count() << "\n";
 
