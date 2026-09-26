@@ -16,6 +16,26 @@ def kv_string(k,v):
 def kv_u32(k,v):
     return s(k)+struct.pack('<I',U32)+struct.pack('<I',v)
 
+ARRAY = 9
+I32 = 5
+U64 = 10
+
+def kv_array_i32(k, values):
+    return (
+        s(k)
+        + struct.pack('<I', ARRAY)
+        + struct.pack('<IQ', I32, len(values))
+        + b''.join(struct.pack('<i', v) for v in values)
+    )
+
+def kv_array_u64(k, values):
+    return (
+        s(k)
+        + struct.pack('<I', ARRAY)
+        + struct.pack('<IQ', U64, len(values))
+        + b''.join(struct.pack('<Q', v) for v in values)
+    )
+
 def write(path: Path):
     kvs=[
         kv_string('general.architecture','qwen4exp'),
@@ -25,6 +45,11 @@ def write(path: Path):
         kv_u32('qwen4exp.expert_count',512),
         kv_u32('qwen4exp.expert_used_count',10),
         kv_u32('qwen4exp.nextn_predict_layers',1),
+        kv_array_i32('qwen4exp.attention.compress_ratios', [0, 0, 0, 8] * 12 + [0]),
+        kv_array_i32('qwen4exp.ple.layers', [0]),
+        kv_array_u64('qwen4exp.ple.layer_multipliers', [3, 5, 7]),
+        kv_array_u64('qwen4exp.ple.head_offsets', list(range(0, 160, 10))),
+        kv_array_u64('qwen4exp.ple.head_vocab_sizes', [10] * 16),
     ]
     body=struct.pack('<IIQQ',MAGIC,3,0,len(kvs))+b''.join(kvs)
     body += b'\0' * ((32-len(body)%32)%32)
