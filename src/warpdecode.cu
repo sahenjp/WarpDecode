@@ -42,6 +42,7 @@ struct Args {
     int start_token = 1;
     bool graph = true;
     bool autotune = true;
+    bool load_only = false;
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -59,8 +60,9 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--start-token") a.start_token = std::stoi(need(i, "--start-token"));
         else if (s == "--no-graph") a.graph = false;
         else if (s == "--no-autotune") a.autotune = false;
+        else if (s == "--load-only") a.load_only = true;
         else if (s == "-h" || s == "--help") {
-            std::cout << "warpdecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--no-graph] [--no-autotune]\n";
+            std::cout << "warpdecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--no-graph] [--no-autotune] [--load-only]\n";
             std::exit(0);
         } else throw std::runtime_error("不明な引数: " + s);
     }
@@ -778,12 +780,54 @@ int main(int argc, char** argv) {
         std::cerr << "target kernel plan: decode=" << kernel_plan.decode << " verify=" << kernel_plan.verify << "\n";
         std::cerr << "GGUF読込: " << args.model << "\n";
         wd::GgufFile gguf(args.model);
+        const std::string arch = gguf.string_meta("general.architecture");
+
+        if (arch == "qwen4exp") {
+            const int memory_mib = static_cast<int>(prop.totalGlobalMem / (1024ull * 1024ull));
+            std::cerr << "Qwen3.8-Flash-Next専用runtimeを構築します\n";
+            auto qrt = wd::load_qwen38_runtime(gguf, cc, memory_mib);
+            std::cerr << "arch=qwen4exp trunk=" << qrt.layout.trunk_layers
+                      << " qsa=" << qrt.layout.qsa_layer_count()
+                      << " gdn=" << qrt.layout.gdn_layer_count()
+                      << " experts=" << qrt.layout.experts
+                      << " topk=" << qrt.layout.experts_used
+                      << " mtp=" << qrt.layout.mtp_layers << "\n";
+            std::cerr << "expert-cache=" << qrt.tuning.expert_cache_mib
+                      << " MiB slots=" << qrt.expert_cache_slots
+                      << " fused=" << (qrt.fused_experts ? "true" : "false") << "\n";
+
+            if (!args.load_only) {
+                throw std::runtime_error(
+                    "Qwen3.8 forwardは配線中です。まず --load-only で実モデルロードを検証してください");
+            }
+
+            std::cout << "{\"engine\":\"warpdecode-qwen38\",\"gpu\":\"" << prop.name
+                      << "\",\"arch\":\"qwen4exp\""
+                      << ",\"load_only\":true"
+                      << ",\"trunk_layers\":" << qrt.layout.trunk_layers
+                      << ",\"qsa_layers\":" << qrt.layout.qsa_layer_count()
+                      << ",\"gdn_layers\":" << qrt.layout.gdn_layer_count()
+                      << ",\"experts\":" << qrt.layout.experts
+                      << ",\"experts_used\":" << qrt.layout.experts_used
+                      << ",\"expert_cache_mib\":" << qrt.tuning.expert_cache_mib
+                      << ",\"expert_cache_slots\":" << qrt.expert_cache_slots
+                      << ",\"fused_experts\":" << (qrt.fused_experts ? "true" : "false")
+                      << ",\"kernel_family\":\"" << kernel_plan.family << "\"}\n";
+            return 0;
+        }
+
         wd::Model model = wd::load_model(gguf);
         if (args.autotune) wd::autotune_q4(model);
         std::cerr << "arch=" << model.arch << " layers=" << model.layers << " hidden=" << model.hidden
                   << " heads=" << model.heads << "/" << model.kv_heads << " ffn=" << model.ffn
                   << " vocab=" << model.vocab << "\n";
         std::cerr << "制約: Q4_0 dense / batch=1 / greedy / FP16 KV / CUDA only\n";
+
+        if (args.load_only) {
+            std::cout << "{\"engine\":\"warpdecode-v2\",\"gpu\":\"" << prop.name
+                      << "\",\"arch\":\"" << model.arch << "\",\"load_only\":true}\n";
+            return 0;
+        }
 
         if (args.start_token >= model.vocab) throw std::runtime_error("--start-token が語彙数以上です");
         wd::Runtime rt(model, args.ctx);
