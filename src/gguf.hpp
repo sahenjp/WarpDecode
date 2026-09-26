@@ -272,7 +272,8 @@ struct TensorInfo {
 
 class GgufFile {
 public:
-    explicit GgufFile(const std::string& path, bool validate_tensor_data = true) : mapped_(path) { parse(validate_tensor_data); }
+    explicit GgufFile(const std::string& path, bool validate_tensor_data = true)
+        : path_(path), mapped_(path) { parse(validate_tensor_data); }
 
     const TensorInfo& tensor(const std::string& name) const {
         auto it = tensor_index_.find(name);
@@ -365,6 +366,10 @@ public:
     const std::vector<TensorInfo>& tensors() const { return tensors_; }
     uint32_t version() const { return version_; }
     size_t data_offset() const { return data_offset_; }
+    const std::string& path() const { return path_; }
+    uint64_t tensor_file_offset(const TensorInfo& t) const {
+        return static_cast<uint64_t>(data_offset_) + t.relative_offset;
+    }
 
 private:
     const MetaValue& meta(const std::string& key) const {
@@ -435,6 +440,7 @@ private:
         }
     }
 
+    std::string path_;
     MappedFile mapped_;
     uint32_t version_ = 0;
     size_t data_offset_ = 0;
