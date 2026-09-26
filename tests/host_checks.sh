@@ -15,6 +15,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/gguf_parser_test.cpp -o /tmp/w
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/ple_reader_test.cpp -o /tmp/warpdecode-ple-reader-test
 /tmp/warpdecode-ple-reader-test >/dev/null
 
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_tuning_test.cpp -o /tmp/warpdecode-qwen38-tuning-test
+/tmp/warpdecode-qwen38-tuning-test >/dev/null
+
 ./build-ui/warpdecode-tui --dump-state \
   --gpu-fixture tests/nvidia-smi.fixture.csv \
   --model-dir tests > /tmp/warpdecode-state.json

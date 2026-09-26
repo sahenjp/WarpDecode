@@ -1,6 +1,7 @@
 #include "gguf.hpp"
 #include "gpu_arch.hpp"
 #include "model_profile.hpp"
+#include "qwen38_tuning.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -476,6 +477,15 @@ private:
             std::cout << "PLE: " << m.profile.ple_path << "\n";
             std::cout << "MoE: " << m.profile.moe_path << "\n";
             std::cout << "MTP: " << m.profile.mtp_path << "\n";
+            if (gpu) {
+                const auto tune = wd::qwen38_tuning_for_gpu(gpu->sm, gpu->memory_mib);
+                std::cout << "tune: QSA=" << tune.qsa_block_budget << " blocks/" << tune.qsa_token_budget << " tokens"
+                          << " PLE-prefetch=" << tune.ple_prefetch_rows
+                          << " rows PLE-cache=" << tune.ple_hot_cache_mib << " MiB"
+                          << " expert-cache=" << tune.expert_cache_mib << " MiB"
+                          << " prefetch-depth=" << tune.expert_prefetch_depth << "\n";
+                std::cout << "MTP auto: draft={2,3,4}, reward=accepted_target_tokens/gpu_us\n";
+            }
             std::cout << "runtime: planner ready / qwen4exp forward kernels not wired yet\n";
         } else {
             std::cout << "decode: " << m.profile.decode_path << "\n";
