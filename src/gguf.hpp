@@ -27,6 +27,12 @@ enum class GgmlType : uint32_t {
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,
+    Q8_0 = 8,
+    Q6_K = 14,
+    IQ4_NL = 20,
+    IQ3_S = 21,
+    IQ2_S = 22,
+    BF16 = 30,
 };
 
 class MappedFile {
@@ -189,12 +195,22 @@ struct TensorInfo {
 
     size_t byte_size() const {
         const uint64_t n = elements();
+        auto blocked = [&](uint64_t qk, uint64_t bytes, const char* type_name) -> size_t {
+            if (n % qk != 0) {
+                throw std::runtime_error(std::string(type_name) + "テンソル要素数がblock sizeの倍数ではありません: " + name);
+            }
+            return static_cast<size_t>((n / qk) * bytes);
+        };
         switch (type) {
-            case GgmlType::F32: return static_cast<size_t>(n * 4);
-            case GgmlType::F16: return static_cast<size_t>(n * 2);
-            case GgmlType::Q4_0:
-                if (n % 32 != 0) throw std::runtime_error("Q4_0テンソル要素数が32の倍数ではありません: " + name);
-                return static_cast<size_t>((n / 32) * 18);
+            case GgmlType::F32:    return static_cast<size_t>(n * 4);
+            case GgmlType::F16:    return static_cast<size_t>(n * 2);
+            case GgmlType::BF16:   return static_cast<size_t>(n * 2);
+            case GgmlType::Q4_0:   return blocked(32, 18, "Q4_0");
+            case GgmlType::Q8_0:   return blocked(32, 34, "Q8_0");
+            case GgmlType::Q6_K:   return blocked(256, 210, "Q6_K");
+            case GgmlType::IQ4_NL: return blocked(32, 18, "IQ4_NL");
+            case GgmlType::IQ3_S:  return blocked(256, 110, "IQ3_S");
+            case GgmlType::IQ2_S:  return blocked(256, 82, "IQ2_S");
             default: throw std::runtime_error("未対応テンソル型: " + name);
         }
     }
