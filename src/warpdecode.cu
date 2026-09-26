@@ -1,6 +1,9 @@
 #include "gguf.hpp"
 #include "gpu_arch.hpp"
 #include "lowbit.cuh"
+#include "qwen38_layout.hpp"
+#include "qwen38_moe.cuh"
+#include "qwen38_tuning.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
