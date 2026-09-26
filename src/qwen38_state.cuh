@@ -4,6 +4,7 @@
 #include "qwen38_hc.cuh"
 #include "qwen38_layout.hpp"
 #include "qwen38_moe.cuh"
+#include "qwen38_ple.cuh"
 #include "qwen38_qsa.cuh"
 #include "qwen38_runtime.cuh"
 
@@ -27,6 +28,9 @@ struct Qwen38LayerState {
 
     std::unique_ptr<Qwen38GdnState> gdn_state;
     std::unique_ptr<Qwen38GdnScratch> gdn_scratch;
+
+    std::unique_ptr<Qwen38PleState> ple_state;
+    std::unique_ptr<Qwen38PleScratch> ple_scratch;
 
     __half * moe_out = nullptr;
 
@@ -95,6 +99,13 @@ public:
                 st->gdn_scratch->initialize(q);
             }
 
+            if (q.is_ple(il)) {
+                st->ple_state = std::make_unique<Qwen38PleState>();
+                st->ple_scratch = std::make_unique<Qwen38PleScratch>();
+                st->ple_state->initialize(q);
+                st->ple_scratch->initialize(q);
+            }
+
             layers_.push_back(std::move(st));
         }
 
@@ -107,6 +118,7 @@ public:
         for (auto & st : layers_) {
             if (st->qsa_state) st->qsa_state->clear(stream_);
             if (st->gdn_state) st->gdn_state->clear(stream_);
+            if (st->ple_state) st->ple_state->clear(stream_);
         }
         cudaMemsetAsync(residual_, 0,
             residual_elements() * sizeof(__half), stream_);
