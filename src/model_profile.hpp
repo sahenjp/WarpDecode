@@ -20,7 +20,8 @@ struct ModelProfile {
     bool qwen38_flash_next = false;
     bool runnable = false;
 
-    int layers = 0;
+    int layers = 0;        // trunk layers used for target-model decode
+    int total_blocks = 0;  // trunk + trailing MTP/NextN blocks in GGUF
     int hidden = 0;
     int experts = 0;
     int routed_experts = 0;
@@ -74,7 +75,9 @@ inline ModelProfile profile_model(const GgufFile& g, const std::filesystem::path
 
     if (p.qwen38_flash_next) {
         p.family = "qwen3.8-flash-next";
-        p.layers = static_cast<int>(uint_meta_or(g, "qwen4exp.block_count", 48));
+        p.total_blocks = static_cast<int>(uint_meta_or(g, "qwen4exp.block_count", 48));
+        p.mtp_layers = static_cast<int>(uint_meta_or(g, "qwen4exp.nextn_predict_layers", 0));
+        p.layers = std::max(0, p.total_blocks - p.mtp_layers);
         p.hidden = static_cast<int>(uint_meta_or(g, "qwen4exp.embedding_length", 2560));
         p.experts = static_cast<int>(uint_meta_or(g, "qwen4exp.expert_count", 512));
         p.routed_experts = static_cast<int>(uint_meta_or(g, "qwen4exp.expert_used_count", 10));
@@ -82,7 +85,6 @@ inline ModelProfile profile_model(const GgufFile& g, const std::filesystem::path
         p.gdn_layers = (p.layers / 4) * 3;
         p.qsa_layers = p.layers - p.gdn_layers;
         p.residual_streams = 4;
-        p.mtp_layers = static_cast<int>(uint_meta_or(g, "qwen4exp.nextn_predict_layers", 1));
 
         const auto gpu = kernel_plan_for_sm(sm);
         p.decode_path = sm > 0 ? std::string(gpu.decode) + "+grouped-moe" : "grouped-lowbit-moe";
@@ -116,6 +118,7 @@ inline std::string profile_summary(const ModelProfile& p) {
         o << "  " << p.layers << "L " << p.gdn_layers << "GDN+" << p.qsa_layers << "QSA"
           << "  MoE " << p.routed_experts << "+" << p.shared_experts << "/" << p.experts
           << "  MTP" << p.mtp_layers;
+        if (p.total_blocks != p.layers) o << "  blocks=" << p.total_blocks;
     }
     return o.str();
 }
