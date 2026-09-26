@@ -70,9 +70,16 @@ public:
     GpuExpertCache(const GpuExpertCache &) = delete;
     GpuExpertCache & operator=(const GpuExpertCache &) = delete;
 
-    ~GpuExpertCache() {
-        if (pool_) cudaFree(pool_);
+    GpuExpertCache(GpuExpertCache && o) noexcept { move_from(std::move(o)); }
+    GpuExpertCache & operator=(GpuExpertCache && o) noexcept {
+        if (this != &o) {
+            release();
+            move_from(std::move(o));
+        }
+        return *this;
     }
+
+    ~GpuExpertCache() { release(); }
 
     void initialize(
             size_t capacity_mib,
@@ -154,6 +161,38 @@ public:
     }
 
 private:
+    void release() {
+        if (pool_) cudaFree(pool_);
+        pool_ = nullptr;
+        n_slots_ = 0;
+        slot_bytes_ = gate_bytes_ = up_bytes_ = down_bytes_ = 0;
+        slots_.clear();
+        index_.clear();
+    }
+
+    void move_from(GpuExpertCache && o) noexcept {
+        pool_ = o.pool_;
+        n_slots_ = o.n_slots_;
+        slot_bytes_ = o.slot_bytes_;
+        gate_bytes_ = o.gate_bytes_;
+        up_bytes_ = o.up_bytes_;
+        down_bytes_ = o.down_bytes_;
+        gate_rows_ = o.gate_rows_; gate_cols_ = o.gate_cols_;
+        up_rows_ = o.up_rows_; up_cols_ = o.up_cols_;
+        down_rows_ = o.down_rows_; down_cols_ = o.down_cols_;
+        gate_type_ = o.gate_type_;
+        up_type_ = o.up_type_;
+        down_type_ = o.down_type_;
+        clock_ = o.clock_;
+        slots_ = std::move(o.slots_);
+        index_ = std::move(o.index_);
+
+        o.pool_ = nullptr;
+        o.n_slots_ = 0;
+        o.slot_bytes_ = o.gate_bytes_ = o.up_bytes_ = o.down_bytes_ = 0;
+        o.clock_ = 0;
+    }
+
     struct Slot {
         uint64_t key = 0;
         uint64_t last_use = 0;
@@ -247,9 +286,16 @@ public:
     GpuFusedExpertCache(const GpuFusedExpertCache &) = delete;
     GpuFusedExpertCache & operator=(const GpuFusedExpertCache &) = delete;
 
-    ~GpuFusedExpertCache() {
-        if (pool_) cudaFree(pool_);
+    GpuFusedExpertCache(GpuFusedExpertCache && o) noexcept { move_from(std::move(o)); }
+    GpuFusedExpertCache & operator=(GpuFusedExpertCache && o) noexcept {
+        if (this != &o) {
+            release();
+            move_from(std::move(o));
+        }
+        return *this;
     }
+
+    ~GpuFusedExpertCache() { release(); }
 
     void initialize(
             size_t capacity_mib,
@@ -329,6 +375,37 @@ public:
     }
 
 private:
+    void release() {
+        if (pool_) cudaFree(pool_);
+        pool_ = nullptr;
+        n_slots_ = 0;
+        slot_bytes_ = gate_up_bytes_ = down_bytes_ = 0;
+        slots_.clear();
+        index_.clear();
+    }
+
+    void move_from(GpuFusedExpertCache && o) noexcept {
+        pool_ = o.pool_;
+        n_slots_ = o.n_slots_;
+        slot_bytes_ = o.slot_bytes_;
+        gate_up_bytes_ = o.gate_up_bytes_;
+        down_bytes_ = o.down_bytes_;
+        gate_up_rows_ = o.gate_up_rows_;
+        gate_up_cols_ = o.gate_up_cols_;
+        down_rows_ = o.down_rows_;
+        down_cols_ = o.down_cols_;
+        gate_up_type_ = o.gate_up_type_;
+        down_type_ = o.down_type_;
+        clock_ = o.clock_;
+        slots_ = std::move(o.slots_);
+        index_ = std::move(o.index_);
+
+        o.pool_ = nullptr;
+        o.n_slots_ = 0;
+        o.slot_bytes_ = o.gate_up_bytes_ = o.down_bytes_ = 0;
+        o.clock_ = 0;
+    }
+
     struct Slot {
         uint64_t key = 0;
         uint64_t last_use = 0;
