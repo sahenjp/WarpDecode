@@ -50,6 +50,8 @@ struct Qwen38Layout {
     int ple_heads_per_ngram = 0;
     int ple_conv_kernel = 0;
     int ple_embedding_length = 0;
+    int ple_eos_token_id = -1;
+    int ple_image_token_id = -1;
 
     std::vector<int64_t> compress_ratios;
     std::vector<uint64_t> ple_layers;
@@ -149,6 +151,8 @@ inline Qwen38Layout qwen38_layout_from_gguf(const GgufFile & g) {
         q.ple_heads_per_ngram = q38_u32(g, "qwen4exp.ple.heads_per_ngram");
         q.ple_conv_kernel = q38_u32(g, "qwen4exp.ple.conv_kernel");
         q.ple_embedding_length = q38_u32(g, "qwen4exp.embedding_length_per_layer_input");
+        q.ple_eos_token_id = static_cast<int>(g.number_meta("qwen4exp.ple.eos_token_id", -1));
+        q.ple_image_token_id = static_cast<int>(g.number_meta("qwen4exp.ple.image_token_id", q.ple_eos_token_id));
         q.ple_layer_multipliers = g.uint_array_meta("qwen4exp.ple.layer_multipliers");
         q.ple_head_offsets = g.uint_array_meta("qwen4exp.ple.head_offsets");
         q.ple_head_vocab_sizes = g.uint_array_meta("qwen4exp.ple.head_vocab_sizes");
@@ -177,7 +181,8 @@ inline Qwen38Layout qwen38_layout_from_gguf(const GgufFile & g) {
 
     if (!q.ple_layers.empty()) {
         if (q.ple_ngram_size < 2 || q.ple_heads_per_ngram <= 0 ||
-            q.ple_conv_kernel <= 0 || q.ple_embedding_length <= 0) {
+            q.ple_conv_kernel <= 0 || q.ple_embedding_length <= 0 ||
+            q.ple_eos_token_id < 0) {
             throw std::runtime_error("invalid qwen3.8 PLE metadata");
         }
         if (q.ple_layer_multipliers.size() < static_cast<size_t>(q.ple_ngram_size)) {
