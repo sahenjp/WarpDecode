@@ -2,6 +2,7 @@
 
 #include "gguf.hpp"
 #include "iq2s_grid.cuh"
+#include "iq3s_grid.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -62,7 +63,7 @@ struct LowBitMatrix {
 };
 
 inline bool lowbit_gemv_supported(GgmlType type) {
-    return type == GgmlType::Q8_0 || type == GgmlType::IQ4_NL || type == GgmlType::IQ2_S;
+    return type == GgmlType::Q8_0 || type == GgmlType::IQ4_NL || type == GgmlType::IQ2_S || type == GgmlType::IQ3_S;
 }
 
 inline LowBitMatrix borrow_lowbit_matrix(
@@ -95,7 +96,7 @@ inline LowBitMatrix upload_lowbit_matrix(const TensorInfo & t) {
     out.type = t.type;
     out.bytes = t.byte_size();
 
-    const int quantum = t.type == GgmlType::IQ2_S ? 256 : 32;
+    const int quantum = (t.type == GgmlType::IQ2_S || t.type == GgmlType::IQ3_S) ? 256 : 32;
     if (out.cols <= 0 || out.rows <= 0 || out.cols % quantum != 0) {
         throw std::runtime_error("invalid low-bit matrix shape: " + t.name);
     }
@@ -270,6 +271,80 @@ __global__ void iq2_s_gemv_kernel(
     }
 }
 
+
+__device__ __forceinline__ uint8_t iq3s_grid_value(uint16_t index, int lane4) {
+    const uint32_t packed = k_iq3s_grid[index];
+    return static_cast<uint8_t>(packed >> (lane4 * 8));
+}
+
+template <bool OUT_F32>
+__global__ void iq3_s_gemv_kernel(
+        const uint8_t * __restrict__ w,
+        const __half * __restrict__ x,
+        void * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const int superblocks_per_row = cols >> 8; // 256 values per IQ3_S block
+    const size_t row_stride = static_cast<size_t>(superblocks_per_row) * 110u;
+    const uint8_t * row_ptr = w + static_cast<size_t>(row) * row_stride;
+
+    const int group = lane >> 3;  // 4 groups of 8
+    const int lane8 = lane & 7;
+    float acc = 0.0f;
+
+    for (int sb = 0; sb < superblocks_per_row; ++sb) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(sb) * 110u;
+        const float d = lowbit_half(blk);
+        const uint8_t * qs = blk + 2;
+        const uint8_t * qh = qs + 64;
+        const uint8_t * signs = qh + 8;
+        const uint8_t * scales = signs + 32;
+
+#pragma unroll
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const uint8_t * qs32 = qs + ib32 * 8;
+            const uint8_t qh32 = qh[ib32];
+            const uint8_t sign_bits = signs[ib32 * 4 + group];
+            const uint8_t scale_byte = scales[ib32 >> 1];
+            const uint8_t scale4 = (ib32 & 1) ? (scale_byte >> 4) : (scale_byte & 0x0f);
+            const float db = d * static_cast<float>(1 + 2 * scale4);
+
+            uint16_t grid_index;
+            int grid_lane;
+            if (lane8 < 4) {
+                grid_index = static_cast<uint16_t>(qs32[2 * group])
+                    | static_cast<uint16_t>((static_cast<uint16_t>(qh32) << (8 - 2 * group)) & 0x100u);
+                grid_lane = lane8;
+            } else {
+                grid_index = static_cast<uint16_t>(qs32[2 * group + 1])
+                    | static_cast<uint16_t>((static_cast<uint16_t>(qh32) << (7 - 2 * group)) & 0x100u);
+                grid_lane = lane8 - 4;
+            }
+
+            float qv = static_cast<float>(iq3s_grid_value(grid_index, grid_lane));
+            if (sign_bits & (1u << lane8)) qv = -qv;
+
+            const int col = (sb << 8) + (ib32 << 5) + lane;
+            acc = fmaf(db * qv, __half2float(x[col]), acc);
+        }
+    }
+
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        if constexpr (OUT_F32) {
+            static_cast<float *>(y)[row] = acc;
+        } else {
+            static_cast<__half *>(y)[row] = __float2half(acc);
+        }
+    }
+}
+
 inline void launch_lowbit_gemv_half(
         const LowBitMatrix & w,
         const __half * x,
@@ -288,6 +363,8 @@ inline void launch_lowbit_gemv_half(
         iq4_nl_gemv_kernel<false><<<blocks, threads, 0, stream>>>(w.data, x, y, w.rows, w.cols);
     } else if (w.type == GgmlType::IQ2_S) {
         iq2_s_gemv_kernel<false><<<blocks, threads, 0, stream>>>(w.data, x, y, w.rows, w.cols);
+    } else if (w.type == GgmlType::IQ3_S) {
+        iq3_s_gemv_kernel<false><<<blocks, threads, 0, stream>>>(w.data, x, y, w.rows, w.cols);
     } else {
         throw std::runtime_error("unsupported low-bit GEMV type");
     }
@@ -311,6 +388,8 @@ inline void launch_lowbit_gemv_float(
         iq4_nl_gemv_kernel<true><<<blocks, threads, 0, stream>>>(w.data, x, y, w.rows, w.cols);
     } else if (w.type == GgmlType::IQ2_S) {
         iq2_s_gemv_kernel<true><<<blocks, threads, 0, stream>>>(w.data, x, y, w.rows, w.cols);
+    } else if (w.type == GgmlType::IQ3_S) {
+        iq3_s_gemv_kernel<true><<<blocks, threads, 0, stream>>>(w.data, x, y, w.rows, w.cols);
     } else {
         throw std::runtime_error("unsupported low-bit GEMV type");
     }
