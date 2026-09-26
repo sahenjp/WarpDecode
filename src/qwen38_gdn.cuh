@@ -106,7 +106,10 @@ public:
             reset();
             throw std::runtime_error(std::string("cudaMalloc GDN conv state failed: ") + cudaGetErrorString(e));
         }
-        clear(nullptr);
+        const size_t state_n = static_cast<size_t>(state_dim_) * state_dim_ * value_heads_;
+        const size_t conv_n = static_cast<size_t>(conv_kernel_ - 1) * conv_channels_;
+        cudaMemset(state_, 0, state_n * sizeof(float));
+        cudaMemset(conv_state_, 0, conv_n * sizeof(__half));
     }
 
     void clear(cudaStream_t stream) {
