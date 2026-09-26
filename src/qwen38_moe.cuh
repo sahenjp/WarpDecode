@@ -1,6 +1,7 @@
 #pragma once
 
 #include "expert_cache.cuh"
+#include "dense_vector.cuh"
 #include "gguf.hpp"
 #include "lowbit.cuh"
 
@@ -26,6 +27,47 @@ struct Qwen38MoeLayerTensors {
 
     bool fused_gate_up() const { return gate_up != nullptr; }
 };
+
+struct Qwen38SharedExpertWeights {
+    DeviceHalfVector gate_input;
+    LowBitMatrix gate;
+    LowBitMatrix up;
+    LowBitMatrix down;
+};
+
+inline Qwen38SharedExpertWeights load_qwen38_shared_expert(
+        const GgufFile & g,
+        int il,
+        int hidden,
+        int shared_ffn) {
+    const std::string p = "blk." + std::to_string(il) + ".";
+    const TensorInfo & gate_input = g.tensor(p + "ffn_gate_inp_shexp.weight");
+    const TensorInfo & gate = g.tensor(p + "ffn_gate_shexp.weight");
+    const TensorInfo & up = g.tensor(p + "ffn_up_shexp.weight");
+    const TensorInfo & down = g.tensor(p + "ffn_down_shexp.weight");
+
+    if (gate_input.dims.size() != 1 || static_cast<int>(gate_input.dims[0]) != hidden) {
+        throw std::runtime_error("shared expert gate-input shape mismatch");
+    }
+    auto check_matrix = [&](const TensorInfo & t, int rows, int cols, const char * what) {
+        if (t.dims.size() != 2 || static_cast<int>(t.dims[0]) != cols || static_cast<int>(t.dims[1]) != rows) {
+            throw std::runtime_error(std::string("shared expert ") + what + " shape mismatch: " + t.name);
+        }
+        if (!lowbit_gemv_supported(t.type)) {
+            throw std::runtime_error(std::string("shared expert ") + what + " low-bit type unsupported: " + t.name);
+        }
+    };
+    check_matrix(gate, shared_ffn, hidden, "gate");
+    check_matrix(up, shared_ffn, hidden, "up");
+    check_matrix(down, hidden, shared_ffn, "down");
+
+    Qwen38SharedExpertWeights out;
+    out.gate_input = upload_half_vector(gate_input);
+    out.gate = upload_lowbit_matrix(gate);
+    out.up = upload_lowbit_matrix(up);
+    out.down = upload_lowbit_matrix(down);
+    return out;
+}
 
 inline Qwen38MoeLayerTensors qwen38_moe_tensors(const GgufFile & g, int il) {
     const std::string p = "blk." + std::to_string(il) + ".";
@@ -133,6 +175,18 @@ __global__ void q38_float_to_half_kernel(
     if (i < n) y[i] = __float2half(x[i]);
 }
 
+
+__global__ void q38_add_shared_kernel(
+        __half * __restrict__ routed,
+        const __half * __restrict__ shared,
+        const float * __restrict__ gate,
+        int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float y = __half2float(routed[i]) + (*gate) * __half2float(shared[i]);
+    routed[i] = __float2half(y);
+}
+
 class Qwen38MoeScratch {
 public:
     Qwen38MoeScratch() = default;
@@ -162,6 +216,7 @@ public:
         alloc(reinterpret_cast<void **>(&d_act_), static_cast<size_t>(expert_ffn_) * sizeof(__half));
         alloc(reinterpret_cast<void **>(&d_down_), static_cast<size_t>(hidden_) * sizeof(__half));
         alloc(reinterpret_cast<void **>(&d_accum_), static_cast<size_t>(hidden_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&d_shared_gate_), sizeof(float));
 
         host_alloc(reinterpret_cast<void **>(&h_ids_), static_cast<size_t>(k_) * sizeof(int));
         host_alloc(reinterpret_cast<void **>(&h_weights_), static_cast<size_t>(k_) * sizeof(float));
@@ -181,6 +236,7 @@ public:
     __half * d_act() const { return d_act_; }
     __half * d_down() const { return d_down_; }
     float * d_accum() const { return d_accum_; }
+    float * d_shared_gate() const { return d_shared_gate_; }
     int * h_ids() const { return h_ids_; }
     float * h_weights() const { return h_weights_; }
 
@@ -205,6 +261,7 @@ private:
         if (d_act_) cudaFree(d_act_);
         if (d_down_) cudaFree(d_down_);
         if (d_accum_) cudaFree(d_accum_);
+        if (d_shared_gate_) cudaFree(d_shared_gate_);
         if (h_ids_) cudaFreeHost(h_ids_);
         if (h_weights_) cudaFreeHost(h_weights_);
         d_logits_ = nullptr;
@@ -212,6 +269,7 @@ private:
         d_weights_ = nullptr;
         d_gate_ = d_up_ = d_gate_up_ = d_act_ = d_down_ = nullptr;
         d_accum_ = nullptr;
+        d_shared_gate_ = nullptr;
         h_ids_ = nullptr;
         h_weights_ = nullptr;
     }
@@ -230,6 +288,7 @@ private:
     __half * d_act_ = nullptr;
     __half * d_down_ = nullptr;
     float * d_accum_ = nullptr;
+    float * d_shared_gate_ = nullptr;
     int * h_ids_ = nullptr;
     float * h_weights_ = nullptr;
 };
@@ -355,6 +414,38 @@ inline void run_qwen38_routed_moe_separate(
     }
 
     q38_finish_moe(scratch, out, stream);
+}
+
+
+inline void run_qwen38_shared_expert(
+        const __half * x,
+        const Qwen38SharedExpertWeights & shared,
+        Qwen38MoeScratch & scratch,
+        __half * routed_in_out,
+        cudaStream_t stream) {
+    if (shared.gate_input.size != scratch.hidden() ||
+        shared.gate.rows != scratch.expert_ffn() || shared.gate.cols != scratch.hidden() ||
+        shared.up.rows != scratch.expert_ffn() || shared.up.cols != scratch.hidden() ||
+        shared.down.rows != scratch.hidden() || shared.down.cols != scratch.expert_ffn()) {
+        throw std::runtime_error("Qwen3.8 shared expert geometry mismatch");
+    }
+
+    half_dot_kernel<<<1, 256, 0, stream>>>(
+        shared.gate_input.data, x, scratch.d_shared_gate(), scratch.hidden());
+    sigmoid_scalar_kernel<<<1, 1, 0, stream>>>(scratch.d_shared_gate());
+
+    launch_lowbit_gemv_half(shared.gate, x, scratch.d_gate(), stream);
+    launch_lowbit_gemv_half(shared.up, x, scratch.d_up(), stream);
+
+    const int threads = 256;
+    const int ffn_blocks = (scratch.expert_ffn() + threads - 1) / threads;
+    const int hidden_blocks = (scratch.hidden() + threads - 1) / threads;
+
+    q38_silu_mul_kernel<<<ffn_blocks, threads, 0, stream>>>(
+        scratch.d_gate(), scratch.d_up(), scratch.d_act(), scratch.expert_ffn());
+    launch_lowbit_gemv_half(shared.down, scratch.d_act(), scratch.d_down(), stream);
+    q38_add_shared_kernel<<<hidden_blocks, threads, 0, stream>>>(
+        routed_in_out, scratch.d_down(), scratch.d_shared_gate(), scratch.hidden());
 }
 
 } // namespace wd
