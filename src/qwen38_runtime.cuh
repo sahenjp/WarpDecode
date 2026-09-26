@@ -7,6 +7,7 @@
 #include "qwen38_hc.cuh"
 #include "qwen38_layout.hpp"
 #include "qwen38_moe.cuh"
+#include "qwen38_ple.cuh"
 #include "qwen38_qsa.cuh"
 #include "qwen38_tuning.hpp"
 
@@ -29,6 +30,7 @@ struct Qwen38RuntimeLayer {
     bool qsa = false;
     std::unique_ptr<Qwen38QsaWeights> qsa_w;
     std::unique_ptr<Qwen38GdnWeights> gdn_w;
+    std::unique_ptr<Qwen38PleWeights> ple_w;
 
     GpuMatrix router;
     Qwen38MoeLayerTensors routed;
@@ -41,6 +43,11 @@ struct Qwen38Runtime {
 
     std::vector<Qwen38RuntimeLayer> layers;
     Qwen38HcWeights hc_head;
+
+    LowBitMatrix token_embd;
+    LowBitMatrix output;
+    int vocab = 0;
+    std::unique_ptr<Qwen38PleTable> ple_table;
 
     GpuExpertCache expert_cache;
     GpuFusedExpertCache fused_expert_cache;
@@ -102,6 +109,7 @@ inline void qwen38_check_expert_tensors(
 
 inline Qwen38Runtime load_qwen38_runtime(
         const GgufFile & g,
+        const std::string & model_path,
         int sm,
         int memory_mib) {
     Qwen38Runtime rt;
@@ -115,6 +123,28 @@ inline Qwen38Runtime load_qwen38_runtime(
     }
     if (rt.layout.experts != 512 || rt.layout.experts_used != 10) {
         throw std::runtime_error("Qwen3.8 fast path currently expects 512 experts / top-10 routing");
+    }
+
+    const TensorInfo & tok = g.tensor("token_embd.weight");
+    const TensorInfo & out = g.tensor("output.weight");
+    if (tok.dims.size() != 2 ||
+        static_cast<int>(tok.dims[0]) != rt.layout.hidden ||
+        tok.type != GgmlType::Q8_0) {
+        throw std::runtime_error("Qwen3.8 token embedding must be Q8_0 [hidden,vocab]");
+    }
+    if (out.dims.size() != 2 ||
+        static_cast<int>(out.dims[0]) != rt.layout.hidden ||
+        out.dims[1] != tok.dims[1] ||
+        out.type != GgmlType::Q6_K) {
+        throw std::runtime_error("Qwen3.8 output head must be Q6_K [hidden,vocab]");
+    }
+    rt.vocab = static_cast<int>(tok.dims[1]);
+    rt.token_embd = upload_lowbit_matrix(tok);
+    rt.output = upload_lowbit_matrix(out);
+
+    if (!rt.layout.ple_layers.empty()) {
+        rt.ple_table = std::make_unique<Qwen38PleTable>();
+        rt.ple_table->initialize(model_path, g, rt.layout);
     }
 
     rt.layers.reserve(static_cast<size_t>(rt.layout.trunk_layers));
@@ -137,6 +167,10 @@ inline Qwen38Runtime load_qwen38_runtime(
         } else {
             layer.gdn_w = std::make_unique<Qwen38GdnWeights>(
                 load_qwen38_gdn_weights(g, il, rt.layout));
+        }
+        if (rt.layout.is_ple(il)) {
+            layer.ple_w = std::make_unique<Qwen38PleWeights>(
+                load_qwen38_ple_weights(g, il, rt.layout));
         }
 
         layer.routed = qwen38_moe_tensors(g, il);
