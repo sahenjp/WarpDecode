@@ -29,7 +29,7 @@ struct Qwen38RuntimeLayer {
     std::unique_ptr<Qwen38QsaWeights> qsa_w;
     std::unique_ptr<Qwen38GdnWeights> gdn_w;
 
-    LowBitMatrix router;
+    GpuMatrix router;
     Qwen38MoeLayerTensors routed;
     Qwen38SharedExpertWeights shared;
 };
@@ -57,7 +57,10 @@ inline void qwen38_check_router(
         static_cast<int>(t.dims[1]) != q.experts) {
         throw std::runtime_error("Qwen3.8 router shape mismatch: " + t.name);
     }
-    if (!lowbit_gemv_supported(t.type)) {
+    if (!(lowbit_gemv_supported(t.type) ||
+          t.type == GgmlType::F16 ||
+          t.type == GgmlType::BF16 ||
+          t.type == GgmlType::F32)) {
         throw std::runtime_error("Qwen3.8 router type unsupported: " + t.name);
     }
 }
@@ -142,7 +145,7 @@ inline Qwen38Runtime load_qwen38_runtime(
             throw std::runtime_error("mixed fused/separate expert layout across Qwen3.8 layers");
         }
 
-        layer.router = upload_lowbit_matrix(*layer.routed.router);
+        layer.router = upload_matrix(*layer.routed.router);
         layer.shared = load_qwen38_shared_expert(
             g, il, rt.layout.hidden, rt.layout.shared_ffn);
 
