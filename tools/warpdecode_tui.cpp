@@ -1,5 +1,6 @@
 #include "gguf.hpp"
 #include "gpu_arch.hpp"
+#include "model_profile.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -11,6 +12,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -74,8 +76,10 @@ struct GpuInfo {
 struct ModelInfo {
     fs::path path;
     uintmax_t bytes = 0;
+    size_t shard_count = 1;
     std::string arch = "?";
     std::string quant = "?";
+    wd::ModelProfile profile;
     bool supported = false;
     std::string note;
     bool queued = false;
@@ -194,24 +198,51 @@ ModelInfo inspect_model(const fs::path& p) {
     m.bytes = fs::file_size(p, ec);
     try {
         wd::GgufFile g(p.string());
-        m.arch = g.string_meta("general.architecture");
-        m.quant = quant_name(g.tensor("token_embd.weight").type);
-        m.supported = (m.quant == "Q4_0" && (m.arch == "llama" || m.arch == "qwen2" || m.arch == "qwen3"));
-        if (!m.supported) m.note = "現エンジン対象外";
+        m.profile = wd::profile_model(g, p);
+        m.arch = m.profile.arch;
+        m.quant = m.profile.quant_hint;
+
+        // Dense legacy models can derive the exact type from token_embd.  qwen4exp
+        // split GGUFs may have a metadata-only first shard, so never require a tensor
+        // just to show the model in the TUI.
+        if (!m.profile.qwen38_flash_next) {
+            if (const auto* t = g.optional_tensor("token_embd.weight")) m.quant = quant_name(t->type);
+        }
+        m.supported = m.profile.runnable && m.quant == "Q4_0";
+        if (m.profile.qwen38_flash_next) m.note = "qwen3.8専用planner: runtime配線中";
+        else if (!m.supported) m.note = "現エンジン対象外";
     } catch (const std::exception& e) {
         m.note = e.what();
     }
     return m;
 }
 
+struct GgufGroup {
+    fs::path first;
+    uintmax_t bytes = 0;
+    size_t shards = 0;
+};
+
+std::string gguf_group_key(const fs::path& p, int* shard_index = nullptr) {
+    static const std::regex split_re(R"(^(.*)-([0-9]{5})-of-([0-9]{5})\.gguf$)", std::regex::icase);
+    std::smatch m;
+    const std::string name = p.filename().string();
+    if (!std::regex_match(name, m, split_re)) {
+        if (shard_index) *shard_index = 1;
+        return p.string();
+    }
+    if (shard_index) *shard_index = std::stoi(m[2].str());
+    return (p.parent_path() / (m[1].str() + "-of-" + m[3].str())).string();
+}
+
 std::vector<ModelInfo> discover_models(const std::vector<fs::path>& dirs, size_t limit = 500) {
-    std::vector<ModelInfo> out;
+    std::map<std::string, GgufGroup> groups;
     std::set<fs::path> seen;
     for (const auto& dir : dirs) {
         std::error_code ec;
         if (!fs::exists(dir, ec)) continue;
         fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
-        for (; it != end && out.size() < limit; it.increment(ec)) {
+        for (; it != end && groups.size() < limit; it.increment(ec)) {
             if (ec) { ec.clear(); continue; }
             if (!it->is_regular_file(ec)) continue;
             auto p = it->path();
@@ -221,9 +252,25 @@ std::vector<ModelInfo> discover_models(const std::vector<fs::path>& dirs, size_t
             auto canon = fs::weakly_canonical(p, ec);
             if (ec) canon = p;
             if (!seen.insert(canon).second) continue;
-            out.push_back(inspect_model(canon));
+
+            int shard_index = 1;
+            const std::string key = gguf_group_key(canon, &shard_index);
+            auto& gr = groups[key];
+            gr.bytes += fs::file_size(canon, ec);
+            ++gr.shards;
+            if (gr.first.empty() || shard_index == 1) gr.first = canon;
         }
-        if (out.size() >= limit) break;
+        if (groups.size() >= limit) break;
+    }
+
+    std::vector<ModelInfo> out;
+    out.reserve(groups.size());
+    for (const auto& [_, gr] : groups) {
+        if (gr.first.empty()) continue;
+        auto m = inspect_model(gr.first);
+        m.bytes = gr.bytes;
+        m.shard_count = gr.shards;
+        out.push_back(std::move(m));
     }
     std::sort(out.begin(), out.end(), [](const auto& a, const auto& b){ return a.path.filename().string() < b.path.filename().string(); });
     return out;
@@ -403,8 +450,41 @@ private:
             case 'c': case 'C': edit_number("コンテキスト長: ", cfg_.ctx, 16); break;
             case 'n': case 'N': edit_number("生成トークン数: ", cfg_.generate, 1); break;
             case 't': case 'T': cfg_.autotune = !cfg_.autotune; save_config(cfg_); status_ = cfg_.autotune ? "autotune: ON" : "autotune: OFF"; break;
+            case 'p': case 'P': show_plan(); break;
             default: break;
         }
+    }
+
+    void show_plan() {
+        if (models_.empty()) { status_ = "モデルがありません"; return; }
+        const auto& m = models_[primary_model_ < models_.size() ? primary_model_ : 0];
+        const GpuInfo* gpu = gpus_.empty() ? nullptr : &gpus_[primary_gpu_ < gpus_.size() ? primary_gpu_ : 0];
+        term_.disable();
+        std::cout << "\033[2J\033[HWarpDecode model plan\n\n";
+        std::cout << "model: " << m.path.filename().string() << "\n";
+        std::cout << "family: " << m.profile.family << "  arch=" << m.arch << "  quant=" << m.quant << "\n";
+        std::cout << "size: " << human_size(m.bytes) << "  shards=" << m.shard_count << "\n";
+        if (gpu) {
+            const auto gp = wd::kernel_plan_for_sm(gpu->sm);
+            std::cout << "gpu: " << gpu->name << " sm_" << gpu->sm << "\n";
+            std::cout << "low-bit decode: " << gp.decode << "\n";
+        }
+        if (m.profile.qwen38_flash_next) {
+            std::cout << "layout: " << m.profile.layers << " layers = " << m.profile.gdn_layers << " GDN + " << m.profile.qsa_layers << " QSA\n";
+            std::cout << "moe: " << m.profile.experts << " experts, " << m.profile.routed_experts << " routed + " << m.profile.shared_experts << " shared/token\n";
+            std::cout << "QSA: " << m.profile.qsa_path << "\n";
+            std::cout << "PLE: " << m.profile.ple_path << "\n";
+            std::cout << "MoE: " << m.profile.moe_path << "\n";
+            std::cout << "MTP: " << m.profile.mtp_path << "\n";
+            std::cout << "runtime: planner ready / qwen4exp forward kernels not wired yet\n";
+        } else {
+            std::cout << "decode: " << m.profile.decode_path << "\n";
+            std::cout << "runtime: " << (m.supported ? "ready" : "unsupported") << "\n";
+        }
+        std::cout << "\nEnterで戻ります..." << std::flush;
+        std::string dummy; std::getline(std::cin, dummy);
+        term_.enable();
+        status_ = "planを表示しました";
     }
 
     void edit_number(const std::string& label, int& value, int minv) {
@@ -512,7 +592,7 @@ private:
         std::cout << "\033[2J\033[H";
         std::cout << "warpdecode control  |  batch=1 CUDA inference\n";
         std::cout << "Tab: モデル/GPU  ↑↓: 移動  Enter: 主選択  Space: 複数選択\n";
-        std::cout << "L: 起動  M: 独立複数起動  B: ビルド  A: モデル場所追加  R: 再読込  C/N: ctx/token  T: autotune  Q: 終了\n";
+        std::cout << "L: 起動  M: 独立複数起動  B: ビルド  P: model plan  A: モデル場所追加  R: 再読込  C/N: ctx/token  T: autotune  Q: 終了\n";
         std::cout << "ctx=" << cfg_.ctx << "  generate=" << cfg_.generate << "  autotune=" << (cfg_.autotune ? "on" : "off") << "\n\n";
 
         std::cout << (focus_gpu_ ? "   " : "▶ ") << "Models (" << models_.size() << ")\n";
@@ -524,7 +604,9 @@ private:
             std::cout << ((!focus_gpu_ && i == model_cursor_) ? " > " : "   ")
                       << (i == primary_model_ ? "*" : " ") << (m.queued ? "[x] " : "[ ] ")
                       << m.path.filename().string() << "  " << human_size(m.bytes)
-                      << "  " << m.arch << "/" << m.quant << (m.supported ? "" : "  !") << "\n";
+                      << (m.shard_count > 1 ? "  x" + std::to_string(m.shard_count) + " shards" : "")
+                      << "  " << m.arch << "/" << m.quant
+                      << (m.profile.qwen38_flash_next ? "  [Q38-plan]" : (m.supported ? "" : "  !")) << "\n";
         }
 
         std::cout << "\n" << (focus_gpu_ ? "▶ " : "   ") << "GPUs (" << gpus_.size() << ")\n";
@@ -571,8 +653,11 @@ void dump_state(const fs::path& fixture, const std::vector<fs::path>& override_d
         if (i) std::cout << ',';
         const auto& m = models[i];
         std::cout << "\n    {\"path\":\"" << json_escape(m.path.string()) << "\",\"bytes\":" << m.bytes
+                  << ",\"shards\":" << m.shard_count
                   << ",\"arch\":\"" << json_escape(m.arch) << "\",\"quant\":\"" << m.quant
-                  << "\",\"supported\":" << (m.supported ? "true" : "false") << "}";
+                  << "\",\"family\":\"" << json_escape(m.profile.family)
+                  << "\",\"qwen38_flash_next\":" << (m.profile.qwen38_flash_next ? "true" : "false")
+                  << ",\"supported\":" << (m.supported ? "true" : "false") << "}";
     }
     std::cout << "\n  ]\n}\n";
 }

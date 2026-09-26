@@ -37,6 +37,7 @@ R         GPU/モデル再スキャン
 C         context長
 N         generation長
 T         Q4カーネルautotune ON/OFF
+P         選択モデルの実行plan表示
 Q         終了
 ```
 
@@ -90,6 +91,7 @@ RTX 50系(SM120)はCUDA 12.8以降を使います。
 - Linux / WSL
 - NVIDIA GPU、SM50以上をビルド対象
 - dense Llama / Qwen2 / Qwen3
+- Qwen3.8-Flash-Next (`qwen4exp`) はTUI/planner・split GGUF認識まで対応、専用forward実装中
 - GGUF Q4_0
 - batch=1
 - FP16 KV cache
@@ -151,3 +153,10 @@ Q4_0はロード時に量子値を変えずplanar配置へ再パックします�
 - 5%未満は同等扱い
 
 現環境にはNVIDIA GPU / nvccがないため、CUDA本体の実機性能は未確認です。TUI、GGUF parser、設定・検出部分はホスト側でテストしています。
+
+
+## Qwen3.8-Flash-Next
+
+`qwen4exp`を看板最適化対象に追加しました。split GGUFはTUI上で1モデルにまとめ、metadata-only first shardでも認識します。専用方針は `docs/QWEN38_FLASH_NEXT.md`。
+
+狙うhot pathは **persistent QSA block cache + compact KV gather / direct PLE row reader / hot expert slot cache / grouped low-bit MoE / adaptive MTP2-4** です。現時点ではplannerとPLE direct readerが入り、qwen4exp forward本体は未配線です。

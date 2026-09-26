@@ -61,3 +61,8 @@ CPU推論、AMD、Metal、Vulkan、LoRA、画像、音声、学習、量子化�
 7. P2P/NVLink-aware multi-GPU
 
 単にCUTLASS/BitBLAS等へ全面依存はしない。参照実装と探索器として使い、最終hot pathは依存・dispatch・メモリ配置を削れる場合に専用カーネルへ固定する。
+
+
+## Qwen3.8-Flash-Next fast path
+
+`qwen4exp`はdense runtimeの派生として扱わない。QSA block cache、PLE direct gather、MoE expert slot cache、GDN persistent state、MTP verifierを持つ専用planner/runtimeへ分岐する。詳細は `docs/QWEN38_FLASH_NEXT.md`。
