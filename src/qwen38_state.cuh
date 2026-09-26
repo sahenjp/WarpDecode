@@ -34,18 +34,6 @@ struct Qwen38LayerState {
     Qwen38LayerState(const Qwen38LayerState &) = delete;
     Qwen38LayerState & operator=(const Qwen38LayerState &) = delete;
 
-    Qwen38LayerState(Qwen38LayerState && o) noexcept
-        : hc_attn(std::move(o.hc_attn)),
-          hc_ffn(std::move(o.hc_ffn)),
-          moe(std::move(o.moe)),
-          qsa_state(std::move(o.qsa_state)),
-          qsa_scratch(std::move(o.qsa_scratch)),
-          gdn_state(std::move(o.gdn_state)),
-          gdn_scratch(std::move(o.gdn_scratch)),
-          moe_out(o.moe_out) {
-        o.moe_out = nullptr;
-    }
-
     ~Qwen38LayerState() {
         if (moe_out) cudaFree(moe_out);
     }
@@ -82,12 +70,12 @@ public:
 
         layers_.reserve(static_cast<size_t>(q.trunk_layers));
         for (int il = 0; il < q.trunk_layers; ++il) {
-            Qwen38LayerState st;
-            st.hc_attn.initialize(q.hidden, q.hc_count, q.hc_low_rank);
-            st.hc_ffn.initialize(q.hidden, q.hc_count, q.hc_low_rank);
-            st.moe.initialize(q.experts, q.experts_used, q.hidden, q.expert_ffn);
+            auto st = std::make_unique<Qwen38LayerState>();
+            st->hc_attn.initialize(q.hidden, q.hc_count, q.hc_low_rank);
+            st->hc_ffn.initialize(q.hidden, q.hc_count, q.hc_low_rank);
+            st->moe.initialize(q.experts, q.experts_used, q.hidden, q.expert_ffn);
 
-            e = cudaMalloc(reinterpret_cast<void **>(&st.moe_out), static_cast<size_t>(q.hidden) * sizeof(__half));
+            e = cudaMalloc(reinterpret_cast<void **>(&st->moe_out), static_cast<size_t>(q.hidden) * sizeof(__half));
             if (e != cudaSuccess) throw std::runtime_error("cudaMalloc Qwen3.8 MoE output failed");
 
             if (q.is_qsa(il)) {
@@ -96,15 +84,15 @@ public:
                     : static_cast<int>(q.compress_ratios[static_cast<size_t>(il)]);
                 if (ratio <= 0) throw std::runtime_error("invalid QSA compression ratio");
 
-                st.qsa_state = std::make_unique<Qwen38QsaState>();
-                st.qsa_scratch = std::make_unique<Qwen38QsaScratch>();
-                initialize_qwen38_qsa_state(*st.qsa_state, max_ctx, ratio, q);
-                st.qsa_scratch->initialize(q);
+                st->qsa_state = std::make_unique<Qwen38QsaState>();
+                st->qsa_scratch = std::make_unique<Qwen38QsaScratch>();
+                initialize_qwen38_qsa_state(*st->qsa_state, max_ctx, ratio, q);
+                st->qsa_scratch->initialize(q);
             } else {
-                st.gdn_state = std::make_unique<Qwen38GdnState>();
-                st.gdn_scratch = std::make_unique<Qwen38GdnScratch>();
-                st.gdn_state->initialize(q);
-                st.gdn_scratch->initialize(q);
+                st->gdn_state = std::make_unique<Qwen38GdnState>();
+                st->gdn_scratch = std::make_unique<Qwen38GdnScratch>();
+                st->gdn_state->initialize(q);
+                st->gdn_scratch->initialize(q);
             }
 
             layers_.push_back(std::move(st));
@@ -117,8 +105,8 @@ public:
     void clear() {
         if (!stream_) return;
         for (auto & st : layers_) {
-            if (st.qsa_state) st.qsa_state->clear(stream_);
-            if (st.gdn_state) st.gdn_state->clear(stream_);
+            if (st->qsa_state) st->qsa_state->clear(stream_);
+            if (st->gdn_state) st->gdn_state->clear(stream_);
         }
         cudaMemsetAsync(residual_, 0,
             residual_elements() * sizeof(__half), stream_);
@@ -135,14 +123,14 @@ public:
         if (il < 0 || il >= static_cast<int>(layers_.size())) {
             throw std::runtime_error("Qwen3.8 layer state index out of range");
         }
-        return layers_[static_cast<size_t>(il)];
+        return *layers_[static_cast<size_t>(il)];
     }
 
 private:
     size_t residual_elements() const {
         if (layers_.empty()) return 0;
-        return static_cast<size_t>(layers_.front().hc_attn.hidden())
-             * layers_.front().hc_attn.hc();
+        return static_cast<size_t>(layers_.front()->hc_attn.hidden())
+             * layers_.front()->hc_attn.hc();
     }
 
     int max_ctx_ = 0;
@@ -150,7 +138,7 @@ private:
     __half * residual_ = nullptr;
     __half * head_hidden_ = nullptr;
     Qwen38HcScratch head_hc_;
-    std::vector<Qwen38LayerState> layers_;
+    std::vector<std::unique_ptr<Qwen38LayerState>> layers_;
 };
 
 } // namespace wd
