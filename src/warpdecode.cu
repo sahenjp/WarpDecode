@@ -573,7 +573,7 @@ __global__ void attention_decode_kernel(const __half* q,
     const int kvh = (h * kv_heads) / heads;
     const float qd = d < head_dim ? half_to_float(q[h * head_dim + d]) : 0.0f;
     float acc = 0.0f;
-    float m = -CUDART_INF_F;
+    float m = -INFINITY;
     float l = 0.0f;
     const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
 
@@ -623,7 +623,7 @@ struct MaxPair { float v; int i; };
 
 __global__ void argmax_kernel(const float* logits, int n, int* token, int* out_tokens, const int* pos_ptr) {
     __shared__ MaxPair sm[256];
-    MaxPair best{-CUDART_INF_F, 0};
+    MaxPair best{-INFINITY, 0};
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float v = logits[i];
         if (v > best.v || (v == best.v && i < best.i)) best = {v, i};
