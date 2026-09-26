@@ -66,7 +66,7 @@ struct DeviceHalfBuffer {
     __half* p = nullptr;
     size_t n = 0;
     DeviceHalfBuffer() = default;
-    explicit DeviceHalfBuffer(size_t count) : n(count) { WD_CUDA(cudaMalloc(&p, n * sizeof(__half))); }
+    explicit DeviceHalfBuffer(size_t count) : n(count) { WD_CUDA(cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(__half))); }
     DeviceHalfBuffer(const DeviceHalfBuffer&) = delete;
     DeviceHalfBuffer& operator=(const DeviceHalfBuffer&) = delete;
     DeviceHalfBuffer(DeviceHalfBuffer&& o) noexcept : p(o.p), n(o.n) { o.p = nullptr; o.n = 0; }
@@ -81,7 +81,7 @@ struct DeviceFloatBuffer {
     float* p = nullptr;
     size_t n = 0;
     DeviceFloatBuffer() = default;
-    explicit DeviceFloatBuffer(size_t count) : n(count) { WD_CUDA(cudaMalloc(&p, n * sizeof(float))); }
+    explicit DeviceFloatBuffer(size_t count) : n(count) { WD_CUDA(cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(float))); }
     DeviceFloatBuffer(const DeviceFloatBuffer&) = delete;
     DeviceFloatBuffer& operator=(const DeviceFloatBuffer&) = delete;
     DeviceFloatBuffer(DeviceFloatBuffer&& o) noexcept : p(o.p), n(o.n) { o.p = nullptr; o.n = 0; }
@@ -160,8 +160,8 @@ static HostPlanarQ4 concat_q4(const std::vector<HostPlanarQ4>& xs) {
 static Q4Matrix upload_q4(const HostPlanarQ4& h) {
     Q4Matrix out;
     out.rows = h.rows; out.cols = h.cols;
-    WD_CUDA(cudaMalloc(&out.q, h.q.size()));
-    WD_CUDA(cudaMalloc(&out.d, h.d_bits.size() * sizeof(uint16_t)));
+    WD_CUDA(cudaMalloc(reinterpret_cast<void**>(&out.q), h.q.size()));
+    WD_CUDA(cudaMalloc(reinterpret_cast<void**>(&out.d), h.d_bits.size() * sizeof(uint16_t)));
     WD_CUDA(cudaMemcpy(out.q, h.q.data(), h.q.size(), cudaMemcpyHostToDevice));
     WD_CUDA(cudaMemcpy(out.d, h.d_bits.data(), h.d_bits.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
     return out;
@@ -655,9 +655,9 @@ struct Runtime {
         kcache(static_cast<size_t>(model.layers) * ctx * model.kv_dim),
         vcache(static_cast<size_t>(model.layers) * ctx * model.kv_dim) {
         WD_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        WD_CUDA(cudaMalloc(&d_token, sizeof(int)));
-        WD_CUDA(cudaMalloc(&d_pos, sizeof(int)));
-        WD_CUDA(cudaMalloc(&d_out_tokens, static_cast<size_t>(ctx) * sizeof(int)));
+        WD_CUDA(cudaMalloc(reinterpret_cast<void**>(&d_token), sizeof(int)));
+        WD_CUDA(cudaMalloc(reinterpret_cast<void**>(&d_pos), sizeof(int)));
+        WD_CUDA(cudaMalloc(reinterpret_cast<void**>(&d_out_tokens), static_cast<size_t>(ctx) * sizeof(int)));
         WD_CUDA(cudaMemsetAsync(kcache.p, 0, kcache.n * sizeof(__half), stream));
         WD_CUDA(cudaMemsetAsync(vcache.p, 0, vcache.n * sizeof(__half), stream));
         WD_CUDA(cudaMemsetAsync(d_out_tokens, 0xff, static_cast<size_t>(ctx) * sizeof(int), stream));
