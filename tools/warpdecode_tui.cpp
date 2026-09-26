@@ -186,6 +186,12 @@ std::vector<GpuInfo> discover_gpus(const fs::path& fixture = {}) {
 std::string quant_name(wd::GgmlType t) {
     switch (t) {
         case wd::GgmlType::Q4_0: return "Q4_0";
+        case wd::GgmlType::Q8_0: return "Q8_0";
+        case wd::GgmlType::Q6_K: return "Q6_K";
+        case wd::GgmlType::IQ4_NL: return "IQ4_NL";
+        case wd::GgmlType::IQ3_S: return "IQ3_S";
+        case wd::GgmlType::IQ2_S: return "IQ2_S";
+        case wd::GgmlType::BF16: return "BF16";
         case wd::GgmlType::F16: return "F16";
         case wd::GgmlType::F32: return "F32";
         default: return "other";
