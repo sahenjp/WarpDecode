@@ -4,6 +4,7 @@
 #include "qwen38_layout.hpp"
 #include "qwen38_hc.cuh"
 #include "qwen38_gdn.cuh"
+#include "qwen38_forward.cuh"
 #include "qwen38_moe.cuh"
 #include "qwen38_runtime.cuh"
 #include "qwen38_state.cuh"
@@ -787,7 +788,7 @@ int main(int argc, char** argv) {
         if (arch == "qwen4exp") {
             const int memory_mib = static_cast<int>(prop.totalGlobalMem / (1024ull * 1024ull));
             std::cerr << "Qwen3.8-Flash-Next専用runtimeを構築します\n";
-            auto qrt = wd::load_qwen38_runtime(gguf, cc, memory_mib);
+            auto qrt = wd::load_qwen38_runtime(gguf, args.model, cc, memory_mib);
             wd::Qwen38DecodeState qstate;
             qstate.initialize(qrt, args.ctx);
             std::cerr << "arch=qwen4exp trunk=" << qrt.layout.trunk_layers
@@ -800,24 +801,49 @@ int main(int argc, char** argv) {
                       << " MiB slots=" << qrt.expert_cache_slots
                       << " fused=" << (qrt.fused_experts ? "true" : "false") << "\n";
 
-            if (!args.load_only) {
-                throw std::runtime_error(
-                    "Qwen3.8 forwardは配線中です。まず --load-only で実モデルロードを検証してください");
+            if (args.load_only) {
+                std::cout << "{\"engine\":\"warpdecode-qwen38\",\"gpu\":\"" << prop.name
+                          << "\",\"arch\":\"qwen4exp\""
+                          << ",\"load_only\":true"
+                          << ",\"trunk_layers\":" << qrt.layout.trunk_layers
+                          << ",\"qsa_layers\":" << qrt.layout.qsa_layer_count()
+                          << ",\"gdn_layers\":" << qrt.layout.gdn_layer_count()
+                          << ",\"experts\":" << qrt.layout.experts
+                          << ",\"experts_used\":" << qrt.layout.experts_used
+                          << ",\"vocab\":" << qrt.vocab
+                          << ",\"expert_cache_mib\":" << qrt.tuning.expert_cache_mib
+                          << ",\"expert_cache_slots\":" << qrt.expert_cache_slots
+                          << ",\"ctx\":" << qstate.max_ctx()
+                          << ",\"decode_state_initialized\":true"
+                          << ",\"ple\":" << (qrt.ple_table ? "true" : "false")
+                          << ",\"fused_experts\":" << (qrt.fused_experts ? "true" : "false")
+                          << ",\"kernel_family\":\"" << kernel_plan.family << "\"}\n";
+                return 0;
             }
+
+            if (args.start_token >= qrt.vocab) {
+                throw std::runtime_error("--start-token がQwen3.8語彙数以上です");
+            }
+
+            wd::Qwen38Decoder decoder(qrt, qstate);
+            std::vector<int> generated;
+            generated.reserve(static_cast<size_t>(args.generate));
+            const double sec = decoder.run(args.start_token, args.generate, &generated);
+            const double tps = args.generate / sec;
+            const uint64_t token_hash = wd::qwen38_token_hash(generated);
 
             std::cout << "{\"engine\":\"warpdecode-qwen38\",\"gpu\":\"" << prop.name
                       << "\",\"arch\":\"qwen4exp\""
-                      << ",\"load_only\":true"
-                      << ",\"trunk_layers\":" << qrt.layout.trunk_layers
-                      << ",\"qsa_layers\":" << qrt.layout.qsa_layer_count()
-                      << ",\"gdn_layers\":" << qrt.layout.gdn_layer_count()
-                      << ",\"experts\":" << qrt.layout.experts
-                      << ",\"experts_used\":" << qrt.layout.experts_used
-                      << ",\"expert_cache_mib\":" << qrt.tuning.expert_cache_mib
-                      << ",\"expert_cache_slots\":" << qrt.expert_cache_slots
+                      << ",\"tokens\":" << args.generate
+                      << ",\"seconds\":" << std::fixed << std::setprecision(6) << sec
+                      << ",\"tok_s\":" << std::setprecision(3) << tps
+                      << ",\"first_token\":" << (generated.empty() ? -1 : generated.front())
+                      << ",\"last_token\":" << (generated.empty() ? -1 : generated.back())
+                      << ",\"token_hash\":\"0x" << std::hex << token_hash << std::dec << "\""
                       << ",\"ctx\":" << qstate.max_ctx()
-                      << ",\"decode_state_initialized\":true"
-                      << ",\"fused_experts\":" << (qrt.fused_experts ? "true" : "false")
+                      << ",\"ple\":" << (qrt.ple_table ? "true" : "false")
+                      << ",\"mtp\":false"
+                      << ",\"cuda_graph\":false"
                       << ",\"kernel_family\":\"" << kernel_plan.family << "\"}\n";
             return 0;
         }
