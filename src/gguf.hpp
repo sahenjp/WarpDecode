@@ -29,6 +29,7 @@ enum class GgmlType : uint32_t {
     Q4_0 = 2,
     Q8_0 = 8,
     Q6_K = 14,
+    IQ3_XXS = 18,
     IQ4_NL = 20,
     IQ3_S = 21,
     IQ2_S = 22,
@@ -260,6 +261,7 @@ struct TensorInfo {
             case GgmlType::Q4_0:   return blocked(32, 18, "Q4_0");
             case GgmlType::Q8_0:   return blocked(32, 34, "Q8_0");
             case GgmlType::Q6_K:   return blocked(256, 210, "Q6_K");
+            case GgmlType::IQ3_XXS:return blocked(256, 98, "IQ3_XXS");
             case GgmlType::IQ4_NL: return blocked(32, 18, "IQ4_NL");
             case GgmlType::IQ3_S:  return blocked(256, 110, "IQ3_S");
             case GgmlType::IQ2_S:  return blocked(256, 82, "IQ2_S");
