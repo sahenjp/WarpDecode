@@ -786,6 +786,8 @@ int main(int argc, char** argv) {
             const int memory_mib = static_cast<int>(prop.totalGlobalMem / (1024ull * 1024ull));
             std::cerr << "Qwen3.8-Flash-Next専用runtimeを構築します\n";
             auto qrt = wd::load_qwen38_runtime(gguf, cc, memory_mib);
+            wd::Qwen38DecodeState qstate;
+            qstate.initialize(qrt, args.ctx);
             std::cerr << "arch=qwen4exp trunk=" << qrt.layout.trunk_layers
                       << " qsa=" << qrt.layout.qsa_layer_count()
                       << " gdn=" << qrt.layout.gdn_layer_count()
@@ -811,6 +813,8 @@ int main(int argc, char** argv) {
                       << ",\"experts_used\":" << qrt.layout.experts_used
                       << ",\"expert_cache_mib\":" << qrt.tuning.expert_cache_mib
                       << ",\"expert_cache_slots\":" << qrt.expert_cache_slots
+                      << ",\"ctx\":" << qstate.max_ctx()
+                      << ",\"decode_state_initialized\":true"
                       << ",\"fused_experts\":" << (qrt.fused_experts ? "true" : "false")
                       << ",\"kernel_family\":\"" << kernel_plan.family << "\"}\n";
             return 0;
