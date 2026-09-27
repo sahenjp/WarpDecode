@@ -1,6 +1,6 @@
 # Modal $1 Qwen3.8-Flash-Next tuning run
 
-目的は長時間ベンチではなく、WarpDecodeのQSA / PLE / MoE / MTPパラメータを短時間で絞ること。
+目的は長時間ベンチではなく、warodecodeのQSA / PLE / MoE / MTPパラメータを短時間で絞ること。
 
 ## GPU時間をモデル取得に使わない
 
@@ -42,7 +42,7 @@ acceptance率ではなく:
 reward = accepted_target_tokens / gpu_microseconds
 ```
 
-を最大化する。WarpDecodeの `AdaptiveMtpController` は最初に2/3/4を1回ずつ測り、その後はEWMA reward最大のdraft長を選ぶ。
+を最大化する。warodecodeの `AdaptiveMtpController` は最初に2/3/4を1回ずつ測り、その後はEWMA reward最大のdraft長を選ぶ。
 
 ## 記録必須
 

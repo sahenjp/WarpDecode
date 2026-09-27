@@ -13,12 +13,12 @@ V100実機を持っている人には、最初はコード改造を頼まずロ�
 手順:
 
 ```bash
-git clone <warpdecodeのリポジトリ>
-cd warpdecode
+git clone <warodecodeのリポジトリ>
+cd warodecode
 ./bench/build.sh v100
 
 ./bench/ab.sh \
-  ./build-sm70/warpdecode \
+  ./build-sm70/warodecode \
   /path/to/llama.cpp/build/bin/llama-bench \
   /models/model-Q4_0.gguf \
   999
@@ -27,7 +27,7 @@ cd warpdecode
 追加で:
 
 ```bash
-./bench/profile.sh ./build-sm70/warpdecode /models/model-Q4_0.gguf
+./bench/profile.sh ./build-sm70/warodecode /models/model-Q4_0.gguf
 nvidia-smi -q > bench-out/nvidia-smi-q.txt
 nvcc --version > bench-out/nvcc.txt
 ```

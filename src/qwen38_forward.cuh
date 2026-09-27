@@ -33,12 +33,28 @@ struct Q38MaxPair {
 
 struct Qwen38Trace {
     std::vector<float> hc_init;
+    std::vector<float> hc_attn_norm;
+    std::vector<float> hc_attn_low;
+    std::vector<float> hc_attn_gate;
     std::vector<float> hc_attn_mix;
+    std::vector<float> hc_attn_mix_used;
+    Qwen38HcF32Trace hc_f32;
+    std::vector<float> gdn_qkv;
+    std::vector<float> gdn_z;
+    std::vector<float> gdn_beta;
+    std::vector<float> gdn_alpha;
+    std::vector<float> gdn_gate;
+    std::vector<float> gdn_core_out;
+    std::vector<float> gdn_norm_out;
     std::vector<float> attn_out;
     std::vector<float> after_attn;
     std::vector<float> hc_ffn_mix;
     std::vector<float> ffn_out;
     std::vector<float> after_ffn;
+    std::vector<float> router_logits;
+    std::vector<float> router_weights;
+    std::vector<int> expert_ids;
+    bool use_f32_hc_layer0 = false;
 };
 
 __global__ void q38_argmax_kernel(
@@ -125,13 +141,25 @@ public:
         }
 
         cudaStream_t stream = state_.stream();
+        Qwen38HcF32DebugScratch hc_f32_scratch;
 
         // The wide HC residual starts as four identical copies of the token embedding.
         launch_q8_0_gather_row(rt_.token_embd, token, state_.head_hidden(), stream);
         const int hc_dim = q.hidden * q.hc_count;
         q38_repeat_embedding_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
             state_.head_hidden(), state_.residual(), q.hidden, q.hc_count);
-        if (trace) trace->hc_init = copy_half(state_.residual(), static_cast<size_t>(hc_dim));
+        if (trace) trace->hc_init = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
+        if (trace) {
+            const Qwen38HcWeights & hc_attn = rt_.layers.front().hc_attn;
+            hc_f32_scratch.initialize(q.hidden, q.hc_count, q.hc_low_rank);
+            run_qwen38_hc_f32_debug(rt_.token_embd, token, hc_attn, hc_f32_scratch, q.rms_eps, stream);
+            trace->hc_f32.init = copy_float(stream, hc_f32_scratch.residual(), static_cast<size_t>(hc_dim));
+            trace->hc_f32.norm = copy_float(stream, hc_f32_scratch.norm(), static_cast<size_t>(hc_dim));
+            trace->hc_f32.low_raw = copy_float(stream, hc_f32_scratch.low_raw(), static_cast<size_t>(q.hc_low_rank));
+            trace->hc_f32.low = copy_float(stream, hc_f32_scratch.low(), static_cast<size_t>(q.hc_low_rank));
+            trace->hc_f32.gate = copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim));
+            trace->hc_f32.mixed = copy_float(stream, hc_f32_scratch.mixed(), static_cast<size_t>(q.hidden));
+        }
 
         for (int il = 0; il < q.trunk_layers; ++il) {
             Qwen38RuntimeLayer & layer = rt_.layers[static_cast<size_t>(il)];
@@ -150,7 +178,20 @@ public:
 
             __half * cur = run_qwen38_hc_mix(
                 state_.residual(), layer.hc_attn, st.hc_attn, q.rms_eps, stream);
-            if (trace && il == 0) trace->hc_attn_mix = copy_half(cur, static_cast<size_t>(q.hidden));
+            if (trace && il == 0) {
+                trace->hc_attn_norm = copy_half(stream, st.hc_attn.xn(), static_cast<size_t>(hc_dim));
+                trace->hc_attn_low = copy_half(
+                    stream, st.hc_attn.lo(), static_cast<size_t>(st.hc_attn.low_rank()));
+                trace->hc_attn_gate = copy_half(stream, st.hc_attn.gate(), static_cast<size_t>(hc_dim));
+                trace->hc_attn_mix = copy_half(stream, cur, static_cast<size_t>(q.hidden));
+            }
+            if (trace && trace->use_f32_hc_layer0 && il == 0) {
+                const int blocks = (q.hidden + 255) / 256;
+                q38_float_to_half_kernel<<<blocks, 256, 0, stream>>>(
+                    hc_f32_scratch.mixed(), st.hc_attn.mixed(), q.hidden);
+                cur = st.hc_attn.mixed();
+                trace->hc_attn_mix_used = copy_half(stream, cur, static_cast<size_t>(q.hidden));
+            }
 
             __half * attn_out = nullptr;
             if (layer.qsa) {
@@ -167,14 +208,26 @@ public:
                 attn_out = run_qwen38_gdn(
                     cur, *layer.gdn_w, *st.gdn_state, *st.gdn_scratch,
                     q, q.rms_eps, stream);
+                if (trace && il == 0) {
+                    const int key_dim = q.ssm_state_size * q.ssm_group_count;
+                    const int value_dim = q.ssm_state_size * q.ssm_dt_rank;
+                    const int conv_dim = key_dim * 2 + value_dim;
+                    trace->gdn_qkv = copy_half(stream, st.gdn_scratch->qkv(), static_cast<size_t>(conv_dim));
+                    trace->gdn_z = copy_half(stream, st.gdn_scratch->z(), static_cast<size_t>(value_dim));
+                    trace->gdn_beta = copy_half(stream, st.gdn_scratch->beta(), static_cast<size_t>(q.ssm_dt_rank));
+                    trace->gdn_alpha = copy_half(stream, st.gdn_scratch->alpha(), static_cast<size_t>(q.ssm_dt_rank));
+                    trace->gdn_gate = copy_float(stream, st.gdn_scratch->gate(), static_cast<size_t>(q.ssm_dt_rank));
+                    trace->gdn_core_out = copy_half(stream, st.gdn_scratch->core_out(), static_cast<size_t>(value_dim));
+                    trace->gdn_norm_out = copy_half(stream, st.gdn_scratch->norm_out(), static_cast<size_t>(value_dim));
+                }
             }
-            if (trace && il == 0) trace->attn_out = copy_half(attn_out, static_cast<size_t>(q.hidden));
+            if (trace && il == 0) trace->attn_out = copy_half(stream, attn_out, static_cast<size_t>(q.hidden));
             run_qwen38_hc_combine(state_.residual(), attn_out, st.hc_attn, stream);
-            if (trace && il == 0) trace->after_attn = copy_half(state_.residual(), static_cast<size_t>(hc_dim));
+            if (trace && il == 0) trace->after_attn = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
 
             cur = run_qwen38_hc_mix(
                 state_.residual(), layer.hc_ffn, st.hc_ffn, q.rms_eps, stream);
-            if (trace && il == 0) trace->hc_ffn_mix = copy_half(cur, static_cast<size_t>(q.hidden));
+            if (trace && il == 0) trace->hc_ffn_mix = copy_half(stream, cur, static_cast<size_t>(q.hidden));
 
             if (rt_.fused_experts) {
                 if (!layer.routed.gate_up || !layer.routed.down) {
@@ -195,16 +248,20 @@ public:
                     rt_.expert_cache, st.moe, st.moe_out,
                     q.expert_weights_scale, stream);
             }
+            if (trace && il == 0) {
+                trace->router_logits = copy_float(stream, st.moe.d_logits(), static_cast<size_t>(q.experts));
+                trace->router_weights.assign(st.moe.h_weights(), st.moe.h_weights() + q.experts_used);
+                trace->expert_ids.assign(st.moe.h_ids(), st.moe.h_ids() + q.experts_used);
+            }
 
             run_qwen38_shared_expert(cur, layer.shared, st.moe, st.moe_out, stream);
-            if (trace && il == 0) trace->ffn_out = copy_half(st.moe_out, static_cast<size_t>(q.hidden));
+            if (trace && il == 0) trace->ffn_out = copy_half(stream, st.moe_out, static_cast<size_t>(q.hidden));
             run_qwen38_hc_combine(state_.residual(), st.moe_out, st.hc_ffn, stream);
-            if (trace && il == 0) trace->after_ffn = copy_half(state_.residual(), static_cast<size_t>(hc_dim));
+            if (trace && il == 0) trace->after_ffn = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
         }
 
         __half * head = run_qwen38_hc_mix(
             state_.residual(), rt_.hc_head, state_.head_hc(), q.rms_eps, stream);
-
         launch_lowbit_gemv_float(rt_.output, head, logits_, stream);
         q38_argmax_kernel<<<1, 256, 0, stream>>>(
             logits_, rt_.vocab, next_token_, has_nonfinite_);
@@ -295,15 +352,27 @@ public:
     }
 
 private:
-    static std::vector<float> copy_half(const __half * data, size_t n) {
+    static std::vector<float> copy_half(cudaStream_t stream, const __half * data, size_t n) {
+        cudaError_t e = cudaStreamSynchronize(stream);
+        if (e != cudaSuccess) throw std::runtime_error("sync Qwen3.8 trace stream failed");
         std::vector<__half> half(n);
-        const cudaError_t e = cudaMemcpy(
+        e = cudaMemcpy(
             half.data(), data, n * sizeof(__half), cudaMemcpyDeviceToHost);
         if (e != cudaSuccess) throw std::runtime_error("copy Qwen3.8 trace tensor failed");
         std::vector<float> out(n);
         std::transform(half.begin(), half.end(), out.begin(), [](__half x) {
             return __half2float(x);
         });
+        return out;
+    }
+
+    static std::vector<float> copy_float(cudaStream_t stream, const float * data, size_t n) {
+        cudaError_t e = cudaStreamSynchronize(stream);
+        if (e != cudaSuccess) throw std::runtime_error("sync Qwen3.8 trace stream failed");
+        std::vector<float> out(n);
+        e = cudaMemcpy(
+            out.data(), data, n * sizeof(float), cudaMemcpyDeviceToHost);
+        if (e != cudaSuccess) throw std::runtime_error("copy Qwen3.8 trace tensor failed");
         return out;
     }
 

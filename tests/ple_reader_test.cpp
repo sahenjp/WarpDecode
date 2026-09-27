@@ -7,7 +7,7 @@
 #include <vector>
 
 int main() {
-    const char* path = "/tmp/warpdecode-ple-reader.bin";
+    const char* path = "/tmp/warodecode-ple-reader.bin";
     constexpr uint32_t row_bytes = 7;
     constexpr uint64_t rows = 32;
     {

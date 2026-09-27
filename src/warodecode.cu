@@ -47,6 +47,7 @@ struct Args {
     bool graph = true;
     bool autotune = true;
     bool load_only = false;
+    bool debug_f32_hc_layer0 = false;
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -66,11 +67,13 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--no-graph") a.graph = false;
         else if (s == "--no-autotune") a.autotune = false;
         else if (s == "--load-only") a.load_only = true;
+        else if (s == "--debug-f32-hc-layer0") a.debug_f32_hc_layer0 = true;
         else if (s == "-h" || s == "--help") {
-            std::cout << "warpdecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--no-graph] [--no-autotune] [--load-only]\n";
+            std::cout << "warodecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--debug-f32-hc-layer0] [--no-graph] [--no-autotune] [--load-only]\n";
             std::exit(0);
         } else throw std::runtime_error("不明な引数: " + s);
     }
+    if (a.debug_f32_hc_layer0 && a.top_k == 0) a.top_k = 10;
     if (a.model.empty()) throw std::runtime_error("--model が必要です");
     if (a.ctx < 16 || a.generate < 1 || a.start_token < 0 || a.top_k < 0 || a.top_k > 256) {
         throw std::runtime_error("引数範囲が不正です");
@@ -779,7 +782,7 @@ int main(int argc, char** argv) {
         WD_CUDA(cudaSetDevice(args.device));
         cudaDeviceProp prop{}; WD_CUDA(cudaGetDeviceProperties(&prop, args.device));
         const int cc = prop.major * 10 + prop.minor;
-        if (cc < 50) throw std::runtime_error("warpdecodeはSM50以上のNVIDIA GPUを対象にします");
+        if (cc < 50) throw std::runtime_error("warodecodeはSM50以上のNVIDIA GPUを対象にします");
         if (args.ctx <= args.generate + 2) throw std::runtime_error("--ctx は --generate より十分大きくしてください");
 
         const auto kernel_plan = wd::kernel_plan_for_sm(cc);
@@ -806,7 +809,7 @@ int main(int argc, char** argv) {
                       << " fused=" << (qrt.fused_experts ? "true" : "false") << "\n";
 
             if (args.load_only) {
-                std::cout << "{\"engine\":\"warpdecode-qwen38\",\"gpu\":\"" << prop.name
+                std::cout << "{\"engine\":\"warodecode-qwen38\",\"gpu\":\"" << prop.name
                           << "\",\"arch\":\"qwen4exp\""
                           << ",\"load_only\":true"
                           << ",\"trunk_layers\":" << qrt.layout.trunk_layers
@@ -834,6 +837,7 @@ int main(int argc, char** argv) {
             generated.reserve(static_cast<size_t>(args.generate));
             std::vector<std::pair<int, float>> top_logits;
             wd::Qwen38Trace trace;
+            trace.use_f32_hc_layer0 = args.debug_f32_hc_layer0;
             const double sec = decoder.run(
                 args.start_token, args.generate, &generated,
                 args.top_k > 0 ? &top_logits : nullptr, args.top_k,
@@ -841,7 +845,7 @@ int main(int argc, char** argv) {
             const double tps = args.generate / sec;
             const uint64_t token_hash = wd::qwen38_token_hash(generated);
 
-            std::cout << "{\"engine\":\"warpdecode-qwen38\",\"gpu\":\"" << prop.name
+            std::cout << "{\"engine\":\"warodecode-qwen38\",\"gpu\":\"" << prop.name
                       << "\",\"arch\":\"qwen4exp\""
                       << ",\"tokens\":" << args.generate
                       << ",\"seconds\":" << std::fixed << std::setprecision(6) << sec
@@ -852,6 +856,7 @@ int main(int argc, char** argv) {
                       << ",\"ctx\":" << qstate.max_ctx()
                       << ",\"ple\":" << (qrt.ple_table ? "true" : "false")
                       << ",\"mtp\":false"
+                      << ",\"debug_f32_hc_layer0\":" << (args.debug_f32_hc_layer0 ? "true" : "false")
                       << ",\"cuda_graph\":false"
                       << ",\"kernel_family\":\"" << kernel_plan.family << "\""
                       << ",\"token_ids\":[";
@@ -877,12 +882,37 @@ int main(int argc, char** argv) {
                     std::cout << ']';
                 };
                 dump_trace("hc_init", trace.hc_init);
+                dump_trace("hc_attn_norm", trace.hc_attn_norm);
+                dump_trace("hc_attn_low", trace.hc_attn_low);
+                dump_trace("hc_attn_gate", trace.hc_attn_gate);
                 dump_trace("hc_attn_mix", trace.hc_attn_mix);
+                dump_trace("hc_attn_mix_used", trace.hc_attn_mix_used);
+                dump_trace("hc_f32_init", trace.hc_f32.init);
+                dump_trace("hc_f32_norm", trace.hc_f32.norm);
+                dump_trace("hc_f32_low_raw", trace.hc_f32.low_raw);
+                dump_trace("hc_f32_low", trace.hc_f32.low);
+                dump_trace("hc_f32_gate", trace.hc_f32.gate);
+                dump_trace("hc_f32_mix", trace.hc_f32.mixed);
+                dump_trace("gdn_qkv", trace.gdn_qkv);
+                dump_trace("gdn_z", trace.gdn_z);
+                dump_trace("gdn_beta", trace.gdn_beta);
+                dump_trace("gdn_alpha", trace.gdn_alpha);
+                dump_trace("gdn_gate", trace.gdn_gate);
+                dump_trace("gdn_core_out", trace.gdn_core_out);
+                dump_trace("gdn_norm_out", trace.gdn_norm_out);
                 dump_trace("attn_out", trace.attn_out);
                 dump_trace("after_attn", trace.after_attn);
                 dump_trace("hc_ffn_mix", trace.hc_ffn_mix);
                 dump_trace("ffn_out", trace.ffn_out);
                 dump_trace("after_ffn", trace.after_ffn);
+                dump_trace("router_logits", trace.router_logits);
+                dump_trace("router_weights", trace.router_weights);
+                std::cout << ",\"expert_ids\":[";
+                for (size_t i = 0; i < trace.expert_ids.size(); ++i) {
+                    if (i != 0) std::cout << ',';
+                    std::cout << trace.expert_ids[i];
+                }
+                std::cout << ']';
             }
             std::cout << "}\n";
             return 0;
@@ -896,7 +926,7 @@ int main(int argc, char** argv) {
         std::cerr << "制約: Q4_0 dense / batch=1 / greedy / FP16 KV / CUDA only\n";
 
         if (args.load_only) {
-            std::cout << "{\"engine\":\"warpdecode-v2\",\"gpu\":\"" << prop.name
+            std::cout << "{\"engine\":\"warodecode-v2\",\"gpu\":\"" << prop.name
                       << "\",\"arch\":\"" << model.arch << "\",\"load_only\":true}\n";
             return 0;
         }
@@ -906,7 +936,7 @@ int main(int argc, char** argv) {
         const double sec = rt.run(args.generate, args.graph, args.start_token);
         const double tps = args.generate / sec;
         const uint64_t token_hash = rt.output_hash(args.generate);
-        std::cout << "{\"engine\":\"warpdecode-v2\",\"gpu\":\"" << prop.name
+        std::cout << "{\"engine\":\"warodecode-v2\",\"gpu\":\"" << prop.name
                   << "\",\"arch\":\"" << model.arch << "\",\"tokens\":" << args.generate
                   << ",\"seconds\":" << std::fixed << std::setprecision(6) << sec
                   << ",\"tok_s\":" << std::setprecision(3) << tps

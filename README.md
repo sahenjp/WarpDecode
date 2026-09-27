@@ -1,4 +1,4 @@
-# warpdecode
+# warodecode
 
 NVIDIA GPU上の **batch=1 LLM decode速度** に対象を絞り、llama.cppの汎用性コストを捨てて速度を取りにいくCUDAランタイムです。
 
@@ -41,7 +41,7 @@ P         選択モデルの実行plan表示
 Q         終了
 ```
 
-設定は `~/.config/warpdecode/tui.conf` に保存します。
+設定は `~/.config/warodecode/tui.conf` に保存します。
 
 ## GPU対応方針
 
@@ -84,7 +84,7 @@ RTX 50系(SM120)はCUDA 12.8以降を使います。
 ./bench/build.sh rtx50
 ```
 
-出力は `build-smXX/warpdecode` です。
+出力は `build-smXX/warodecode` です。
 
 ## 現在のforward
 
@@ -109,7 +109,7 @@ Q4_0はロード時に量子値を変えずplanar配置へ再パックします�
 ## 実行
 
 ```bash
-./build-sm86/warpdecode \
+./build-sm86/warodecode \
   --model /models/model-q4_0.gguf \
   --ctx 4096 \
   --generate 128 \
@@ -119,14 +119,14 @@ Q4_0はロード時に量子値を変えずplanar配置へ再パックします�
 起動時に代表的なQ4行列を64/128/256/512 threadsで短く実測し、そのGPUで速いlaunch形状を採用します。比較のため無効化もできます。
 
 ```bash
-./build-sm86/warpdecode --model model.gguf --no-autotune
+./build-sm86/warodecode --model model.gguf --no-autotune
 ```
 
 ## llama.cppとのA/B
 
 ```bash
 ./bench/ab.sh \
-  ./build-sm86/warpdecode \
+  ./build-sm86/warodecode \
   /path/to/llama-bench \
   /models/model-q4_0.gguf \
   999

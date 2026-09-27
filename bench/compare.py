@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 if len(sys.argv) != 3:
-    raise SystemExit(f"使い方: {sys.argv[0]} warpdecode.json llama.json")
+    raise SystemExit(f"使い方: {sys.argv[0]} warodecode.json llama.json")
 
 wd_text = Path(sys.argv[1]).read_text().strip().splitlines()
 wd = json.loads(wd_text[-1])
@@ -24,7 +24,7 @@ ratio = wd_tps / ll_tps
 pct = (ratio - 1.0) * 100.0
 verdict = "PASS" if pct >= 5.0 else ("TIE" if pct > -5.0 else "FAIL")
 print(json.dumps({
-    "warpdecode_tok_s": wd_tps,
+    "warodecode_tok_s": wd_tps,
     "llama_cpp_tok_s": ll_tps,
     "speedup_x": round(ratio, 4),
     "difference_percent": round(pct, 2),

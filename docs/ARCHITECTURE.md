@@ -5,14 +5,14 @@
 ## 層
 
 ```text
-warpdecode-tui (C++17 / CUDA不要)
+warodecode-tui (C++17 / CUDA不要)
   ├─ GPU検出
   ├─ GGUF検出
   ├─ 世代別ビルド
   ├─ 単体起動
   └─ GPUごとの独立複数起動
 
-warpdecode engine (C++/CUDA)
+warodecode engine (C++/CUDA)
   ├─ mmap GGUF loader
   ├─ load-time Q4 prepack
   ├─ architecture dispatch

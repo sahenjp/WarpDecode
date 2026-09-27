@@ -50,9 +50,9 @@ if (( ARCH >= 120 )) && { (( CUDA_MAJOR < 12 )) || (( CUDA_MAJOR == 12 && CUDA_M
 fi
 
 BUILD="build-sm${ARCH}"
-echo "warpdecode: target=sm_${ARCH} build=$BUILD"
+echo "warodecode: target=sm_${ARCH} build=$BUILD"
 cmake -S . -B "$BUILD" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DWARPDECODE_BUILD_ENGINE=ON \
+  -DWARODECODE_BUILD_ENGINE=ON \
   -DCMAKE_CUDA_ARCHITECTURES="$ARCH"
 cmake --build "$BUILD" -j"$(nproc)"

@@ -97,12 +97,12 @@ struct Config {
 fs::path config_path() {
     const char* home = std::getenv("HOME");
     fs::path base = home ? fs::path(home) : fs::current_path();
-    return base / ".config" / "warpdecode" / "tui.conf";
+    return base / ".config" / "warodecode" / "tui.conf";
 }
 
 Config default_config() {
     Config c;
-    const char* env = std::getenv("WARPDECODE_MODEL_DIRS");
+    const char* env = std::getenv("WARODECODE_MODEL_DIRS");
     if (env && *env) {
         for (const auto& p : split(env, ':')) if (!p.empty()) c.model_dirs.emplace_back(p);
     }
@@ -297,7 +297,7 @@ fs::path project_root(const char* argv0) {
 }
 
 fs::path engine_path(const fs::path& root, int sm) {
-    return root / ("build-sm" + std::to_string(sm)) / "warpdecode";
+    return root / ("build-sm" + std::to_string(sm)) / "warodecode";
 }
 
 class RawTerminal {
@@ -467,7 +467,7 @@ private:
         const auto& m = models_[primary_model_ < models_.size() ? primary_model_ : 0];
         const GpuInfo* gpu = gpus_.empty() ? nullptr : &gpus_[primary_gpu_ < gpus_.size() ? primary_gpu_ : 0];
         term_.disable();
-        std::cout << "\033[2J\033[HWarpDecode model plan\n\n";
+        std::cout << "\033[2J\033[Hwarodecode model plan\n\n";
         std::cout << "model: " << m.path.filename().string() << "\n";
         std::cout << "family: " << m.profile.family << "  arch=" << m.arch << "  quant=" << m.quant << "\n";
         std::cout << "size: " << human_size(m.bytes) << "  shards=" << m.shard_count << "\n";
@@ -606,7 +606,7 @@ private:
 
     void draw() const {
         std::cout << "\033[2J\033[H";
-        std::cout << "warpdecode control  |  batch=1 CUDA inference\n";
+        std::cout << "warodecode control  |  batch=1 CUDA inference\n";
         std::cout << "Tab: モデル/GPU  ↑↓: 移動  Enter: 主選択  Space: 複数選択\n";
         std::cout << "L: 起動  M: 独立複数起動  B: ビルド  P: model plan  A: モデル場所追加  R: 再読込  C/N: ctx/token  T: autotune  Q: 終了\n";
         std::cout << "ctx=" << cfg_.ctx << "  generate=" << cfg_.generate << "  autotune=" << (cfg_.autotune ? "on" : "off") << "\n\n";
@@ -691,7 +691,7 @@ int main(int argc, char** argv) {
             else if (a == "--gpu-fixture" && i + 1 < argc) fixture = argv[++i];
             else if (a == "--model-dir" && i + 1 < argc) dirs.emplace_back(argv[++i]);
             else if (a == "-h" || a == "--help") {
-                std::cout << "warpdecode-tui [--dump-state] [--gpu-fixture file] [--model-dir dir]\n";
+                std::cout << "warodecode-tui [--dump-state] [--gpu-fixture file] [--model-dir dir]\n";
                 return 0;
             } else throw std::runtime_error("不明な引数: " + a);
         }

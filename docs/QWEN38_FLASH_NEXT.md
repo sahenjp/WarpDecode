@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next optimization target
 
-WarpDecodeでは `general.architecture=qwen4exp` を汎用dense経路へ無理に流さない。Qwen3.8-Flash-Next専用runtimeとして扱う。
+warodecodeでは `general.architecture=qwen4exp` を汎用dense経路へ無理に流さない。Qwen3.8-Flash-Next専用runtimeとして扱う。
 
 ## model contract
 
@@ -18,7 +18,7 @@ WarpDecodeでは `general.architecture=qwen4exp` を汎用dense経路へ無理�
 
 GGUF側のarchitecture名は `qwen4exp`。
 
-## WarpDecodeが狙う差
+## warodecodeが狙う差
 
 ### 1. QSA decodeをcontext長に比例させない
 
@@ -58,7 +58,7 @@ QSA indexerのtop-kもCPUへ落とさない。CUDA上に常駐させる。
 
 PLEは巨大だが1 tokenあたり触るrowは非常に少ない。全表をVRAMへ載せるのは帯域・容量の使い方として悪い。
 
-WarpDecodeのpath:
+warodecodeのpath:
 
 ```text
 token ids

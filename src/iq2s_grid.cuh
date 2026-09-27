@@ -3,7 +3,7 @@
 #include <cstdint>
 
 // IQ2_S 8-value magnitude codebook. Values mirror ggml's IQ2_S format table.
-// Kept local so WarpDecode can consume GGUF IQ2_S weights without linking ggml.
+// Kept local so warodecode can consume GGUF IQ2_S weights without linking ggml.
 namespace wd {
 __device__ __constant__ uint64_t k_iq2s_grid[1024] = {
 0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,

@@ -6,41 +6,41 @@ cd "$ROOT"
 bash -n setup.sh bench/build.sh bench/ab.sh bench/profile.sh
 python3 -m py_compile bench/compare.py tests/make_qwen38_fixture.py
 python3 tests/make_qwen38_fixture.py
-cmake -S . -B build-ui -DCMAKE_BUILD_TYPE=Release -DWARPDECODE_BUILD_ENGINE=OFF >/dev/null
+cmake -S . -B build-ui -DCMAKE_BUILD_TYPE=Release -DWARODECODE_BUILD_ENGINE=OFF >/dev/null
 cmake --build build-ui -j"$(nproc)" >/dev/null
 
-g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/gguf_parser_test.cpp -o /tmp/warpdecode-gguf-parser-test
-/tmp/warpdecode-gguf-parser-test tests/min.gguf >/dev/null
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/gguf_parser_test.cpp -o /tmp/warodecode-gguf-parser-test
+/tmp/warodecode-gguf-parser-test tests/min.gguf >/dev/null
 
-g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/gguf_type_size_test.cpp -o /tmp/warpdecode-gguf-type-size-test
-/tmp/warpdecode-gguf-type-size-test >/dev/null
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/gguf_type_size_test.cpp -o /tmp/warodecode-gguf-type-size-test
+/tmp/warodecode-gguf-type-size-test >/dev/null
 
-g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/gguf_array_test.cpp -o /tmp/warpdecode-gguf-array-test
-/tmp/warpdecode-gguf-array-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/gguf_array_test.cpp -o /tmp/warodecode-gguf-array-test
+/tmp/warodecode-gguf-array-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
 
-g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/ple_reader_test.cpp -o /tmp/warpdecode-ple-reader-test
-/tmp/warpdecode-ple-reader-test >/dev/null
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/ple_reader_test.cpp -o /tmp/warodecode-ple-reader-test
+/tmp/warodecode-ple-reader-test >/dev/null
 
-g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_tuning_test.cpp -o /tmp/warpdecode-qwen38-tuning-test
-/tmp/warpdecode-qwen38-tuning-test >/dev/null
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_tuning_test.cpp -o /tmp/warodecode-qwen38-tuning-test
+/tmp/warodecode-qwen38-tuning-test >/dev/null
 
-g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/model_profile_test.cpp -o /tmp/warpdecode-model-profile-test
-/tmp/warpdecode-model-profile-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/model_profile_test.cpp -o /tmp/warodecode-model-profile-test
+/tmp/warodecode-model-profile-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
 
-g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_layout_test.cpp -o /tmp/warpdecode-qwen38-layout-test
-/tmp/warpdecode-qwen38-layout-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_layout_test.cpp -o /tmp/warodecode-qwen38-layout-test
+/tmp/warodecode-qwen38-layout-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
 
-./build-ui/warpdecode-tui --dump-state \
+./build-ui/warodecode-tui --dump-state \
   --gpu-fixture tests/nvidia-smi.fixture.csv \
-  --model-dir tests > /tmp/warpdecode-state.json
-python3 -m json.tool /tmp/warpdecode-state.json >/dev/null
+  --model-dir tests > /tmp/warodecode-state.json
+python3 -m json.tool /tmp/warodecode-state.json >/dev/null
 
-./build-ui/warpdecode-tui --dump-state \
+./build-ui/warodecode-tui --dump-state \
   --gpu-fixture tests/nvidia-smi.fixture.csv \
-  --model-dir tests/qwen38-fixture > /tmp/warpdecode-q38-state.json
+  --model-dir tests/qwen38-fixture > /tmp/warodecode-q38-state.json
 python3 - <<'PY2'
 import json
-x=json.load(open('/tmp/warpdecode-q38-state.json'))
+x=json.load(open('/tmp/warodecode-q38-state.json'))
 assert len(x['models']) == 1, x
 m=x['models'][0]
 assert m['qwen38_flash_next'] is True, m

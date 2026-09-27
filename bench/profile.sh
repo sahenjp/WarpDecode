@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ $# -lt 2 ]]; then
-  echo "使い方: $0 ./warpdecode model.gguf" >&2
+  echo "使い方: $0 ./warodecode model.gguf" >&2
   exit 2
 fi
 BIN=$1
