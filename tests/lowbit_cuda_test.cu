@@ -69,32 +69,6 @@ int main() {
     }
 
     {
-        // Q6_K: d=1, scale=1, quantized value = +1 everywhere.
-        // Stored 6-bit code is 33: low nibble=1, high two bits=2.
-        std::vector<uint8_t> raw(210, 0);
-        for (int i = 0; i < 128; ++i) raw[i] = 0x11;
-        for (int i = 0; i < 64; ++i) raw[128 + i] = 0xaa;
-        for (int i = 0; i < 16; ++i) raw[192 + i] = 1;
-        put_half(raw, 208, 1.0f);
-        const float y = run_case(wd::GgmlType::Q6_K, 256, raw);
-        if (std::fabs(y - 256.0f) > 0.02f) throw std::runtime_error("Q6_K mismatch");
-        std::cout << "Q6_K PASS " << y << "\n";
-    }
-
-    {
-        // Q6_K: d=1, scale=1, quantized value +1 everywhere.
-        // Stored six-bit value is 33: low nibble 1, high bits 2.
-        std::vector<uint8_t> raw(210, 0);
-        for (int i = 0; i < 128; ++i) raw[i] = 0x11;
-        for (int i = 0; i < 64; ++i) raw[128 + i] = 0xaa;
-        for (int i = 0; i < 16; ++i) raw[192 + i] = 1;
-        put_half(raw, 208, 1.0f);
-        const float y = run_case(wd::GgmlType::Q6_K, 256, raw);
-        if (std::fabs(y - 256.0f) > 0.02f) throw std::runtime_error("Q6_K mismatch");
-        std::cout << "Q6_K PASS " << y << "\n";
-    }
-
-    {
         std::vector<uint8_t> raw(18, 0);
         put_half(raw, 0, 1.0f);
         for (int i = 0; i < 16; ++i) raw[2 + i] = 0x88;

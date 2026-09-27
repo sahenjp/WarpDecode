@@ -43,6 +43,7 @@ struct Args {
     int generate = 128;
     int device = 0;
     int start_token = 1;
+    int top_k = 0;
     bool graph = true;
     bool autotune = true;
     bool load_only = false;
@@ -61,16 +62,19 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--generate") a.generate = std::stoi(need(i, "--generate"));
         else if (s == "--device") a.device = std::stoi(need(i, "--device"));
         else if (s == "--start-token") a.start_token = std::stoi(need(i, "--start-token"));
+        else if (s == "--top-k") a.top_k = std::stoi(need(i, "--top-k"));
         else if (s == "--no-graph") a.graph = false;
         else if (s == "--no-autotune") a.autotune = false;
         else if (s == "--load-only") a.load_only = true;
         else if (s == "-h" || s == "--help") {
-            std::cout << "warpdecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--no-graph] [--no-autotune] [--load-only]\n";
+            std::cout << "warpdecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--no-graph] [--no-autotune] [--load-only]\n";
             std::exit(0);
         } else throw std::runtime_error("不明な引数: " + s);
     }
     if (a.model.empty()) throw std::runtime_error("--model が必要です");
-    if (a.ctx < 16 || a.generate < 1 || a.start_token < 0) throw std::runtime_error("引数範囲が不正です");
+    if (a.ctx < 16 || a.generate < 1 || a.start_token < 0 || a.top_k < 0 || a.top_k > 256) {
+        throw std::runtime_error("引数範囲が不正です");
+    }
     return a;
 }
 
@@ -828,7 +832,12 @@ int main(int argc, char** argv) {
             wd::Qwen38Decoder decoder(qrt, qstate);
             std::vector<int> generated;
             generated.reserve(static_cast<size_t>(args.generate));
-            const double sec = decoder.run(args.start_token, args.generate, &generated);
+            std::vector<std::pair<int, float>> top_logits;
+            wd::Qwen38Trace trace;
+            const double sec = decoder.run(
+                args.start_token, args.generate, &generated,
+                args.top_k > 0 ? &top_logits : nullptr, args.top_k,
+                args.top_k > 0 ? &trace : nullptr);
             const double tps = args.generate / sec;
             const uint64_t token_hash = wd::qwen38_token_hash(generated);
 
@@ -844,7 +853,38 @@ int main(int argc, char** argv) {
                       << ",\"ple\":" << (qrt.ple_table ? "true" : "false")
                       << ",\"mtp\":false"
                       << ",\"cuda_graph\":false"
-                      << ",\"kernel_family\":\"" << kernel_plan.family << "\"}\n";
+                      << ",\"kernel_family\":\"" << kernel_plan.family << "\""
+                      << ",\"token_ids\":[";
+            for (size_t i = 0; i < generated.size(); ++i) {
+                if (i != 0) std::cout << ',';
+                std::cout << generated[i];
+            }
+            std::cout << ']';
+            if (!top_logits.empty()) {
+                std::cout << ",\"top_logits\":[";
+                for (size_t i = 0; i < top_logits.size(); ++i) {
+                    if (i != 0) std::cout << ',';
+                    std::cout << '[' << top_logits[i].first << ','
+                              << std::setprecision(9) << std::defaultfloat << top_logits[i].second << ']';
+                }
+                std::cout << ']';
+                auto dump_trace = [](const char * name, const std::vector<float> & values) {
+                    std::cout << ",\"" << name << "\":[";
+                    for (size_t i = 0; i < values.size(); ++i) {
+                        if (i != 0) std::cout << ',';
+                        std::cout << std::setprecision(9) << std::defaultfloat << values[i];
+                    }
+                    std::cout << ']';
+                };
+                dump_trace("hc_init", trace.hc_init);
+                dump_trace("hc_attn_mix", trace.hc_attn_mix);
+                dump_trace("attn_out", trace.attn_out);
+                dump_trace("after_attn", trace.after_attn);
+                dump_trace("hc_ffn_mix", trace.hc_ffn_mix);
+                dump_trace("ffn_out", trace.ffn_out);
+                dump_trace("after_ffn", trace.after_ffn);
+            }
+            std::cout << "}\n";
             return 0;
         }
 
