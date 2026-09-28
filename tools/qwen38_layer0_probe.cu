@@ -171,6 +171,7 @@ int main(int argc, char ** argv) {
         float * d_router_weights = nullptr;
         float * d_router_input = nullptr;
         float * d_logits = nullptr;
+        float * d_router_half_logits = nullptr;
         auto alloc = [](void ** p, size_t n, const char * what) {
             const cudaError_t e = cudaMalloc(p, n);
             if (e != cudaSuccess) throw std::runtime_error(std::string("cudaMalloc ") + what + ": " + cudaGetErrorString(e));
@@ -179,6 +180,8 @@ int main(int argc, char ** argv) {
               static_cast<size_t>(experts) * hidden * sizeof(float), "router weights");
         alloc(reinterpret_cast<void **>(&d_router_input), static_cast<size_t>(hidden) * sizeof(float), "router input");
         alloc(reinterpret_cast<void **>(&d_logits), static_cast<size_t>(experts) * sizeof(float), "router logits");
+        alloc(reinterpret_cast<void **>(&d_router_half_logits), static_cast<size_t>(experts) * sizeof(float), "half-weight router logits");
+        wd::GpuMatrix router_half = wd::upload_matrix(router);
         cudaError_t e = cudaMemcpy(d_router_weights, router.data,
                                    static_cast<size_t>(experts) * hidden * sizeof(float), cudaMemcpyHostToDevice);
         if (e != cudaSuccess) throw std::runtime_error(std::string("copy router weights failed: ") + cudaGetErrorString(e));
@@ -189,6 +192,9 @@ int main(int argc, char ** argv) {
             d_router_weights, d_router_input, d_logits, experts, hidden);
         e = cudaDeviceSynchronize();
         if (e != cudaSuccess) throw std::runtime_error(std::string("router GEMV failed: ") + cudaGetErrorString(e));
+        wd::launch_matrix_gemv_f32_input(router_half, d_router_input, d_router_half_logits, nullptr);
+        e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) throw std::runtime_error(std::string("half-weight router GEMV failed: ") + cudaGetErrorString(e));
 
         const size_t hc_size = static_cast<size_t>(hc_dim);
         const std::vector<float> init = copy_f32(hc_scratch.residual(), hc_size);
@@ -198,8 +204,10 @@ int main(int argc, char ** argv) {
         const std::vector<float> hc_gate = copy_f32(hc_scratch.gate(), hc_size);
         const std::vector<float> hc_mixed = copy_f32(hc_scratch.mixed(), static_cast<size_t>(hidden));
         const std::vector<float> logits = copy_f32(d_logits, static_cast<size_t>(experts));
+        const std::vector<float> half_weight_logits = copy_f32(d_router_half_logits, static_cast<size_t>(experts));
         const float weight_scale = static_cast<float>(gguf.number_meta("qwen4exp.expert_weights_scale", 1.0));
         const std::vector<RouterMax> top = rank_router(logits, weight_scale);
+        const std::vector<RouterMax> half_weight_top = rank_router(half_weight_logits, weight_scale);
 
         std::cout << "PROBE_RESULT={\"token\":" << token << ",\"hidden\":" << hidden
                   << ",\"hc\":" << hc << ",\"low_rank\":" << low_rank << ",\"router_input_source\":\"external_f32\"";
@@ -210,17 +218,27 @@ int main(int argc, char ** argv) {
         dump_float_array("hc_gate", hc_gate);
         dump_float_array("hc_mixed", hc_mixed);
         dump_float_array("router_logits", logits);
+        dump_float_array("router_logits_f16_weights", half_weight_logits);
         std::cout << ",\"expert_top10\":[";
         for (int i = 0; i < 10; ++i) {
             if (i != 0) std::cout << ',';
             std::cout << '[' << top[i].id << ',' << std::setprecision(9) << std::defaultfloat << top[i].weight << ']';
         }
         std::cout << "],\"rank11\":[" << top[10].id << ',' << top[10].logit
-                  << "],\"margin_10_11\":" << top[9].logit - top[10].logit << "}\n";
+                  << "],\"margin_10_11\":" << top[9].logit - top[10].logit
+                  << ",\"expert_top10_f16_weights\":[";
+        for (int i = 0; i < 10; ++i) {
+            if (i != 0) std::cout << ',';
+            std::cout << '[' << half_weight_top[i].id << ','
+                      << std::setprecision(9) << std::defaultfloat << half_weight_top[i].weight << ']';
+        }
+        std::cout << "],\"rank11_f16_weights\":[" << half_weight_top[10].id << ',' << half_weight_top[10].logit
+                  << "],\"margin_10_11_f16_weights\":" << half_weight_top[9].logit - half_weight_top[10].logit << "}\n";
 
         cudaFree(d_router_weights);
         cudaFree(d_router_input);
         cudaFree(d_logits);
+        cudaFree(d_router_half_logits);
         return 0;
     } catch (const std::exception & e) {
         std::cerr << "layer-0 probe error: " << e.what() << '\n';
