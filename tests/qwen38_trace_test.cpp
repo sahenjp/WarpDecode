@@ -22,8 +22,10 @@ int main() {
     const auto stats = wd::qwen38_trace_stats(values);
     require(stats.count == 3, "trace count");
     require(stats.min == -2.0f && stats.max == 3.0f, "trace range");
+    require(stats.max_abs == 3.0f, "trace max absolute value");
     require(std::abs(stats.mean - (2.0 / 3.0)) < 1e-12, "trace mean");
     require(std::abs(stats.l2 - std::sqrt(14.0)) < 1e-12, "trace L2");
+    require(std::abs(stats.rms - std::sqrt(14.0 / 3.0)) < 1e-12, "trace RMS");
     require(stats.checksum != 0, "trace checksum");
     require(wd::qwen38_expert_trace_offset(0, 4) == 0, "expert zero offset");
     require(wd::qwen38_expert_trace_offset(2, 4) == 8, "expert rank offset");

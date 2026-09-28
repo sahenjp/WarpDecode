@@ -66,7 +66,24 @@ struct Args {
     bool load_only = false;
     bool debug_f32_hc_layer0 = false;
     std::string extended_parity_trace;
+    std::string state_trace_path;
+    std::vector<int> forced_input_tokens;
 };
+
+static std::vector<int> parse_token_ids(const std::string & value) {
+    if (value.empty() || value.back() == ',') throw std::runtime_error("invalid forced input token list");
+    std::stringstream stream(value);
+    std::vector<int> ids;
+    std::string part;
+    while (std::getline(stream, part, ',')) {
+        if (part.empty()) throw std::runtime_error("invalid forced input token list");
+        size_t consumed = 0;
+        const int id = std::stoi(part, &consumed);
+        if (consumed != part.size() || id < 0) throw std::runtime_error("invalid forced input token list");
+        ids.push_back(id);
+    }
+    return ids;
+}
 
 static Args parse_args(int argc, char** argv) {
     Args a;
@@ -87,8 +104,10 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--load-only") a.load_only = true;
         else if (s == "--debug-f32-hc-layer0") a.debug_f32_hc_layer0 = true;
         else if (s == "--extended-parity-trace") a.extended_parity_trace = need(i, "--extended-parity-trace");
+        else if (s == "--state-trace") a.state_trace_path = need(i, "--state-trace");
+        else if (s == "--forced-input-tokens") a.forced_input_tokens = parse_token_ids(need(i, "--forced-input-tokens"));
         else if (s == "-h" || s == "--help") {
-            std::cout << "warodecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--debug-f32-hc-layer0] [--extended-parity-trace path] [--no-graph] [--no-autotune] [--load-only]\n";
+            std::cout << "warodecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--debug-f32-hc-layer0] [--extended-parity-trace path] [--state-trace path --forced-input-tokens 1,271,2] [--no-graph] [--no-autotune] [--load-only]\n";
             std::exit(0);
         } else throw std::runtime_error("不明な引数: " + s);
     }
@@ -98,6 +117,15 @@ static Args parse_args(int argc, char** argv) {
     }
     if (!a.extended_parity_trace.empty() && !a.debug_f32_hc_layer0) {
         throw std::runtime_error("--extended-parity-trace requires --debug-f32-hc-layer0");
+    }
+    if (a.state_trace_path.empty() != a.forced_input_tokens.empty()) {
+        throw std::runtime_error("--state-trace and --forced-input-tokens must be used together");
+    }
+    if (!a.state_trace_path.empty() &&
+        (a.debug_f32_hc_layer0 || !a.extended_parity_trace.empty() ||
+         static_cast<int>(a.forced_input_tokens.size()) != a.generate ||
+         a.forced_input_tokens.front() != a.start_token)) {
+        throw std::runtime_error("state trace requires a forced input for every generated position and cannot be combined with other trace modes");
     }
     if (a.model.empty()) throw std::runtime_error("--model が必要です");
     if (a.ctx < 16 || a.generate < 1 || a.start_token < 0 || a.top_k < 0 || a.top_k > 256) {
@@ -856,6 +884,9 @@ int main(int argc, char** argv) {
             if (args.start_token >= qrt.vocab) {
                 throw std::runtime_error("--start-token がQwen3.8語彙数以上です");
             }
+            for (int token : args.forced_input_tokens) {
+                if (token >= qrt.vocab) throw std::runtime_error("forced input token is outside the Qwen3.8 vocabulary");
+            }
 
             wd::Qwen38Decoder decoder(qrt, qstate);
             std::vector<int> generated;
@@ -864,13 +895,17 @@ int main(int argc, char** argv) {
             wd::Qwen38Trace trace;
             trace.use_f32_hc_layer0 = args.debug_f32_hc_layer0;
             trace.extended_parity = !args.extended_parity_trace.empty();
+            trace.state_trace = !args.state_trace_path.empty();
             const double sec = decoder.run(
                 args.start_token, args.generate, &generated,
                 args.top_k > 0 ? &top_logits : nullptr, args.top_k,
-                args.top_k > 0 ? &trace : nullptr);
+                args.top_k > 0 || trace.state_trace ? &trace : nullptr,
+                args.forced_input_tokens.empty() ? nullptr : &args.forced_input_tokens);
             std::vector<wd::Qwen38TraceStats> extended_trace_stats;
-            if (trace.extended_parity) {
-                wd::write_qwen38_trace_binary(args.extended_parity_trace, trace.extended_vectors);
+            if (trace.extended_parity || trace.state_trace) {
+                wd::write_qwen38_trace_binary(
+                    trace.state_trace ? args.state_trace_path : args.extended_parity_trace,
+                    trace.extended_vectors);
                 extended_trace_stats.reserve(trace.extended_vectors.size());
                 for (const auto & vector : trace.extended_vectors) {
                     extended_trace_stats.push_back(wd::qwen38_trace_stats(vector.values));
@@ -953,9 +988,21 @@ int main(int argc, char** argv) {
                 }
                 std::cout << ']';
             }
-            if (trace.extended_parity) {
-                std::cout << ",\"extended_parity_trace\":{\"format\":\"WDPTRC1-f32le\",\"path\":"
-                          << wd::json_quote(args.extended_parity_trace) << ",\"vectors\":[";
+            if (trace.extended_parity || trace.state_trace) {
+                const std::string & trace_path = trace.state_trace
+                    ? args.state_trace_path : args.extended_parity_trace;
+                std::cout << (trace.state_trace ? ",\"state_trace\":{\"format\":\"WDPTRC1-f32le\",\"path\":"
+                                                : ",\"extended_parity_trace\":{\"format\":\"WDPTRC1-f32le\",\"path\":")
+                          << wd::json_quote(trace_path);
+                if (trace.state_trace) {
+                    std::cout << ",\"forced_input_token_ids\":[";
+                    for (size_t i = 0; i < args.forced_input_tokens.size(); ++i) {
+                        if (i != 0) std::cout << ',';
+                        std::cout << args.forced_input_tokens[i];
+                    }
+                    std::cout << ']';
+                }
+                std::cout << ",\"vectors\":[";
                 for (size_t i = 0; i < trace.extended_vectors.size(); ++i) {
                     if (i != 0) std::cout << ',';
                     const auto & vector = trace.extended_vectors[i];
@@ -964,11 +1011,47 @@ int main(int argc, char** argv) {
                               << ",\"count\":" << stats.count
                               << ",\"min\":" << std::setprecision(9) << std::defaultfloat << stats.min
                               << ",\"max\":" << stats.max
+                              << ",\"max_abs\":" << stats.max_abs
                               << ",\"mean\":" << std::setprecision(17) << stats.mean
                               << ",\"l2\":" << stats.l2
+                              << ",\"rms\":" << stats.rms
                               << ",\"checksum_fnv1a64\":\"0x" << std::hex << stats.checksum << std::dec << "\"}";
                 }
-                std::cout << "]}";
+                std::cout << ']';
+                if (trace.state_trace) {
+                    std::cout << ",\"summaries\":[";
+                    for (size_t i = 0; i < trace.state_summaries.size(); ++i) {
+                        if (i != 0) std::cout << ',';
+                        const auto & item = trace.state_summaries[i];
+                        const auto & stats = item.stats;
+                        std::cout << "{\"name\":" << wd::json_quote(item.name) << ",\"dims\":[";
+                        for (size_t d = 0; d < item.dims.size(); ++d) {
+                            if (d != 0) std::cout << ',';
+                            std::cout << item.dims[d];
+                        }
+                        std::cout << "],\"count\":" << stats.count
+                                  << ",\"min\":" << std::setprecision(9) << std::defaultfloat << stats.min
+                                  << ",\"max\":" << stats.max
+                                  << ",\"max_abs\":" << stats.max_abs
+                                  << ",\"mean\":" << std::setprecision(17) << stats.mean
+                                  << ",\"l2\":" << stats.l2
+                                  << ",\"rms\":" << stats.rms
+                                  << ",\"checksum_fnv1a64\":\"0x" << std::hex << stats.checksum << std::dec << "\"}";
+                    }
+                    std::cout << "],\"integer_vectors\":[";
+                    for (size_t i = 0; i < trace.integer_vectors.size(); ++i) {
+                        if (i != 0) std::cout << ',';
+                        const auto & item = trace.integer_vectors[i];
+                        std::cout << "{\"name\":" << wd::json_quote(item.name) << ",\"values\":[";
+                        for (size_t j = 0; j < item.values.size(); ++j) {
+                            if (j != 0) std::cout << ',';
+                            std::cout << item.values[j];
+                        }
+                        std::cout << "]}";
+                    }
+                    std::cout << ']';
+                }
+                std::cout << '}';
             }
             std::cout << "}\n";
             return 0;

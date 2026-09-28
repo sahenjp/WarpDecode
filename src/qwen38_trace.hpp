@@ -22,9 +22,22 @@ struct Qwen38TraceStats {
     size_t count = 0;
     float min = 0.0f;
     float max = 0.0f;
+    float max_abs = 0.0f;
     double mean = 0.0;
     double l2 = 0.0;
+    double rms = 0.0;
     uint64_t checksum = 14695981039346656037ull;
+};
+
+struct Qwen38TraceSummaryVector {
+    std::string name;
+    std::vector<uint64_t> dims;
+    Qwen38TraceStats stats;
+};
+
+struct Qwen38TraceIntegerVector {
+    std::string name;
+    std::vector<int64_t> values;
 };
 
 inline size_t qwen38_expert_trace_offset(size_t rank, size_t hidden) {
@@ -47,6 +60,7 @@ inline Qwen38TraceStats qwen38_trace_stats(const std::vector<float> & values) {
         if (!std::isfinite(value)) throw std::runtime_error("non-finite value in Qwen3.8 trace");
         sum += value;
         square_sum += static_cast<double>(value) * value;
+        out.max_abs = std::max(out.max_abs, std::abs(value));
         const auto * bytes = reinterpret_cast<const unsigned char *>(&value);
         for (size_t i = 0; i < sizeof(value); ++i) {
             out.checksum ^= bytes[i];
@@ -55,6 +69,7 @@ inline Qwen38TraceStats qwen38_trace_stats(const std::vector<float> & values) {
     }
     out.mean = sum / static_cast<double>(values.size());
     out.l2 = std::sqrt(square_sum);
+    out.rms = std::sqrt(square_sum / static_cast<double>(values.size()));
     return out;
 }
 
