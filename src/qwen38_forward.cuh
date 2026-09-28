@@ -2,6 +2,7 @@
 
 #include "qwen38_runtime.cuh"
 #include "qwen38_state.cuh"
+#include "qwen38_trace.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -58,6 +59,18 @@ struct Qwen38Trace {
     std::vector<float> router_weights;
     std::vector<int> expert_ids;
     bool use_f32_hc_layer0 = false;
+    bool extended_parity = false;
+    std::vector<Qwen38TraceVector> extended_vectors;
+
+    void add_extended(const std::string & name, const std::vector<float> & values) {
+        if (extended_parity) extended_vectors.push_back({name, values});
+    }
+
+    void add_extended_ints(const std::string & name, const std::vector<int> & values) {
+        if (!extended_parity) return;
+        std::vector<float> converted(values.begin(), values.end());
+        extended_vectors.push_back({name, std::move(converted)});
+    }
 };
 
 __global__ void q38_argmax_kernel(
@@ -152,7 +165,10 @@ public:
         const int hc_dim = q.hidden * q.hc_count;
         q38_repeat_embedding_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
             state_.head_hidden(), state_.residual(), q.hidden, q.hc_count);
-        if (trace) trace->hc_init = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
+        if (trace) {
+            trace->hc_init = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
+            trace->add_extended("layer0.hc_init", trace->hc_init);
+        }
         if (trace) {
             const Qwen38HcWeights & hc_attn = rt_.layers.front().hc_attn;
             hc_f32_scratch.initialize(q.hidden, q.hc_count, q.hc_low_rank);
@@ -163,6 +179,11 @@ public:
             trace->hc_f32.low = copy_float(stream, hc_f32_scratch.low(), static_cast<size_t>(q.hc_low_rank));
             trace->hc_f32.gate = copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim));
             trace->hc_f32.mixed = copy_float(stream, hc_f32_scratch.mixed(), static_cast<size_t>(q.hidden));
+            trace->add_extended("layer0.hc_init_f32", trace->hc_f32.init);
+            trace->add_extended("layer0.hc_attn_norm_f32", trace->hc_f32.norm);
+            trace->add_extended("layer0.hc_attn_low_f32", trace->hc_f32.low);
+            trace->add_extended("layer0.hc_attn_gate_f32", trace->hc_f32.gate);
+            trace->add_extended("layer0.hc_attn_mixed_f32", trace->hc_f32.mixed);
             if (trace->use_f32_hc_layer0) {
                 Qwen38RuntimeLayer & layer0 = rt_.layers.front();
                 Qwen38LayerState & state0 = state_.layer(0);
@@ -187,6 +208,7 @@ public:
                 run_qwen38_hc_f32_mix_from_residual(
                     hc_f32_scratch.residual(), layer0.hc_ffn, ffn_scratch, q.rms_eps, stream);
                 trace->hc_ffn_mix_f32 = copy_float(stream, ffn_scratch.mixed(), static_cast<size_t>(q.hidden));
+                trace->add_extended("layer0.hc_mixed_f32", trace->hc_ffn_mix_f32);
                 q38_select_experts_f32_input(
                     layer0.router, ffn_scratch.mixed(), state0.moe,
                     q.expert_weights_scale, stream);
@@ -202,11 +224,19 @@ public:
                 if (!rt_.ple_table || !layer.ple_w || !st.ple_state || !st.ple_scratch) {
                     throw std::runtime_error("Qwen3.8 PLE runtime state is incomplete");
                 }
+                if (trace && trace->extended_parity && il == 1) {
+                    trace->add_extended("layer1.ple_pre_residual", copy_half(
+                        stream, state_.residual(), static_cast<size_t>(hc_dim)));
+                }
                 run_qwen38_ple(
                     state_.residual(), token, history_, pos,
                     *layer.ple_w, *rt_.ple_table,
                     *st.ple_state, *st.ple_scratch,
                     q, stream);
+                if (trace && trace->extended_parity && il == 1) {
+                    trace->add_extended("layer1.ple_post_residual", copy_half(
+                        stream, state_.residual(), static_cast<size_t>(hc_dim)));
+                }
             }
 
             __half * cur = run_qwen38_hc_mix(
@@ -218,12 +248,34 @@ public:
                 trace->hc_attn_gate = copy_half(stream, st.hc_attn.gate(), static_cast<size_t>(hc_dim));
                 trace->hc_attn_mix = copy_half(stream, cur, static_cast<size_t>(q.hidden));
             }
+            if (trace && trace->extended_parity && il == 1) {
+                if (!q.is_ple(il)) {
+                    const std::vector<float> unchanged = copy_half(
+                        stream, state_.residual(), static_cast<size_t>(hc_dim));
+                    trace->add_extended("layer1.ple_pre_residual", unchanged);
+                    trace->add_extended("layer1.ple_post_residual", unchanged);
+                }
+            }
             if (trace && trace->use_f32_hc_layer0 && il == 0) {
                 const int blocks = (q.hidden + 255) / 256;
                 q38_float_to_half_kernel<<<blocks, 256, 0, stream>>>(
                     hc_f32_scratch.mixed(), st.hc_attn.mixed(), q.hidden);
                 cur = st.hc_attn.mixed();
                 trace->hc_attn_mix_used = copy_half(stream, cur, static_cast<size_t>(q.hidden));
+            }
+            if (trace && trace->extended_parity && il == 0) {
+                trace->add_extended("layer0.hc_attn_mixed", trace->hc_attn_mix);
+            }
+            if (trace && trace->extended_parity && il == 1) {
+                trace->add_extended("layer1.hc_attn_norm", copy_half(
+                    stream, st.hc_attn.xn(), static_cast<size_t>(hc_dim)));
+                trace->add_extended("layer1.hc_attn_gate", copy_half(
+                    stream, st.hc_attn.gate(), static_cast<size_t>(hc_dim)));
+                trace->add_extended("layer1.hc_attn_mix", copy_half(
+                    stream, cur, static_cast<size_t>(q.hidden)));
+                trace->add_extended(
+                    layer.qsa ? "layer1.qsa_input" : "layer1.gdn_input",
+                    copy_half(stream, cur, static_cast<size_t>(q.hidden)));
             }
 
             __half * attn_out = nullptr;
@@ -255,44 +307,116 @@ public:
                 }
             }
             if (trace && il == 0) trace->attn_out = copy_half(stream, attn_out, static_cast<size_t>(q.hidden));
+            if (trace && trace->extended_parity && il == 0) {
+                trace->add_extended("layer0.attn_out", trace->attn_out);
+            }
             run_qwen38_hc_combine(state_.residual(), attn_out, st.hc_attn, stream);
             if (trace && il == 0) trace->after_attn = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
+            if (trace && trace->extended_parity && il == 0) {
+                trace->add_extended("layer0.after_attn_hc_combine", trace->after_attn);
+            }
 
             cur = run_qwen38_hc_mix(
                 state_.residual(), layer.hc_ffn, st.hc_ffn, q.rms_eps, stream);
             if (trace && il == 0) trace->hc_ffn_mix = copy_half(stream, cur, static_cast<size_t>(q.hidden));
+            if (trace && trace->extended_parity && il == 0) {
+                trace->add_extended("layer0.hc_mixed", trace->hc_ffn_mix);
+            }
 
             const bool experts_preselected = f32_layer0_router_preselected && il == 0;
 
+            __half * selected_output_trace = nullptr;
+            if (trace && trace->extended_parity && il == 0) {
+                selected_output_trace = st.moe.selected_output_trace();
+            }
             if (rt_.fused_experts) {
                 if (!layer.routed.gate_up || !layer.routed.down) {
                     throw std::runtime_error("Qwen3.8 fused expert tensor set is incomplete");
                 }
-                run_qwen38_routed_moe_fused(
-                    il, cur, layer.router,
-                    *layer.routed.gate_up, *layer.routed.down,
-                    rt_.fused_expert_cache, st.moe, st.moe_out,
-                    q.expert_weights_scale, stream, experts_preselected);
+                if (selected_output_trace) {
+                    run_qwen38_routed_moe_fused<true>(
+                        il, cur, layer.router,
+                        *layer.routed.gate_up, *layer.routed.down,
+                        rt_.fused_expert_cache, st.moe, st.moe_out,
+                        q.expert_weights_scale, stream, experts_preselected, selected_output_trace);
+                } else {
+                    run_qwen38_routed_moe_fused<false>(
+                        il, cur, layer.router,
+                        *layer.routed.gate_up, *layer.routed.down,
+                        rt_.fused_expert_cache, st.moe, st.moe_out,
+                        q.expert_weights_scale, stream, experts_preselected);
+                }
             } else {
                 if (!layer.routed.gate || !layer.routed.up || !layer.routed.down) {
                     throw std::runtime_error("Qwen3.8 expert tensor set is incomplete");
                 }
-                run_qwen38_routed_moe_separate(
-                    il, cur, layer.router,
-                    *layer.routed.gate, *layer.routed.up, *layer.routed.down,
-                    rt_.expert_cache, st.moe, st.moe_out,
-                    q.expert_weights_scale, stream, experts_preselected);
+                if (selected_output_trace) {
+                    run_qwen38_routed_moe_separate<true>(
+                        il, cur, layer.router,
+                        *layer.routed.gate, *layer.routed.up, *layer.routed.down,
+                        rt_.expert_cache, st.moe, st.moe_out,
+                        q.expert_weights_scale, stream, experts_preselected, selected_output_trace);
+                } else {
+                    run_qwen38_routed_moe_separate<false>(
+                        il, cur, layer.router,
+                        *layer.routed.gate, *layer.routed.up, *layer.routed.down,
+                        rt_.expert_cache, st.moe, st.moe_out,
+                        q.expert_weights_scale, stream, experts_preselected);
+                }
             }
             if (trace && il == 0) {
                 trace->router_logits = copy_float(stream, st.moe.d_logits(), static_cast<size_t>(q.experts));
                 trace->router_weights.assign(st.moe.h_weights(), st.moe.h_weights() + q.experts_used);
                 trace->expert_ids.assign(st.moe.h_ids(), st.moe.h_ids() + q.experts_used);
+                if (trace->extended_parity) {
+                    trace->add_extended("layer0.router_logits", trace->router_logits);
+                    trace->add_extended_ints("layer0.selected_expert_ids", trace->expert_ids);
+                    trace->add_extended("layer0.selected_expert_weights", trace->router_weights);
+                    trace->add_extended("layer0.routed_weighted_sum_f32", copy_float(
+                        stream, st.moe.d_accum(), static_cast<size_t>(q.hidden)));
+                    trace->add_extended("layer0.routed_moe_output", copy_half(
+                        stream, st.moe_out, static_cast<size_t>(q.hidden)));
+                    const std::vector<float> selected = copy_half(
+                        stream, selected_output_trace,
+                        static_cast<size_t>(q.experts_used) * q.hidden);
+                    for (int rank = 0; rank < q.experts_used; ++rank) {
+                        const size_t offset = qwen38_expert_trace_offset(
+                            static_cast<size_t>(rank), static_cast<size_t>(q.hidden));
+                        const size_t end = offset + static_cast<size_t>(q.hidden);
+                        if (end > selected.size()) {
+                            throw std::runtime_error("selected expert trace slice is out of range");
+                        }
+                        std::vector<float> expert_output(
+                            selected.begin() + static_cast<std::ptrdiff_t>(offset),
+                            selected.begin() + static_cast<std::ptrdiff_t>(end));
+                        trace->add_extended(
+                            "layer0.expert_rank_" + std::to_string(rank) + "_id_" +
+                                std::to_string(trace->expert_ids[static_cast<size_t>(rank)]),
+                            expert_output);
+                    }
+                }
             }
 
             run_qwen38_shared_expert(cur, layer.shared, st.moe, st.moe_out, stream);
             if (trace && il == 0) trace->ffn_out = copy_half(stream, st.moe_out, static_cast<size_t>(q.hidden));
+            if (trace && trace->extended_parity && il == 0) {
+                const std::vector<float> shared_down = copy_half(
+                    stream, st.moe.d_down(), static_cast<size_t>(q.hidden));
+                const std::vector<float> shared_gate = copy_float(stream, st.moe.d_shared_gate(), 1);
+                std::vector<float> shared_weighted(shared_down.size());
+                std::transform(shared_down.begin(), shared_down.end(), shared_weighted.begin(),
+                    [&](float value) { return value * shared_gate[0]; });
+                trace->add_extended("layer0.shared_expert_output", shared_down);
+                trace->add_extended("layer0.shared_expert_gate", shared_gate);
+                trace->add_extended("layer0.shared_expert_weighted_output_f32", shared_weighted);
+                trace->add_extended("layer0.final_moe_output", trace->ffn_out);
+            }
             run_qwen38_hc_combine(state_.residual(), st.moe_out, st.hc_ffn, stream);
             if (trace && il == 0) trace->after_ffn = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
+            if (trace && trace->extended_parity && il == 0) {
+                trace->add_extended("layer0.hc_ffn_combine_residual", trace->after_ffn);
+                trace->add_extended("layer0.output", trace->after_ffn);
+            }
         }
 
         __half * head = run_qwen38_hc_mix(

@@ -37,6 +37,23 @@
 
 namespace wd {
 
+static std::string json_quote(const std::string & value) {
+    std::ostringstream out;
+    out << '"';
+    for (unsigned char c : value) {
+        if (c == '"' || c == '\\') out << '\\' << static_cast<char>(c);
+        else if (c == '\n') out << "\\n";
+        else if (c == '\r') out << "\\r";
+        else if (c == '\t') out << "\\t";
+        else if (c < 0x20) {
+            out << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
+                << static_cast<int>(c) << std::dec << std::setfill(' ');
+        } else out << static_cast<char>(c);
+    }
+    out << '"';
+    return out.str();
+}
+
 struct Args {
     std::string model;
     int ctx = 4096;
@@ -48,6 +65,7 @@ struct Args {
     bool autotune = true;
     bool load_only = false;
     bool debug_f32_hc_layer0 = false;
+    std::string extended_parity_trace;
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -68,14 +86,18 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--no-autotune") a.autotune = false;
         else if (s == "--load-only") a.load_only = true;
         else if (s == "--debug-f32-hc-layer0") a.debug_f32_hc_layer0 = true;
+        else if (s == "--extended-parity-trace") a.extended_parity_trace = need(i, "--extended-parity-trace");
         else if (s == "-h" || s == "--help") {
-            std::cout << "warodecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--debug-f32-hc-layer0] [--no-graph] [--no-autotune] [--load-only]\n";
+            std::cout << "warodecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--debug-f32-hc-layer0] [--extended-parity-trace path] [--no-graph] [--no-autotune] [--load-only]\n";
             std::exit(0);
         } else throw std::runtime_error("不明な引数: " + s);
     }
     if (a.debug_f32_hc_layer0 && a.top_k == 0) a.top_k = 10;
     if (a.debug_f32_hc_layer0 && a.generate != 1) {
         throw std::runtime_error("--debug-f32-hc-layer0 requires --generate 1");
+    }
+    if (!a.extended_parity_trace.empty() && !a.debug_f32_hc_layer0) {
+        throw std::runtime_error("--extended-parity-trace requires --debug-f32-hc-layer0");
     }
     if (a.model.empty()) throw std::runtime_error("--model が必要です");
     if (a.ctx < 16 || a.generate < 1 || a.start_token < 0 || a.top_k < 0 || a.top_k > 256) {
@@ -841,10 +863,19 @@ int main(int argc, char** argv) {
             std::vector<std::pair<int, float>> top_logits;
             wd::Qwen38Trace trace;
             trace.use_f32_hc_layer0 = args.debug_f32_hc_layer0;
+            trace.extended_parity = !args.extended_parity_trace.empty();
             const double sec = decoder.run(
                 args.start_token, args.generate, &generated,
                 args.top_k > 0 ? &top_logits : nullptr, args.top_k,
                 args.top_k > 0 ? &trace : nullptr);
+            std::vector<wd::Qwen38TraceStats> extended_trace_stats;
+            if (trace.extended_parity) {
+                wd::write_qwen38_trace_binary(args.extended_parity_trace, trace.extended_vectors);
+                extended_trace_stats.reserve(trace.extended_vectors.size());
+                for (const auto & vector : trace.extended_vectors) {
+                    extended_trace_stats.push_back(wd::qwen38_trace_stats(vector.values));
+                }
+            }
             const double tps = args.generate / sec;
             const uint64_t token_hash = wd::qwen38_token_hash(generated);
 
@@ -884,41 +915,60 @@ int main(int argc, char** argv) {
                     }
                     std::cout << ']';
                 };
-                dump_trace("hc_init", trace.hc_init);
-                dump_trace("hc_attn_norm", trace.hc_attn_norm);
-                dump_trace("hc_attn_low", trace.hc_attn_low);
-                dump_trace("hc_attn_gate", trace.hc_attn_gate);
-                dump_trace("hc_attn_mix", trace.hc_attn_mix);
-                dump_trace("hc_attn_mix_used", trace.hc_attn_mix_used);
-                dump_trace("hc_f32_init", trace.hc_f32.init);
-                dump_trace("hc_f32_norm", trace.hc_f32.norm);
-                dump_trace("hc_f32_low_raw", trace.hc_f32.low_raw);
-                dump_trace("hc_f32_low", trace.hc_f32.low);
-                dump_trace("hc_f32_gate", trace.hc_f32.gate);
-                dump_trace("hc_f32_mix", trace.hc_f32.mixed);
-                dump_trace("gdn_f32_out", trace.gdn_f32_out);
-                dump_trace("after_attn_f32", trace.after_attn_f32);
-                dump_trace("gdn_qkv", trace.gdn_qkv);
-                dump_trace("gdn_z", trace.gdn_z);
-                dump_trace("gdn_beta", trace.gdn_beta);
-                dump_trace("gdn_alpha", trace.gdn_alpha);
-                dump_trace("gdn_gate", trace.gdn_gate);
-                dump_trace("gdn_core_out", trace.gdn_core_out);
-                dump_trace("gdn_norm_out", trace.gdn_norm_out);
-                dump_trace("attn_out", trace.attn_out);
-                dump_trace("after_attn", trace.after_attn);
-                dump_trace("hc_ffn_mix", trace.hc_ffn_mix);
-                dump_trace("hc_ffn_mix_f32", trace.hc_ffn_mix_f32);
-                dump_trace("ffn_out", trace.ffn_out);
-                dump_trace("after_ffn", trace.after_ffn);
-                dump_trace("router_logits", trace.router_logits);
-                dump_trace("router_weights", trace.router_weights);
+                if (!trace.extended_parity) {
+                    dump_trace("hc_init", trace.hc_init);
+                    dump_trace("hc_attn_norm", trace.hc_attn_norm);
+                    dump_trace("hc_attn_low", trace.hc_attn_low);
+                    dump_trace("hc_attn_gate", trace.hc_attn_gate);
+                    dump_trace("hc_attn_mix", trace.hc_attn_mix);
+                    dump_trace("hc_attn_mix_used", trace.hc_attn_mix_used);
+                    dump_trace("hc_f32_init", trace.hc_f32.init);
+                    dump_trace("hc_f32_norm", trace.hc_f32.norm);
+                    dump_trace("hc_f32_low_raw", trace.hc_f32.low_raw);
+                    dump_trace("hc_f32_low", trace.hc_f32.low);
+                    dump_trace("hc_f32_gate", trace.hc_f32.gate);
+                    dump_trace("hc_f32_mix", trace.hc_f32.mixed);
+                    dump_trace("gdn_f32_out", trace.gdn_f32_out);
+                    dump_trace("after_attn_f32", trace.after_attn_f32);
+                    dump_trace("gdn_qkv", trace.gdn_qkv);
+                    dump_trace("gdn_z", trace.gdn_z);
+                    dump_trace("gdn_beta", trace.gdn_beta);
+                    dump_trace("gdn_alpha", trace.gdn_alpha);
+                    dump_trace("gdn_gate", trace.gdn_gate);
+                    dump_trace("gdn_core_out", trace.gdn_core_out);
+                    dump_trace("gdn_norm_out", trace.gdn_norm_out);
+                    dump_trace("attn_out", trace.attn_out);
+                    dump_trace("after_attn", trace.after_attn);
+                    dump_trace("hc_ffn_mix", trace.hc_ffn_mix);
+                    dump_trace("hc_ffn_mix_f32", trace.hc_ffn_mix_f32);
+                    dump_trace("ffn_out", trace.ffn_out);
+                    dump_trace("after_ffn", trace.after_ffn);
+                    dump_trace("router_logits", trace.router_logits);
+                    dump_trace("router_weights", trace.router_weights);
+                }
                 std::cout << ",\"expert_ids\":[";
                 for (size_t i = 0; i < trace.expert_ids.size(); ++i) {
                     if (i != 0) std::cout << ',';
                     std::cout << trace.expert_ids[i];
                 }
                 std::cout << ']';
+            }
+            if (trace.extended_parity) {
+                std::cout << ",\"extended_parity_trace\":{\"format\":\"WDPTRC1-f32le\",\"path\":"
+                          << wd::json_quote(args.extended_parity_trace) << ",\"vectors\":[";
+                for (size_t i = 0; i < trace.extended_vectors.size(); ++i) {
+                    if (i != 0) std::cout << ',';
+                    const auto & vector = trace.extended_vectors[i];
+                    const auto & stats = extended_trace_stats[i];
+                    std::cout << "{\"name\":" << wd::json_quote(vector.name)
+                              << ",\"count\":" << stats.count
+                              << ",\"min\":" << std::setprecision(9) << std::defaultfloat << stats.min
+                              << ",\"max\":" << stats.max
+                              << ",\"mean\":" << std::setprecision(17) << stats.mean
+                              << ",\"l2\":" << stats.l2
+                              << ",\"checksum_fnv1a64\":\"0x" << std::hex << stats.checksum << std::dec << "\"}";
+                }
+                std::cout << "]}";
             }
             std::cout << "}\n";
             return 0;

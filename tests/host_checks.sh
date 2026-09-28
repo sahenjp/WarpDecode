@@ -24,6 +24,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/ple_reader_test.cpp -o /tmp/wa
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_tuning_test.cpp -o /tmp/warodecode-qwen38-tuning-test
 /tmp/warodecode-qwen38-tuning-test >/dev/null
 
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_trace_test.cpp -o /tmp/warodecode-qwen38-trace-test
+/tmp/warodecode-qwen38-trace-test
+
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/model_profile_test.cpp -o /tmp/warodecode-model-profile-test
 /tmp/warodecode-model-profile-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
 

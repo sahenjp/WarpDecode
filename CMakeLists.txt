@@ -11,6 +11,10 @@ add_executable(warodecode-tui tools/warodecode_tui.cpp)
 target_include_directories(warodecode-tui PRIVATE src)
 target_compile_options(warodecode-tui PRIVATE -O3 -Wall -Wextra -Wpedantic)
 
+add_executable(warodecode-qwen38-trace-test tests/qwen38_trace_test.cpp)
+target_include_directories(warodecode-qwen38-trace-test PRIVATE src)
+target_compile_options(warodecode-qwen38-trace-test PRIVATE -O2 -Wall -Wextra -Wpedantic)
+
 if(WARODECODE_BUILD_ENGINE)
   include(CheckLanguage)
   check_language(CUDA)
@@ -52,4 +56,11 @@ if(WARODECODE_BUILD_ENGINE)
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
   )
   set_target_properties(warodecode-qwen38-layer0-probe PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+  add_executable(warodecode-qwen38-moe-cuda-test tests/qwen38_moe_cuda_test.cu)
+  target_include_directories(warodecode-qwen38-moe-cuda-test PRIVATE src)
+  target_compile_options(warodecode-qwen38-moe-cuda-test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  )
+  set_target_properties(warodecode-qwen38-moe-cuda-test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 endif()

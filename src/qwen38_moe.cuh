@@ -222,6 +222,14 @@ public:
         host_alloc(reinterpret_cast<void **>(&h_weights_), static_cast<size_t>(k_) * sizeof(float));
     }
 
+    __half * selected_output_trace() {
+        if (!d_selected_output_trace_) {
+            alloc(reinterpret_cast<void **>(&d_selected_output_trace_),
+                  static_cast<size_t>(k_) * hidden_ * sizeof(__half));
+        }
+        return d_selected_output_trace_;
+    }
+
     int n_experts() const { return n_experts_; }
     int k() const { return k_; }
     int hidden() const { return hidden_; }
@@ -262,6 +270,7 @@ private:
         if (d_down_) cudaFree(d_down_);
         if (d_accum_) cudaFree(d_accum_);
         if (d_shared_gate_) cudaFree(d_shared_gate_);
+        if (d_selected_output_trace_) cudaFree(d_selected_output_trace_);
         if (h_ids_) cudaFreeHost(h_ids_);
         if (h_weights_) cudaFreeHost(h_weights_);
         d_logits_ = nullptr;
@@ -270,6 +279,7 @@ private:
         d_gate_ = d_up_ = d_gate_up_ = d_act_ = d_down_ = nullptr;
         d_accum_ = nullptr;
         d_shared_gate_ = nullptr;
+        d_selected_output_trace_ = nullptr;
         h_ids_ = nullptr;
         h_weights_ = nullptr;
     }
@@ -289,6 +299,7 @@ private:
     __half * d_down_ = nullptr;
     float * d_accum_ = nullptr;
     float * d_shared_gate_ = nullptr;
+    __half * d_selected_output_trace_ = nullptr;
     int * h_ids_ = nullptr;
     float * h_weights_ = nullptr;
 };
@@ -360,6 +371,7 @@ inline void q38_finish_moe(
         scratch.d_accum(), out, scratch.hidden());
 }
 
+template <bool CaptureSelectedOutput = false>
 inline void run_qwen38_routed_moe_fused(
         int layer,
         const __half * x,
@@ -371,7 +383,11 @@ inline void run_qwen38_routed_moe_fused(
         __half * out,
         float expert_scale,
         cudaStream_t stream,
-        bool preselected = false) {
+        bool preselected = false,
+        __half * selected_output_trace = nullptr) {
+    if constexpr (CaptureSelectedOutput) {
+        if (!selected_output_trace) throw std::runtime_error("selected expert trace buffer is null");
+    }
     if (gate_up_exps.dims.size() != 3 || down_exps.dims.size() != 3) {
         throw std::runtime_error("Qwen3.8 fused expert tensors must be 3D");
     }
@@ -398,6 +414,13 @@ inline void run_qwen38_routed_moe_fused(
         q38_silu_mul_fused_kernel<<<ffn_blocks, threads, 0, stream>>>(
             scratch.d_gate_up(), scratch.d_act(), scratch.expert_ffn());
         launch_lowbit_gemv_half(w.down, scratch.d_act(), scratch.d_down(), stream);
+        if constexpr (CaptureSelectedOutput) {
+            e = cudaMemcpyAsync(
+                selected_output_trace + static_cast<size_t>(j) * scratch.hidden(),
+                scratch.d_down(), static_cast<size_t>(scratch.hidden()) * sizeof(__half),
+                cudaMemcpyDeviceToDevice, stream);
+            if (e != cudaSuccess) throw std::runtime_error(std::string("copy selected fused expert output failed: ") + cudaGetErrorString(e));
+        }
         q38_weighted_accum_kernel<<<hidden_blocks, threads, 0, stream>>>(
             scratch.d_down(), weight, scratch.d_accum(), scratch.hidden());
     }
@@ -405,6 +428,7 @@ inline void run_qwen38_routed_moe_fused(
     q38_finish_moe(scratch, out, stream);
 }
 
+template <bool CaptureSelectedOutput = false>
 inline void run_qwen38_routed_moe_separate(
         int layer,
         const __half * x,
@@ -417,7 +441,11 @@ inline void run_qwen38_routed_moe_separate(
         __half * out,
         float expert_scale,
         cudaStream_t stream,
-        bool preselected = false) {
+        bool preselected = false,
+        __half * selected_output_trace = nullptr) {
+    if constexpr (CaptureSelectedOutput) {
+        if (!selected_output_trace) throw std::runtime_error("selected expert trace buffer is null");
+    }
     if (!preselected) q38_select_experts(router, x, scratch, expert_scale, stream);
 
     cudaError_t e = cudaMemsetAsync(
@@ -438,6 +466,13 @@ inline void run_qwen38_routed_moe_separate(
         q38_silu_mul_kernel<<<ffn_blocks, threads, 0, stream>>>(
             scratch.d_gate(), scratch.d_up(), scratch.d_act(), scratch.expert_ffn());
         launch_lowbit_gemv_half(w.down, scratch.d_act(), scratch.d_down(), stream);
+        if constexpr (CaptureSelectedOutput) {
+            const cudaError_t copy_error = cudaMemcpyAsync(
+                selected_output_trace + static_cast<size_t>(j) * scratch.hidden(),
+                scratch.d_down(), static_cast<size_t>(scratch.hidden()) * sizeof(__half),
+                cudaMemcpyDeviceToDevice, stream);
+            if (copy_error != cudaSuccess) throw std::runtime_error(std::string("copy selected expert output failed: ") + cudaGetErrorString(copy_error));
+        }
         q38_weighted_accum_kernel<<<hidden_blocks, threads, 0, stream>>>(
             scratch.d_down(), weight, scratch.d_accum(), scratch.hidden());
     }
