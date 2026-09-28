@@ -45,4 +45,11 @@ if(WARODECODE_BUILD_ENGINE)
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
   )
   set_target_properties(warodecode-lowbit-test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+  add_executable(warodecode-qwen38-layer0-probe tools/qwen38_layer0_probe.cu)
+  target_include_directories(warodecode-qwen38-layer0-probe PRIVATE src)
+  target_compile_options(warodecode-qwen38-layer0-probe PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  )
+  set_target_properties(warodecode-qwen38-layer0-probe PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 endif()
