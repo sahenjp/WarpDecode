@@ -135,6 +135,119 @@ __device__ __forceinline__ float iq4_nl_value(uint8_t q) {
     return static_cast<float>(lut[q & 0x0f]);
 }
 
+class Q8_1Buffer {
+public:
+    Q8_1Buffer() = default;
+    Q8_1Buffer(const Q8_1Buffer &) = delete;
+    Q8_1Buffer & operator=(const Q8_1Buffer &) = delete;
+    ~Q8_1Buffer() { reset(); }
+
+    void initialize(int elements) {
+        if (values_) throw std::runtime_error("Q8_1 buffer already initialized");
+        if (elements <= 0 || elements % 32 != 0) throw std::runtime_error("Q8_1 input must be a positive multiple of 32");
+        elements_ = elements;
+        const int blocks = elements / 32;
+        cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&values_), static_cast<size_t>(elements) * sizeof(int8_t));
+        if (e != cudaSuccess) throw std::runtime_error(std::string("cudaMalloc Q8_1 values failed: ") + cudaGetErrorString(e));
+        e = cudaMalloc(reinterpret_cast<void **>(&scales_), static_cast<size_t>(blocks) * sizeof(__half));
+        if (e != cudaSuccess) throw std::runtime_error(std::string("cudaMalloc Q8_1 scales failed: ") + cudaGetErrorString(e));
+    }
+
+    int elements() const { return elements_; }
+    int8_t * values() const { return values_; }
+    __half * scales() const { return scales_; }
+
+private:
+    void reset() {
+        if (values_) cudaFree(values_);
+        if (scales_) cudaFree(scales_);
+        values_ = nullptr;
+        scales_ = nullptr;
+        elements_ = 0;
+    }
+
+    int elements_ = 0;
+    int8_t * values_ = nullptr;
+    __half * scales_ = nullptr;
+};
+
+__global__ void q8_1_quantize_f32_kernel(
+        const float * __restrict__ x,
+        int elements,
+        int8_t * __restrict__ quantized,
+        __half * __restrict__ scales) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int block = blockIdx.x * warps_per_block + warp_in_block;
+    if (block >= elements / 32) return;
+
+    const int i = block * 32 + lane;
+    const float value = x[i];
+    float amax = fabsf(value);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, offset));
+    }
+    amax = __shfl_sync(0xffffffffu, amax, 0);
+    const float d = amax / 127.0f;
+    quantized[i] = amax == 0.0f ? 0 : static_cast<int8_t>(roundf(value / d));
+    if (lane == 0) scales[block] = __float2half(d);
+}
+
+__global__ void q8_0_q8_1_gemv_f32_kernel(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x,
+        const __half * __restrict__ x_scales,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const int blocks_per_row = cols >> 5;
+    const size_t row_stride = static_cast<size_t>(blocks_per_row) * 34u;
+    const uint8_t * row_ptr = w + static_cast<size_t>(row) * row_stride;
+    float sum = 0.0f;
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const uint8_t * block = row_ptr + static_cast<size_t>(b) * 34u;
+        const int8_t qw = *reinterpret_cast<const int8_t *>(block + 2 + lane);
+        int dot = static_cast<int>(qw) * static_cast<int>(x[(b << 5) + lane]);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0) {
+            const float scale = lowbit_half(block) * __half2float(x_scales[b]);
+            sum += scale * static_cast<float>(dot);
+        }
+    }
+    if (lane == 0) y[row] = sum;
+}
+
+inline void launch_q8_0_gemv_q8_1_f32(
+        const LowBitMatrix & weights,
+        const float * input,
+        float * output,
+        Q8_1Buffer & scratch,
+        cudaStream_t stream) {
+    if (weights.type != GgmlType::Q8_0 || weights.rows <= 0 ||
+        weights.cols > scratch.elements() || weights.cols % 32 != 0) {
+        throw std::runtime_error("Q8_0 x Q8_1 GEMV geometry mismatch");
+    }
+    constexpr int threads = 256;
+    const int input_blocks = weights.cols / 32;
+    q8_1_quantize_f32_kernel<<<(input_blocks + 7) / 8, threads, 0, stream>>>(
+        input, weights.cols, scratch.values(), scratch.scales());
+    constexpr int warps = threads / 32;
+    const int row_blocks = (weights.rows + warps - 1) / warps;
+    q8_0_q8_1_gemv_f32_kernel<<<row_blocks, threads, 0, stream>>>(
+        weights.data, scratch.values(), scratch.scales(), output, weights.rows, weights.cols);
+}
+
 template <bool OUT_F32>
 __global__ void q8_0_gemv_kernel(
         const uint8_t * __restrict__ w,

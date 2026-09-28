@@ -73,6 +73,27 @@ __global__ void dense_half_gemv_kernel(
     }
 }
 
+__global__ void dense_half_gemv_f32_input_kernel(
+        const __half * __restrict__ w,
+        const float * __restrict__ x,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const __half * row_ptr = w + static_cast<size_t>(row) * cols;
+    float acc = 0.0f;
+    for (int c = lane; c < cols; c += 32) {
+        acc = fmaf(__half2float(row_ptr[c]), x[c], acc);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
 inline void launch_matrix_gemv_half(
         const GpuMatrix & w,
         const __half * x,
@@ -104,6 +125,20 @@ inline void launch_matrix_gemv_float(
     const int warps = threads / 32;
     const int blocks = (w.rows + warps - 1) / warps;
     dense_half_gemv_kernel<true><<<blocks, threads, 0, stream>>>(
+        w.dense.data, x, y, w.rows, w.cols);
+}
+
+inline void launch_matrix_gemv_f32_input(
+        const GpuMatrix & w,
+        const float * x,
+        float * y,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (w.lowbit) throw std::runtime_error("F32-input GEMV requires a dense matrix");
+    if (threads < 32 || threads % 32 != 0) throw std::runtime_error("matrix GEMV threads must be a multiple of 32");
+    const int warps = threads / 32;
+    const int blocks = (w.rows + warps - 1) / warps;
+    dense_half_gemv_f32_input_kernel<<<blocks, threads, 0, stream>>>(
         w.dense.data, x, y, w.rows, w.cols);
 }
 

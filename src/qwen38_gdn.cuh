@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace wd {
 
@@ -25,6 +26,12 @@ struct Qwen38GdnWeights {
     DeviceHalfArray a;
     DeviceHalfArray norm;
     GpuMatrix out;
+    std::vector<float> debug_beta_f32;
+    std::vector<float> debug_alpha_f32;
+    std::vector<float> debug_conv_f32;
+    std::vector<float> debug_dt_f32;
+    std::vector<float> debug_a_f32;
+    std::vector<float> debug_norm_f32;
 };
 
 inline Qwen38GdnWeights load_qwen38_gdn_weights(
@@ -78,6 +85,24 @@ inline Qwen38GdnWeights load_qwen38_gdn_weights(
     w.a = upload_half_array(a);
     w.norm = upload_half_array(norm);
     w.out = upload_matrix(out_t);
+    if (il == 0) {
+        const TensorInfo * f32_tensors[] = {&beta, &alpha, &conv, &dt, &a, &norm};
+        for (const TensorInfo * t : f32_tensors) {
+            if (t->type != GgmlType::F32) {
+                throw std::runtime_error("layer-0 GDN F32 debug requires F32 parameter tensors");
+            }
+        }
+        auto copy_f32 = [](const TensorInfo & t) {
+            const float * values = reinterpret_cast<const float *>(t.data);
+            return std::vector<float>(values, values + t.elements());
+        };
+        w.debug_beta_f32 = copy_f32(beta);
+        w.debug_alpha_f32 = copy_f32(alpha);
+        w.debug_conv_f32 = copy_f32(conv);
+        w.debug_dt_f32 = copy_f32(dt);
+        w.debug_a_f32 = copy_f32(a);
+        w.debug_norm_f32 = copy_f32(norm);
+    }
     return w;
 }
 
@@ -209,6 +234,107 @@ private:
     __half * final_out_ = nullptr;
 };
 
+class Qwen38GdnF32DebugScratch {
+public:
+    Qwen38GdnF32DebugScratch() = default;
+    Qwen38GdnF32DebugScratch(const Qwen38GdnF32DebugScratch &) = delete;
+    Qwen38GdnF32DebugScratch & operator=(const Qwen38GdnF32DebugScratch &) = delete;
+    ~Qwen38GdnF32DebugScratch() { reset(); }
+
+    void initialize(const Qwen38Layout & q) {
+        const int key_dim = q.ssm_state_size * q.ssm_group_count;
+        const int value_dim = q.ssm_state_size * q.ssm_dt_rank;
+        conv_dim_ = key_dim * 2 + value_dim;
+        key_dim_ = key_dim;
+        value_dim_ = value_dim;
+        heads_ = q.ssm_dt_rank;
+        hidden_ = q.hidden;
+        alloc(reinterpret_cast<void **>(&qkv_), static_cast<size_t>(conv_dim_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&z_), static_cast<size_t>(value_dim_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&beta_), static_cast<size_t>(heads_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&alpha_), static_cast<size_t>(heads_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&conv_out_), static_cast<size_t>(conv_dim_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&gate_), static_cast<size_t>(heads_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&core_out_), static_cast<size_t>(value_dim_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&norm_out_), static_cast<size_t>(value_dim_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&final_out_), static_cast<size_t>(hidden_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&beta_weights_), static_cast<size_t>(heads_) * hidden_ * sizeof(float));
+        alloc(reinterpret_cast<void **>(&alpha_weights_), static_cast<size_t>(heads_) * hidden_ * sizeof(float));
+        alloc(reinterpret_cast<void **>(&conv_weights_), static_cast<size_t>(conv_dim_) * q.ssm_conv_kernel * sizeof(float));
+        alloc(reinterpret_cast<void **>(&dt_), static_cast<size_t>(heads_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&a_), static_cast<size_t>(heads_) * sizeof(float));
+        alloc(reinterpret_cast<void **>(&norm_), static_cast<size_t>(q.ssm_state_size) * sizeof(float));
+    }
+
+    int conv_dim() const { return conv_dim_; }
+    int key_dim() const { return key_dim_; }
+    int value_dim() const { return value_dim_; }
+    int heads() const { return heads_; }
+    int hidden() const { return hidden_; }
+    float * qkv() const { return qkv_; }
+    float * z() const { return z_; }
+    float * beta() const { return beta_; }
+    float * alpha() const { return alpha_; }
+    float * conv_out() const { return conv_out_; }
+    float * gate() const { return gate_; }
+    float * core_out() const { return core_out_; }
+    float * norm_out() const { return norm_out_; }
+    float * final_out() const { return final_out_; }
+    float * beta_weights() const { return beta_weights_; }
+    float * alpha_weights() const { return alpha_weights_; }
+    float * conv_weights() const { return conv_weights_; }
+    float * dt() const { return dt_; }
+    float * a() const { return a_; }
+    float * norm() const { return norm_; }
+
+private:
+    static void alloc(void ** p, size_t n) {
+        const cudaError_t e = cudaMalloc(p, n);
+        if (e != cudaSuccess) throw std::runtime_error(std::string("cudaMalloc GDN F32 debug scratch failed: ") + cudaGetErrorString(e));
+    }
+
+    void reset() {
+        if (qkv_) cudaFree(qkv_);
+        if (z_) cudaFree(z_);
+        if (beta_) cudaFree(beta_);
+        if (alpha_) cudaFree(alpha_);
+        if (conv_out_) cudaFree(conv_out_);
+        if (gate_) cudaFree(gate_);
+        if (core_out_) cudaFree(core_out_);
+        if (norm_out_) cudaFree(norm_out_);
+        if (final_out_) cudaFree(final_out_);
+        if (beta_weights_) cudaFree(beta_weights_);
+        if (alpha_weights_) cudaFree(alpha_weights_);
+        if (conv_weights_) cudaFree(conv_weights_);
+        if (dt_) cudaFree(dt_);
+        if (a_) cudaFree(a_);
+        if (norm_) cudaFree(norm_);
+        qkv_ = z_ = beta_ = alpha_ = conv_out_ = gate_ = core_out_ = norm_out_ = final_out_ = nullptr;
+        beta_weights_ = alpha_weights_ = conv_weights_ = dt_ = a_ = norm_ = nullptr;
+    }
+
+    int conv_dim_ = 0;
+    int key_dim_ = 0;
+    int value_dim_ = 0;
+    int heads_ = 0;
+    int hidden_ = 0;
+    float * qkv_ = nullptr;
+    float * z_ = nullptr;
+    float * beta_ = nullptr;
+    float * alpha_ = nullptr;
+    float * conv_out_ = nullptr;
+    float * gate_ = nullptr;
+    float * core_out_ = nullptr;
+    float * norm_out_ = nullptr;
+    float * final_out_ = nullptr;
+    float * beta_weights_ = nullptr;
+    float * alpha_weights_ = nullptr;
+    float * conv_weights_ = nullptr;
+    float * dt_ = nullptr;
+    float * a_ = nullptr;
+    float * norm_ = nullptr;
+};
+
 __global__ void q38_gdn_conv_kernel(
         const __half * __restrict__ current,
         __half * __restrict__ history,
@@ -268,6 +394,203 @@ __device__ __forceinline__ float q38_softplus(float x) {
     return log1pf(expf(x));
 }
 
+__global__ void q38_gdn_dense_f32_gemv_kernel(
+        const float * __restrict__ w,
+        const float * __restrict__ x,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+    const float * row_ptr = w + static_cast<size_t>(row) * cols;
+    float acc = 0.0f;
+    for (int i = lane; i < cols; i += 32) acc = fmaf(row_ptr[i], x[i], acc);
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
+__global__ void q38_gdn_conv_first_f32_kernel(
+        const float * __restrict__ current,
+        const float * __restrict__ kernel,
+        float * __restrict__ out,
+        int channels,
+        int kernel_size) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    const float value = current[channel] * kernel[channel * kernel_size + kernel_size - 1];
+    out[channel] = value / (1.0f + expf(-value));
+}
+
+__global__ void q38_gdn_l2_norm_f32_kernel(
+        float * x,
+        int head_dim,
+        int heads,
+        float eps) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    __shared__ float smem[256];
+    const int base = head * head_dim;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const float value = x[base + i];
+        sum = fmaf(value, value, sum);
+    }
+    smem[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) smem[threadIdx.x] += smem[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(smem[0] + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) x[base + i] *= inv;
+}
+
+__global__ void q38_gdn_gate_params_f32_kernel(
+        float * beta,
+        const float * alpha,
+        const float * dt,
+        const float * a,
+        float * gate,
+        int heads) {
+    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= heads) return;
+    beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+    gate[h] = q38_softplus(alpha[h] + dt[h]) * a[h];
+}
+
+__global__ void q38_gdn_core_first_f32_kernel(
+        const float * __restrict__ q,
+        const float * __restrict__ k,
+        const float * __restrict__ v,
+        const float * __restrict__ beta,
+        float * __restrict__ out,
+        int head_dim,
+        int key_heads,
+        int value_heads) {
+    const int vh = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    if (vh >= value_heads || col >= head_dim) return;
+    // ggml_repeat tiles the key-head axis cyclically when expanding it to value heads.
+    const int kh = vh % key_heads;
+    const float * qh = q + kh * head_dim;
+    const float * khv = k + kh * head_dim;
+    const float * vhv = v + vh * head_dim;
+    const float delta = beta[vh] * vhv[col];
+    float attn_partial = 0.0f;
+    for (int r = 0; r < head_dim / 32; ++r) {
+        const int i = r * 32 + lane;
+        const float state = khv[i] * delta;
+        attn_partial = fmaf(state, qh[i], attn_partial);
+    }
+    const float attn = warp_sum(attn_partial);
+    if (lane == 0) out[vh * head_dim + col] = attn * rsqrtf(static_cast<float>(head_dim));
+}
+
+__global__ void q38_gdn_gated_rmsnorm_f32_kernel(
+        const float * __restrict__ x,
+        const float * __restrict__ norm,
+        const float * __restrict__ z,
+        float * __restrict__ out,
+        int head_dim,
+        int heads,
+        float eps) {
+    const int h = blockIdx.x;
+    if (h >= heads) return;
+    __shared__ float smem[256];
+    const int base = h * head_dim;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const float value = x[base + i];
+        sum = fmaf(value, value, sum);
+    }
+    smem[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) smem[threadIdx.x] += smem[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(smem[0] / static_cast<float>(head_dim) + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const int idx = base + i;
+        const float gate = 1.0f / (1.0f + expf(-z[idx]));
+        out[idx] = x[idx] * inv * norm[i] * gate;
+    }
+}
+
+inline float * run_qwen38_gdn_f32_first_token(
+        const float * input,
+        const Qwen38GdnWeights & w,
+        Qwen38GdnF32DebugScratch & scratch,
+        const Qwen38Layout & q,
+        float rms_eps,
+        Q8_1Buffer & q8_1,
+        cudaStream_t stream) {
+    const int key_dim = q.ssm_state_size * q.ssm_group_count;
+    const int value_dim = q.ssm_state_size * q.ssm_dt_rank;
+    const int conv_dim = key_dim * 2 + value_dim;
+    const size_t param_count = static_cast<size_t>(q.ssm_dt_rank);
+    if (w.debug_beta_f32.size() != param_count * q.hidden ||
+        w.debug_alpha_f32.size() != param_count * q.hidden ||
+        w.debug_conv_f32.size() != static_cast<size_t>(conv_dim) * q.ssm_conv_kernel ||
+        w.debug_dt_f32.size() != param_count || w.debug_a_f32.size() != param_count ||
+        w.debug_norm_f32.size() != static_cast<size_t>(q.ssm_state_size) ||
+        w.qkv.type != GgmlType::Q8_0 || w.z.type != GgmlType::Q8_0 ||
+        w.out.type != GgmlType::Q8_0) {
+        throw std::runtime_error("layer-0 GDN F32 debug weights mismatch");
+    }
+
+    auto copy_weights = [&](float * dst, const std::vector<float> & src) {
+        const cudaError_t e = cudaMemcpyAsync(dst, src.data(), src.size() * sizeof(float),
+                                              cudaMemcpyHostToDevice, stream);
+        if (e != cudaSuccess) throw std::runtime_error("copy layer-0 GDN F32 debug weights failed");
+    };
+    copy_weights(scratch.beta_weights(), w.debug_beta_f32);
+    copy_weights(scratch.alpha_weights(), w.debug_alpha_f32);
+    copy_weights(scratch.conv_weights(), w.debug_conv_f32);
+    copy_weights(scratch.dt(), w.debug_dt_f32);
+    copy_weights(scratch.a(), w.debug_a_f32);
+    copy_weights(scratch.norm(), w.debug_norm_f32);
+
+    launch_q8_0_gemv_q8_1_f32(w.qkv.low, input, scratch.qkv(), q8_1, stream);
+    launch_q8_0_gemv_q8_1_f32(w.z.low, input, scratch.z(), q8_1, stream);
+
+    constexpr int threads = 256;
+    q38_gdn_dense_f32_gemv_kernel<<<(q.ssm_dt_rank + 7) / 8, threads, 0, stream>>>(
+        scratch.beta_weights(), input, scratch.beta(), q.ssm_dt_rank, q.hidden);
+    q38_gdn_dense_f32_gemv_kernel<<<(q.ssm_dt_rank + 7) / 8, threads, 0, stream>>>(
+        scratch.alpha_weights(), input, scratch.alpha(), q.ssm_dt_rank, q.hidden);
+
+    q38_gdn_conv_first_f32_kernel<<<(conv_dim + threads - 1) / threads, threads, 0, stream>>>(
+        scratch.qkv(), scratch.conv_weights(), scratch.conv_out(), conv_dim, q.ssm_conv_kernel);
+    float * q_conv = scratch.conv_out();
+    float * k_conv = scratch.conv_out() + key_dim;
+    float * v_conv = scratch.conv_out() + key_dim * 2;
+    q38_gdn_l2_norm_f32_kernel<<<q.ssm_group_count, threads, 0, stream>>>(
+        q_conv, q.ssm_state_size, q.ssm_group_count, rms_eps);
+    q38_gdn_l2_norm_f32_kernel<<<q.ssm_group_count, threads, 0, stream>>>(
+        k_conv, q.ssm_state_size, q.ssm_group_count, rms_eps);
+
+    q38_gdn_gate_params_f32_kernel<<<(q.ssm_dt_rank + threads - 1) / threads, threads, 0, stream>>>(
+        scratch.beta(), scratch.alpha(), scratch.dt(), scratch.a(), scratch.gate(), q.ssm_dt_rank);
+    if (q.ssm_state_size != 128) {
+        throw std::runtime_error("layer-0 GDN F32 debug currently expects state size 128");
+    }
+    const dim3 core_grid(q.ssm_dt_rank, (q.ssm_state_size + 3) / 4);
+    const dim3 core_block(32, 4);
+    q38_gdn_core_first_f32_kernel<<<core_grid, core_block, 0, stream>>>(
+        q_conv, k_conv, v_conv, scratch.beta(), scratch.core_out(),
+        q.ssm_state_size, q.ssm_group_count, q.ssm_dt_rank);
+    q38_gdn_gated_rmsnorm_f32_kernel<<<q.ssm_dt_rank, threads, 0, stream>>>(
+        scratch.core_out(), scratch.norm(), scratch.z(), scratch.norm_out(),
+        q.ssm_state_size, q.ssm_dt_rank, rms_eps);
+    launch_q8_0_gemv_q8_1_f32(w.out.low, scratch.norm_out(), scratch.final_out(), q8_1, stream);
+    return scratch.final_out();
+}
+
 __global__ void q38_gdn_gate_params_kernel(
         __half * beta,
         const __half * alpha,
@@ -298,8 +621,7 @@ __global__ void q38_gdn_ar_kernel(
     const int j = threadIdx.x;
     if (vh >= value_heads || j >= head_dim) return;
 
-    const int repeat = value_heads / key_heads;
-    const int kh = vh / repeat;
+    const int kh = vh % key_heads;
     const __half * qh = q + kh * head_dim;
     const __half * khv = k + kh * head_dim;
     const __half * vhv = v + vh * head_dim;

@@ -49,6 +49,9 @@ struct Qwen38Trace {
     std::vector<float> attn_out;
     std::vector<float> after_attn;
     std::vector<float> hc_ffn_mix;
+    std::vector<float> hc_ffn_mix_f32;
+    std::vector<float> gdn_f32_out;
+    std::vector<float> after_attn_f32;
     std::vector<float> ffn_out;
     std::vector<float> after_ffn;
     std::vector<float> router_logits;
@@ -142,6 +145,7 @@ public:
 
         cudaStream_t stream = state_.stream();
         Qwen38HcF32DebugScratch hc_f32_scratch;
+        bool f32_layer0_router_preselected = false;
 
         // The wide HC residual starts as four identical copies of the token embedding.
         launch_q8_0_gather_row(rt_.token_embd, token, state_.head_hidden(), stream);
@@ -159,6 +163,35 @@ public:
             trace->hc_f32.low = copy_float(stream, hc_f32_scratch.low(), static_cast<size_t>(q.hc_low_rank));
             trace->hc_f32.gate = copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim));
             trace->hc_f32.mixed = copy_float(stream, hc_f32_scratch.mixed(), static_cast<size_t>(q.hidden));
+            if (trace->use_f32_hc_layer0) {
+                Qwen38RuntimeLayer & layer0 = rt_.layers.front();
+                Qwen38LayerState & state0 = state_.layer(0);
+                if (layer0.qsa || !layer0.gdn_w || !state0.gdn_state) {
+                    throw std::runtime_error("layer-0 F32 parity path requires GDN attention");
+                }
+                Qwen38GdnF32DebugScratch gdn_scratch;
+                gdn_scratch.initialize(q);
+                float * attn_out = run_qwen38_gdn_f32_first_token(
+                    hc_f32_scratch.mixed(), *layer0.gdn_w, gdn_scratch, q, q.rms_eps,
+                    hc_f32_scratch.q8_1(), stream);
+                trace->gdn_f32_out = copy_float(stream, attn_out, static_cast<size_t>(q.hidden));
+
+                const int combine_blocks = (hc_dim + 255) / 256;
+                q38_hc_combine_f32_kernel<<<combine_blocks, 256, 0, stream>>>(
+                    hc_f32_scratch.residual(), attn_out, hc_f32_scratch.inject(),
+                    q.hidden, q.hc_count);
+                trace->after_attn_f32 = copy_float(stream, hc_f32_scratch.residual(), static_cast<size_t>(hc_dim));
+
+                Qwen38HcF32DebugScratch ffn_scratch;
+                ffn_scratch.initialize(q.hidden, q.hc_count, q.hc_low_rank);
+                run_qwen38_hc_f32_mix_from_residual(
+                    hc_f32_scratch.residual(), layer0.hc_ffn, ffn_scratch, q.rms_eps, stream);
+                trace->hc_ffn_mix_f32 = copy_float(stream, ffn_scratch.mixed(), static_cast<size_t>(q.hidden));
+                q38_select_experts_f32_input(
+                    layer0.router, ffn_scratch.mixed(), state0.moe,
+                    q.expert_weights_scale, stream);
+                f32_layer0_router_preselected = true;
+            }
         }
 
         for (int il = 0; il < q.trunk_layers; ++il) {
@@ -229,6 +262,8 @@ public:
                 state_.residual(), layer.hc_ffn, st.hc_ffn, q.rms_eps, stream);
             if (trace && il == 0) trace->hc_ffn_mix = copy_half(stream, cur, static_cast<size_t>(q.hidden));
 
+            const bool experts_preselected = f32_layer0_router_preselected && il == 0;
+
             if (rt_.fused_experts) {
                 if (!layer.routed.gate_up || !layer.routed.down) {
                     throw std::runtime_error("Qwen3.8 fused expert tensor set is incomplete");
@@ -237,7 +272,7 @@ public:
                     il, cur, layer.router,
                     *layer.routed.gate_up, *layer.routed.down,
                     rt_.fused_expert_cache, st.moe, st.moe_out,
-                    q.expert_weights_scale, stream);
+                    q.expert_weights_scale, stream, experts_preselected);
             } else {
                 if (!layer.routed.gate || !layer.routed.up || !layer.routed.down) {
                     throw std::runtime_error("Qwen3.8 expert tensor set is incomplete");
@@ -246,7 +281,7 @@ public:
                     il, cur, layer.router,
                     *layer.routed.gate, *layer.routed.up, *layer.routed.down,
                     rt_.expert_cache, st.moe, st.moe_out,
-                    q.expert_weights_scale, stream);
+                    q.expert_weights_scale, stream, experts_preselected);
             }
             if (trace && il == 0) {
                 trace->router_logits = copy_float(stream, st.moe.d_logits(), static_cast<size_t>(q.experts));

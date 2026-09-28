@@ -74,6 +74,9 @@ static Args parse_args(int argc, char** argv) {
         } else throw std::runtime_error("不明な引数: " + s);
     }
     if (a.debug_f32_hc_layer0 && a.top_k == 0) a.top_k = 10;
+    if (a.debug_f32_hc_layer0 && a.generate != 1) {
+        throw std::runtime_error("--debug-f32-hc-layer0 requires --generate 1");
+    }
     if (a.model.empty()) throw std::runtime_error("--model が必要です");
     if (a.ctx < 16 || a.generate < 1 || a.start_token < 0 || a.top_k < 0 || a.top_k > 256) {
         throw std::runtime_error("引数範囲が不正です");
@@ -893,6 +896,8 @@ int main(int argc, char** argv) {
                 dump_trace("hc_f32_low", trace.hc_f32.low);
                 dump_trace("hc_f32_gate", trace.hc_f32.gate);
                 dump_trace("hc_f32_mix", trace.hc_f32.mixed);
+                dump_trace("gdn_f32_out", trace.gdn_f32_out);
+                dump_trace("after_attn_f32", trace.after_attn_f32);
                 dump_trace("gdn_qkv", trace.gdn_qkv);
                 dump_trace("gdn_z", trace.gdn_z);
                 dump_trace("gdn_beta", trace.gdn_beta);
@@ -903,6 +908,7 @@ int main(int argc, char** argv) {
                 dump_trace("attn_out", trace.attn_out);
                 dump_trace("after_attn", trace.after_attn);
                 dump_trace("hc_ffn_mix", trace.hc_ffn_mix);
+                dump_trace("hc_ffn_mix_f32", trace.hc_ffn_mix_f32);
                 dump_trace("ffn_out", trace.ffn_out);
                 dump_trace("after_ffn", trace.after_ffn);
                 dump_trace("router_logits", trace.router_logits);

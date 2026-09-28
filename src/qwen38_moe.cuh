@@ -323,6 +323,33 @@ inline void q38_select_experts(
     if (e != cudaSuccess) throw std::runtime_error(std::string("expert selection sync failed: ") + cudaGetErrorString(e));
 }
 
+inline void q38_select_experts_f32_input(
+        const GpuMatrix & router,
+        const float * x,
+        Qwen38MoeScratch & scratch,
+        float expert_scale,
+        cudaStream_t stream) {
+    if (router.rows != scratch.n_experts() || router.cols != scratch.hidden()) {
+        throw std::runtime_error("Qwen3.8 router matrix geometry mismatch");
+    }
+
+    launch_matrix_gemv_f32_input(router, x, scratch.d_logits(), stream);
+    q38_topk_softmax_kernel<<<1, 1, 0, stream>>>(
+        scratch.d_logits(), scratch.n_experts(), scratch.k(), expert_scale,
+        scratch.d_ids(), scratch.d_weights());
+
+    cudaError_t e = cudaMemcpyAsync(
+        scratch.h_ids(), scratch.d_ids(), static_cast<size_t>(scratch.k()) * sizeof(int),
+        cudaMemcpyDeviceToHost, stream);
+    if (e != cudaSuccess) throw std::runtime_error(std::string("copy F32-router expert ids failed: ") + cudaGetErrorString(e));
+    e = cudaMemcpyAsync(
+        scratch.h_weights(), scratch.d_weights(), static_cast<size_t>(scratch.k()) * sizeof(float),
+        cudaMemcpyDeviceToHost, stream);
+    if (e != cudaSuccess) throw std::runtime_error(std::string("copy F32-router expert weights failed: ") + cudaGetErrorString(e));
+    e = cudaStreamSynchronize(stream);
+    if (e != cudaSuccess) throw std::runtime_error(std::string("F32-router selection sync failed: ") + cudaGetErrorString(e));
+}
+
 inline void q38_finish_moe(
         Qwen38MoeScratch & scratch,
         __half * out,
@@ -343,7 +370,8 @@ inline void run_qwen38_routed_moe_fused(
         Qwen38MoeScratch & scratch,
         __half * out,
         float expert_scale,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        bool preselected = false) {
     if (gate_up_exps.dims.size() != 3 || down_exps.dims.size() != 3) {
         throw std::runtime_error("Qwen3.8 fused expert tensors must be 3D");
     }
@@ -351,7 +379,7 @@ inline void run_qwen38_routed_moe_fused(
         throw std::runtime_error("Qwen3.8 fused gate-up FFN width mismatch");
     }
 
-    q38_select_experts(router, x, scratch, expert_scale, stream);
+    if (!preselected) q38_select_experts(router, x, scratch, expert_scale, stream);
 
     cudaError_t e = cudaMemsetAsync(
         scratch.d_accum(), 0, static_cast<size_t>(scratch.hidden()) * sizeof(float), stream);
@@ -388,8 +416,9 @@ inline void run_qwen38_routed_moe_separate(
         Qwen38MoeScratch & scratch,
         __half * out,
         float expert_scale,
-        cudaStream_t stream) {
-    q38_select_experts(router, x, scratch, expert_scale, stream);
+        cudaStream_t stream,
+        bool preselected = false) {
+    if (!preselected) q38_select_experts(router, x, scratch, expert_scale, stream);
 
     cudaError_t e = cudaMemsetAsync(
         scratch.d_accum(), 0, static_cast<size_t>(scratch.hidden()) * sizeof(float), stream);
