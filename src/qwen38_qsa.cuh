@@ -482,9 +482,10 @@ __global__ void q38_qsa_sparse_attention_kernel(
             sh_beta = expf(score - nm);
             sh_l = l * sh_alpha + sh_beta;
             m = nm;
-            l = sh_l;
         }
         __syncthreads();
+        // l is thread-local; every feature lane needs the updated softmax denominator.
+        l = sh_l;
 
         if (d < head_dim) {
             acc = acc * sh_alpha + sh_beta * __half2float(v_cache[base + d]);

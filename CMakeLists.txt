@@ -63,4 +63,11 @@ if(WARODECODE_BUILD_ENGINE)
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
   )
   set_target_properties(warodecode-qwen38-moe-cuda-test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+  add_executable(warodecode-qwen38-qsa-cuda-test tests/qwen38_qsa_cuda_test.cu)
+  target_include_directories(warodecode-qwen38-qsa-cuda-test PRIVATE src)
+  target_compile_options(warodecode-qwen38-qsa-cuda-test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  )
+  set_target_properties(warodecode-qwen38-qsa-cuda-test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 endif()
