@@ -112,7 +112,7 @@ static Args parse_args(int argc, char** argv) {
         } else throw std::runtime_error("不明な引数: " + s);
     }
     if (a.debug_f32_hc_layer0 && a.top_k == 0) a.top_k = 10;
-    if (a.debug_f32_hc_layer0 && a.generate != 1) {
+    if (a.debug_f32_hc_layer0 && a.generate != 1 && a.state_trace_path.empty()) {
         throw std::runtime_error("--debug-f32-hc-layer0 requires --generate 1");
     }
     if (!a.extended_parity_trace.empty() && !a.debug_f32_hc_layer0) {
@@ -122,10 +122,10 @@ static Args parse_args(int argc, char** argv) {
         throw std::runtime_error("--state-trace and --forced-input-tokens must be used together");
     }
     if (!a.state_trace_path.empty() &&
-        (a.debug_f32_hc_layer0 || !a.extended_parity_trace.empty() ||
+        (!a.extended_parity_trace.empty() ||
          static_cast<int>(a.forced_input_tokens.size()) != a.generate ||
          a.forced_input_tokens.front() != a.start_token)) {
-        throw std::runtime_error("state trace requires a forced input for every generated position and cannot be combined with other trace modes");
+        throw std::runtime_error("state trace requires a forced input for every generated position and cannot be combined with extended parity tracing");
     }
     if (a.model.empty()) throw std::runtime_error("--model が必要です");
     if (a.ctx < 16 || a.generate < 1 || a.start_token < 0 || a.top_k < 0 || a.top_k > 256) {

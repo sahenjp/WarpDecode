@@ -183,12 +183,14 @@ public:
         bool f32_layer0_router_preselected = false;
         if (trace && trace->state_trace) {
             trace->position = pos;
+            trace_context_ = "position " + std::to_string(pos) + " embedding";
             trace->add_integer_vector("position", {pos});
             trace->add_integer_vector("input_token", {token});
             trace->add_extended("embedding.hc_init", copy_half(
                 stream, state_.residual(), static_cast<size_t>(q.hidden) * q.hc_count));
         }
-        const bool legacy_trace = trace && !trace->state_trace;
+        const bool legacy_trace = trace &&
+            (!trace->state_trace || (trace->use_f32_hc_layer0 && pos == 0));
 
         // The wide HC residual starts as four identical copies of the token embedding.
         launch_q8_0_gather_row(rt_.token_embd, token, state_.head_hidden(), stream);
@@ -196,6 +198,7 @@ public:
         q38_repeat_embedding_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
             state_.head_hidden(), state_.residual(), q.hidden, q.hc_count);
         if (legacy_trace) {
+            if (trace->state_trace) trace_context_ = "position " + std::to_string(pos) + " F32 layer-0 parity";
             trace->hc_init = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
             trace->add_extended("layer0.hc_init", trace->hc_init);
         }
@@ -249,6 +252,9 @@ public:
         for (int il = 0; il < q.trunk_layers; ++il) {
             Qwen38RuntimeLayer & layer = rt_.layers[static_cast<size_t>(il)];
             Qwen38LayerState & st = state_.layer(il);
+            if (trace && trace->state_trace) {
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " input residual";
+            }
 
             if (trace && trace->state_trace) {
                 trace->add_extended(
@@ -265,6 +271,7 @@ public:
                         stream, state_.residual(), static_cast<size_t>(hc_dim)));
                 }
                 if (trace && trace->state_trace) {
+                    trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " PLE before";
                     const std::vector<uint64_t> rows = qwen38_ple_row_indices(q, token, history_);
                     trace->add_integer_vector("layer" + std::to_string(il) + ".ple_row_indices",
                         std::vector<int64_t>(rows.begin(), rows.end()));
@@ -286,6 +293,7 @@ public:
                         stream, state_.residual(), static_cast<size_t>(hc_dim)));
                 }
                 if (trace && trace->state_trace) {
+                    trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " PLE after";
                     const size_t n = static_cast<size_t>(st.ple_state->hist()) * st.ple_state->channels();
                     trace->add_extended("layer" + std::to_string(il) + ".ple_history_after",
                         copy_half(stream, st.ple_state->history(), n));
@@ -310,14 +318,18 @@ public:
             __half * cur = run_qwen38_hc_mix(
                 state_.residual(), layer.hc_attn, st.hc_attn, q.rms_eps, stream);
             if (trace && trace->state_trace) {
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_attn_norm";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_attn_norm",
                     copy_half(stream, st.hc_attn.xn(), static_cast<size_t>(hc_dim)));
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_attn_gate";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_attn_gate",
                     copy_half(stream, st.hc_attn.gate(), static_cast<size_t>(hc_dim)));
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_attn_mix";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_attn_mix",
                     copy_half(stream, cur, static_cast<size_t>(q.hidden)));
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_attn_inject";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_attn_inject",
-                    copy_half(stream, st.hc_attn.inject(), static_cast<size_t>(hc_dim)));
+                    copy_half(stream, st.hc_attn.inject(), static_cast<size_t>(q.hc_count)));
             }
             if (legacy_trace && il == 0) {
                 trace->hc_attn_norm = copy_half(stream, st.hc_attn.xn(), static_cast<size_t>(hc_dim));
@@ -365,6 +377,7 @@ public:
                     cur, *layer.qsa_w, *st.qsa_state, *st.qsa_scratch,
                     q, il, pos, Qwen38Position4::text(pos), stream);
                 if (trace && trace->state_trace) {
+                    trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " QSA cache/output";
                     const size_t kv_n = static_cast<size_t>(q.kv_heads) * q.key_length;
                     const size_t idx_n = static_cast<size_t>(q.indexer_key_length);
                     trace->add_extended("layer" + std::to_string(il) + ".qsa.query",
@@ -418,6 +431,7 @@ public:
                                           q.ssm_state_size * q.ssm_dt_rank;
                 const size_t conv_state_n = static_cast<size_t>(q.ssm_conv_kernel - 1) * conv_channels;
                 if (trace && trace->state_trace) {
+                    trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " GDN before";
                     trace->add_extended("layer" + std::to_string(il) + ".gdn.input",
                         copy_half(stream, cur, static_cast<size_t>(q.hidden)));
                     trace->add_state_summary("layer" + std::to_string(il) + ".gdn.recurrent_before",
@@ -432,6 +446,7 @@ public:
                     cur, *layer.gdn_w, *st.gdn_state, *st.gdn_scratch,
                     q, q.rms_eps, stream);
                 if (trace && trace->state_trace) {
+                    trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " GDN after";
                     trace->add_state_summary("layer" + std::to_string(il) + ".gdn.recurrent_after",
                         copy_float(stream, st.gdn_state->state(), gdn_state_n),
                         {static_cast<uint64_t>(q.ssm_dt_rank), static_cast<uint64_t>(q.ssm_state_size),
@@ -481,6 +496,7 @@ public:
                 }
             }
             if (trace && trace->state_trace) {
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " attention output";
                 trace->add_extended("layer" + std::to_string(il) + ".attention_output",
                     copy_half(stream, attn_out, static_cast<size_t>(q.hidden)));
             }
@@ -491,6 +507,7 @@ public:
             run_qwen38_hc_combine(state_.residual(), attn_out, st.hc_attn, stream);
             if (legacy_trace && il == 0) trace->after_attn = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
             if (trace && trace->state_trace) {
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " HC attention combine";
                 trace->add_extended("layer" + std::to_string(il) + ".after_attention_residual",
                     copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
             }
@@ -501,14 +518,18 @@ public:
             cur = run_qwen38_hc_mix(
                 state_.residual(), layer.hc_ffn, st.hc_ffn, q.rms_eps, stream);
             if (trace && trace->state_trace) {
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_ffn_norm";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_ffn_norm",
                     copy_half(stream, st.hc_ffn.xn(), static_cast<size_t>(hc_dim)));
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_ffn_gate";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_ffn_gate",
                     copy_half(stream, st.hc_ffn.gate(), static_cast<size_t>(hc_dim)));
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_ffn_mix";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_ffn_mix",
                     copy_half(stream, cur, static_cast<size_t>(q.hidden)));
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_ffn_inject";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_ffn_inject",
-                    copy_half(stream, st.hc_ffn.inject(), static_cast<size_t>(hc_dim)));
+                    copy_half(stream, st.hc_ffn.inject(), static_cast<size_t>(q.hc_count)));
             }
             if (legacy_trace && il == 0) trace->hc_ffn_mix = copy_half(stream, cur, static_cast<size_t>(q.hidden));
             if (trace && trace->extended_parity && il == 0) {
@@ -591,6 +612,7 @@ public:
 
             run_qwen38_shared_expert(cur, layer.shared, st.moe, st.moe_out, stream);
             if (trace && trace->state_trace) {
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " FFN output";
                 trace->add_extended("layer" + std::to_string(il) + ".ffn_output",
                     copy_half(stream, st.moe_out, static_cast<size_t>(q.hidden)));
             }
@@ -610,6 +632,7 @@ public:
             run_qwen38_hc_combine(state_.residual(), st.moe_out, st.hc_ffn, stream);
             if (legacy_trace && il == 0) trace->after_ffn = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
             if (trace && trace->state_trace) {
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " layer output";
                 trace->add_extended("layer" + std::to_string(il) + ".output",
                     copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
             }
@@ -622,12 +645,14 @@ public:
         __half * head = run_qwen38_hc_mix(
             state_.residual(), rt_.hc_head, state_.head_hc(), q.rms_eps, stream);
         if (trace && trace->state_trace) {
+            trace_context_ = "position " + std::to_string(pos) + " final head input";
             trace->add_extended("final.head_input", copy_half(stream, head, static_cast<size_t>(q.hidden)));
         }
         launch_lowbit_gemv_float(rt_.output, head, logits_, stream);
         q38_argmax_kernel<<<1, 256, 0, stream>>>(
             logits_, rt_.vocab, next_token_, has_nonfinite_);
         if (trace && trace->state_trace) {
+            trace_context_ = "position " + std::to_string(pos) + " final logits";
             trace->add_extended("final.logits",
                 copy_float(stream, logits_, static_cast<size_t>(rt_.vocab)));
             trace->add_state_summary("final.logits", copy_float(
@@ -729,13 +754,16 @@ public:
     }
 
 private:
-    static std::vector<float> copy_half(cudaStream_t stream, const __half * data, size_t n) {
+    std::vector<float> copy_half(cudaStream_t stream, const __half * data, size_t n) {
         cudaError_t e = cudaStreamSynchronize(stream);
         if (e != cudaSuccess) throw std::runtime_error("sync Qwen3.8 trace stream failed");
         std::vector<__half> half(n);
         e = cudaMemcpy(
             half.data(), data, n * sizeof(__half), cudaMemcpyDeviceToHost);
-        if (e != cudaSuccess) throw std::runtime_error("copy Qwen3.8 trace tensor failed");
+        if (e != cudaSuccess) {
+            throw std::runtime_error("copy Qwen3.8 trace tensor failed at " + trace_context_ +
+                " (count=" + std::to_string(n) + "): " + cudaGetErrorString(e));
+        }
         std::vector<float> out(n);
         std::transform(half.begin(), half.end(), out.begin(), [](__half x) {
             return __half2float(x);
@@ -743,23 +771,29 @@ private:
         return out;
     }
 
-    static std::vector<float> copy_float(cudaStream_t stream, const float * data, size_t n) {
+    std::vector<float> copy_float(cudaStream_t stream, const float * data, size_t n) {
         cudaError_t e = cudaStreamSynchronize(stream);
         if (e != cudaSuccess) throw std::runtime_error("sync Qwen3.8 trace stream failed");
         std::vector<float> out(n);
         e = cudaMemcpy(
             out.data(), data, n * sizeof(float), cudaMemcpyDeviceToHost);
-        if (e != cudaSuccess) throw std::runtime_error("copy Qwen3.8 trace tensor failed");
+        if (e != cudaSuccess) {
+            throw std::runtime_error("copy Qwen3.8 trace tensor failed at " + trace_context_ +
+                " (count=" + std::to_string(n) + "): " + cudaGetErrorString(e));
+        }
         return out;
     }
 
-    static std::vector<int64_t> copy_ints(cudaStream_t stream, const int * data, size_t n) {
+    std::vector<int64_t> copy_ints(cudaStream_t stream, const int * data, size_t n) {
         if (n == 0) return {};
         cudaError_t e = cudaStreamSynchronize(stream);
         if (e != cudaSuccess) throw std::runtime_error("sync Qwen3.8 trace stream failed");
         std::vector<int> host(n);
         e = cudaMemcpy(host.data(), data, n * sizeof(int), cudaMemcpyDeviceToHost);
-        if (e != cudaSuccess) throw std::runtime_error("copy Qwen3.8 trace indices failed");
+        if (e != cudaSuccess) {
+            throw std::runtime_error("copy Qwen3.8 trace indices failed at " + trace_context_ +
+                " (count=" + std::to_string(n) + "): " + cudaGetErrorString(e));
+        }
         return std::vector<int64_t>(host.begin(), host.end());
     }
 
@@ -771,6 +805,7 @@ private:
     int * host_next_token_ = nullptr;
     int * host_has_nonfinite_ = nullptr;
     std::vector<int> history_;
+    std::string trace_context_;
 };
 
 inline uint64_t qwen38_token_hash(const std::vector<int> & ids) {
