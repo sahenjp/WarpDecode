@@ -20,6 +20,7 @@ struct Qwen38Layout {
     int kv_heads = 0;
     int key_length = 0;
     int value_length = 0;
+    int rope_dimension_count = 0;
 
     int experts = 0;
     int experts_used = 0;
@@ -113,6 +114,8 @@ inline Qwen38Layout qwen38_layout_from_gguf(const GgufFile & g) {
     q.kv_heads = q38_u32(g, "qwen4exp.attention.head_count_kv");
     q.key_length = q38_u32(g, "qwen4exp.attention.key_length");
     q.value_length = q38_u32(g, "qwen4exp.attention.value_length");
+    q.rope_dimension_count = g.has_meta("qwen4exp.rope.dimension_count")
+        ? q38_u32(g, "qwen4exp.rope.dimension_count") : q.key_length;
 
     q.experts = q38_u32(g, "qwen4exp.expert_count");
     q.experts_used = q38_u32(g, "qwen4exp.expert_used_count");
@@ -161,6 +164,8 @@ inline Qwen38Layout qwen38_layout_from_gguf(const GgufFile & g) {
     if (q.total_blocks <= 0 || q.trunk_layers <= 0 || q.mtp_layers < 0 ||
         q.hidden <= 0 || q.heads <= 0 || q.kv_heads <= 0 ||
         q.key_length <= 0 || q.value_length <= 0 ||
+        q.rope_dimension_count <= 0 || q.rope_dimension_count > q.key_length ||
+        (q.rope_dimension_count & 1) != 0 ||
         q.experts <= 0 || q.experts_used <= 0 || q.experts_used > q.experts ||
         q.expert_ffn <= 0 || q.shared_ffn <= 0 ||
         q.ssm_conv_kernel <= 0 || q.ssm_state_size <= 0 ||

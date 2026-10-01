@@ -17,6 +17,7 @@ int main(int argc, char ** argv) {
     assert(q.kv_heads == 2);
     assert(q.experts == 512);
     assert(q.experts_used == 10);
+    assert(q.rope_dimension_count == 64);
     assert(q.qsa_layer_count() == 12);
     assert(q.gdn_layer_count() == 36);
     assert(q.is_qsa(3));
@@ -27,7 +28,7 @@ int main(int argc, char ** argv) {
     assert(std::fabs(q.rms_eps - 1e-6f) < 1e-9f);
     assert(std::fabs(q.rope_freq_base - 1000000.0f) < 1.0f);
     assert(std::fabs(q.expert_weights_scale - 1.25f) < 1e-6f);
-    assert((q.rope_sections == std::vector<int64_t>{16, 24, 24, 0}));
+    assert((q.rope_sections == std::vector<int64_t>{11, 11, 10, 0}));
 
     std::cout << "PASS\n";
     return 0;

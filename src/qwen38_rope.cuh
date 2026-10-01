@@ -40,12 +40,13 @@ __device__ __forceinline__ int q38_imrope_axis(
 __global__ void q38_imrope_neox_inplace_kernel(
         __half * x,
         int head_dim,
+        int rotary_dim,
         int n_heads,
         int4 pos,
         int4 sections,
         float freq_base) {
     const int pair_global = blockIdx.x * blockDim.x + threadIdx.x;
-    const int pairs_per_head = head_dim / 2;
+    const int pairs_per_head = rotary_dim / 2;
     const int total_pairs = n_heads * pairs_per_head;
     if (pair_global >= total_pairs) return;
 
@@ -58,7 +59,7 @@ __global__ void q38_imrope_neox_inplace_kernel(
                   axis == 1 ? pos.y :
                   axis == 2 ? pos.z : pos.w;
 
-    const float theta_scale = powf(freq_base, -2.0f / static_cast<float>(head_dim));
+    const float theta_scale = powf(freq_base, -2.0f / static_cast<float>(rotary_dim));
     const float theta = static_cast<float>(p) * powf(theta_scale, static_cast<float>(pair));
     float sn, cs;
     sincosf(theta, &sn, &cs);
@@ -82,6 +83,10 @@ inline void launch_qwen38_imrope(
     if (head_dim <= 0 || (head_dim & 1) || n_heads <= 0) {
         throw std::runtime_error("invalid IMRoPE geometry");
     }
+    if (q.rope_dimension_count <= 0 || q.rope_dimension_count > head_dim ||
+        (q.rope_dimension_count & 1) != 0) {
+        throw std::runtime_error("invalid Qwen3.8 rotary dimension count");
+    }
     if (q.rope_sections.size() != 4) {
         throw std::runtime_error("Qwen3.8 IMRoPE requires 4 rope.dimension_sections");
     }
@@ -93,10 +98,10 @@ inline void launch_qwen38_imrope(
         static_cast<int>(q.rope_sections[2]),
         static_cast<int>(q.rope_sections[3]));
 
-    const int total_pairs = n_heads * (head_dim / 2);
+    const int total_pairs = n_heads * (q.rope_dimension_count / 2);
     const int threads = 256;
     q38_imrope_neox_inplace_kernel<<<(total_pairs + threads - 1) / threads, threads, 0, stream>>>(
-        x, head_dim, n_heads, p, s, q.rope_freq_base);
+        x, head_dim, q.rope_dimension_count, n_heads, p, s, q.rope_freq_base);
 }
 
 } // namespace wd

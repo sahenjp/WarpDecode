@@ -10,6 +10,44 @@ static void check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 
+static void test_imrope_rotary_dimensions() {
+    wd::Qwen38Layout layout;
+    layout.rope_dimension_count = 4;
+    layout.rope_freq_base = 10000.0f;
+    layout.rope_sections = {1, 1, 0, 0};
+    const std::vector<float> input{1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<__half> actual(input.size());
+    for (size_t i = 0; i < input.size(); ++i) actual[i] = __float2half(input[i]);
+
+    __half * device = nullptr;
+    check(cudaMalloc(reinterpret_cast<void **>(&device), actual.size() * sizeof(__half)));
+    check(cudaMemcpy(device, actual.data(), actual.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    wd::launch_qwen38_imrope(device, 8, 1, wd::Qwen38Position4::text(1), layout, nullptr);
+    check(cudaGetLastError());
+    check(cudaDeviceSynchronize());
+    check(cudaMemcpy(actual.data(), device, actual.size() * sizeof(__half), cudaMemcpyDeviceToHost));
+    cudaFree(device);
+
+    const float theta_scale = std::pow(layout.rope_freq_base, -2.0f / layout.rope_dimension_count);
+    for (int pair = 0; pair < 2; ++pair) {
+        const float theta = std::pow(theta_scale, static_cast<float>(pair));
+        const float cs = std::cos(theta);
+        const float sn = std::sin(theta);
+        const int other = pair + 2;
+        const float expected_a = input[static_cast<size_t>(pair)] * cs - input[static_cast<size_t>(other)] * sn;
+        const float expected_b = input[static_cast<size_t>(pair)] * sn + input[static_cast<size_t>(other)] * cs;
+        if (std::abs(__half2float(actual[static_cast<size_t>(pair)]) - expected_a) > 2e-3f ||
+            std::abs(__half2float(actual[static_cast<size_t>(other)]) - expected_b) > 2e-3f) {
+            throw std::runtime_error("IMRoPE used the wrong rotary dimension or pair offset");
+        }
+    }
+    for (size_t i = 4; i < input.size(); ++i) {
+        if (std::abs(__half2float(actual[i]) - input[i]) > 1e-3f) {
+            throw std::runtime_error("IMRoPE modified a non-rotary head dimension");
+        }
+    }
+}
+
 int main() {
     try {
         constexpr int heads = 2;
@@ -72,7 +110,8 @@ int main() {
         cudaFree(d_k);
         cudaFree(d_v);
         cudaFree(d_out);
-        std::cout << "QSA single-token softmax PASS\n";
+        test_imrope_rotary_dimensions();
+        std::cout << "QSA single-token softmax and IMRoPE dimensions PASS\n";
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "QSA single-token softmax FAIL: " << error.what() << '\n';
