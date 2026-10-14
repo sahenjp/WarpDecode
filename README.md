@@ -4,6 +4,8 @@ NVIDIA GPU上の **batch=1 LLM decode速度** に対象を絞り、llama.cppの�
 
 現時点では開発中です。「llama.cppより高速」という性能主張は、同一モデル・同一GPUで実測して5%以上勝った構成だけに限定します。
 
+ライセンス: [MIT](LICENSE)
+
 ## まずTUIを起動
 
 CUDAが未導入でもTUIだけは起動できます。
