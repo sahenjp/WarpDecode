@@ -133,6 +133,17 @@ Colab は**使っていないセッションを自動回収する**ことがあ�
 - expert 融合（60→5 launch/層）は +0.55%。launch 削減は上限近く。
 - 出力ヘッドは 189 GiB/s で帯域律速。最適化対象ではない。
 
+## 割り当て更新（2026-10-14 20:35・Task L）
+
+| セッション | GPU | 担当 |
+|---|---|---|
+| warpdecode-a100 | A100 40GB | **Task L (llama.cpp 直接 A/B)** |
+| warpdecode-l4b | L4 24GB | 空き確認のみ（未使用） |
+
+Task L は a100 で llama.cpp を CUDA sm80 ビルドし、同一モデル・同一条件で
+本エンジンと交互に decode を計測する。作業ディレクトリは `/content/wd_taskl`（専用）。
+他担当は a100 を使わないこと。
+
 ## 2026-10-14 19:50 時点の状態
 
 Colab のセッション回収が頻繁に起きている。現在の生存セッション:
@@ -154,3 +165,36 @@ warpdecode-l4 / l4f / t4 は回収された。再作成のたびに 85.9GB の�
 - `WARODECODE_MTP=1 + MTP_BATCH_VERIFY=1 + MOE_BATCH_K=4` の実行で **matched_prefix=41**（64/64 でない）。
   バッチ verify が MoE の数値を変えている疑い。既定スイッチは OFF のままだが、
   ON にする前に必ず原因を特定して 64/64 に戻すこと。
+
+## 2026-10-14 20:25 割り当て（公開後の追加タスク）
+
+**リポジトリは公開済み**（`git push origin main` → 5933825）。
+
+| セッション | GPU | 担当 |
+|---|---|---|
+| warpdecode-a100 | A100 40GB | **Task L（llama.cpp との A/B）** |
+| warpdecode-l4b | L4 24GB | **Task M（トークナイザ + ストリーミング CLI）** |
+
+※ セッションは2つしか生存していない。回収されたら `colab new -s <name> --gpu A100|L4` で再作成し、
+  `hf download pentacoxian-dev/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-GGUF Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf --local-dir /content/models`
+  でモデルを再取得する（85.9GB・約5分）。
+
+### 完了済みタスク（この日の全成果）
+| タスク | 内容 | 主な結果 |
+|---|---|---|
+| Issue #1 | CPU オラクルと 64/64 一致 | **達成**（修正10系統） |
+| A | prefill/decode 分離ベンチ | decode 4.107 / prefill 4.626 tok/s |
+| B | MTP 投機的デコード実装 | 受理率62.5%、batch=1 verify では -3.8〜6.2% |
+| C | expert cache 分析 + copy stream | 混雑時 +33%、レバーは容量 |
+| D | DP4A + コードブック smem | +6%（IQ2_S カーネル 5.1倍） |
+| F | トークン時間の内訳 | MoE 44% / hc_mix 30% / attn 23% |
+| G | expert 融合（60→5 launch/層） | +0.55%（launch は支配的でない） |
+| H | expert 転送の pread+ring+DMA | **3.7 → 14〜17 GiB/s、+21〜47%** |
+| J | HC mix のカーネル改善 | **80.5 → 37.1 ms（2.17倍）、A100 +25%** |
+| K | expert 先読みパイプライン | 実装・45テスト PASS、効果なし（予測不能）→ 既定OFF |
+
+### 最終速度（すべて parity 64/64）
+| 構成 | decode |
+|---|---|
+| L4 8000MiB | 5.287 tok/s |
+| **A100 16000MiB** | **5.607 tok/s** |

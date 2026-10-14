@@ -236,12 +236,13 @@ def rewrite(text, name):
 
 
 total = 0
-for pattern in ("src/*.cuh", "src/*.hpp"):
+for pattern in ("src/*.cuh", "src/*.hpp", "src/*.inc"):
     for path in root.glob(pattern):
         text, n = rewrite(path.read_text(), str(path))
         (work / "src" / path.name).write_text(text)
         total += n
-for name in ("tests/qwen38_moe_cuda_test.cu", "tests/moe_fused_grid_bench.cu"):
+for name in ("tests/qwen38_moe_cuda_test.cu", "tests/moe_fused_grid_bench.cu",
+             "tests/qwen38_tokenizer_host_test.cpp"):
     path = root / name
     text, n = rewrite(path.read_text(), str(path))
     (work / "tests" / (path.stem + ".cpp")).write_text(text)
@@ -265,5 +266,63 @@ g++ -std=c++17 -fsyntax-only -ffp-contract=off -mavx2 -mfma -mf16c -D__CUDACC__ 
   -Wno-unknown-pragmas -Wno-attributes \
   -include "$STUB/cuda_prelude.h" -I "$STUB" -I "$WORK/src" \
   tests/moe_fused_grid_bench.cpp
+
+# The Task M tokenizer and its CLI driver are host-only (no CUDA), so the same
+# -fsyntax-only pass type checks them without a model file. The unicode tables
+# are mirrored above as src/*.inc, and qwen38_tokenizer.cuh includes them.
+g++ -std=c++17 -fsyntax-only -Wall -Wextra -I "$WORK/src" \
+  tests/qwen38_tokenizer_host_test.cpp
+
+# warodecode.cu itself cannot be compiled without nvcc (it includes CUB), so its
+# structural invariants are checked textually: braces and namespace closings must
+# balance. This catches the "namespace wd opened twice, closed once" class of
+# edit that a header-only syntax pass would miss.
+python3 - "$ROOT/src/warodecode.cu" "$ROOT/src/qwen38_tokenizer.cuh" <<'BALANCE_EOF'
+import pathlib
+import sys
+
+for name in sys.argv[1:]:
+    text = pathlib.Path(name).read_text()
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c in ("\"", "'"):
+            quote = c
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        out.append(c)
+        i += 1
+    clean = "".join(out)
+    delta = clean.count("{") - clean.count("}")
+    if delta != 0:
+        raise SystemExit("unbalanced braces in %s (%d open, %d close)"
+                         % (name, clean.count("{"), clean.count("}")))
+    # A second "namespace wd {" inside the already open one silently creates
+    # wd::wd and every helper becomes unreachable (nvcc: "namespace wd has no
+    # member ..."). Exactly one such opening line is allowed per file.
+    opens = [line for line in text.splitlines() if line.strip().startswith("namespace wd {")]
+    if len(opens) != 1:
+        raise SystemExit("expected exactly one 'namespace wd {' in %s, found %d"
+                         % (name, len(opens)))
+    print("balanced: %s (%d braces, 1 namespace)" % (pathlib.Path(name).name, clean.count("{")))
+BALANCE_EOF
 
 echo "PASS (g++ -fsyntax-only, launch syntax rewritten)"

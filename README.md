@@ -55,10 +55,39 @@ CUDAエンジンは llama.cpp (`6fcaa16f4b360649933a54d1f91ad40ed35c0e11`) のCP
 | モデル | Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf (85.9 GB) |
 | 一致 | **64/64トークン** (全最適化後も維持、通算200本以上で確認) |
 | decode (L4 8000MiB, batch=1, ctx=128) | **5.29 tok/s** |
-| decode (A100 16000MiB) | **5.61 tok/s** |
+| decode (A100 16000MiB) | **5.61〜5.88 tok/s**（単発計測 / 3反復の最速値） |
 | prefill (L4 8000MiB, 同条件) | **4.63 tok/s** |
 | 速度 (F16高速パス基準) | 2.38 tok/s → **2.2〜2.4倍** |
 | 速度 (最適化前の本エンジン) | 3.20 tok/s → **1.65倍** |
+
+### llama.cpp (CUDA) との直接 A/B（A100 40GB・同一モデル・同一条件）
+
+同じセッション・同じ 85.9GB GGUF で、pinned llama.cpp を CUDA sm80 でビルドして
+batch=1 decode を交互に実測しました（詳細と再現手順: `docs/LLAMACPP_AB.md`）。
+
+| 構成 | VRAM 実測 | decode | 出力一致 |
+|---|---|---|---|
+| 本エンジン expert cache 8,000 MiB | 14,248 MiB | 5.56 tok/s | **64/64** |
+| 本エンジン expert cache 16,000 MiB | 22,248 MiB | 5.88 tok/s | **64/64** |
+| 本エンジン expert cache 30,000 MiB | 36,248 MiB | **6.15 tok/s** | **64/64** |
+| llama.cpp `-ngl 99`（MoE expert 全 CPU・12 threads） | 5,098 MiB | 12.54 tok/s | 36/64 |
+| llama.cpp `-ngl 99`（末尾 8 層の expert を GPU） | 12,796 MiB | 15.00 tok/s | 36/64 |
+| llama.cpp `-ngl 99`（末尾 16 層の expert を GPU） | 20,494 MiB | 18.49 tok/s | 36/64 |
+| llama.cpp 純 CPU（`-ngl 0`・12 threads） | 436 MiB | 4.56 tok/s | 44/64 |
+
+**A100 40GB では llama.cpp のほうが速い**（VRAM 予算を揃えると 2.7〜3.8 倍）。
+本エンジンが勝つのは「純 CPU の llama.cpp に対して約 1.3 倍」の範囲です。
+一方で CPU オラクルと 64/64 一致するのは本エンジンだけで、llama.cpp は既定ビルド
+（`GGML_NATIVE=ON` / repack 有効）だと自分の CPU 参照実装すら再現しません
+（オラクルと同じ cmake フラグでビルドすると 64/64 に戻ることが確認済み）。
+速度と数値忠実度は別の軸として読んでください。
+
+再現:
+
+```bash
+WARODECODE_COLAB_SESSION=warpdecode-a100 WARODECODE_COLAB_ARCH=80 \
+  python3 tools/llamacpp_ab.py --rounds 3 --reps 3 --llama-k 8 --llama-k2 16
+```
 
 ### 速度の内訳と効いた最適化
 
@@ -110,6 +139,30 @@ bash tests/qwen38_shexp_gate_host_check.sh /path/to/llama.cpp  # 共有エキス
 bash tests/qwen38_exact_math_host_check.sh /path/to/llama.cpp  # 超越関数
 bash tests/qwen38_cuda_syntax_check.sh                          # nvcc無しのCUDA構文検査 (CIで実行)
 ```
+
+## 文字列で話しかける (トークナイザ + ストリーミング CLI)
+
+GGUF の語彙から byte-level BPE トークナイザを読み、llama.cpp の `llama-cli` と同じ
+操作感で使えます。トークン ID 列は llama.cpp と完全一致します (実物の Qwen3.8 語彙で
+292/292、実機 86GB モデルでも 78/78)。
+
+```bash
+# 1回だけ
+./build-sm89/warodecode -m /content/models/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf \
+  -p "こんにちは。自己紹介してください。" -n 48 --chat-template
+
+# 対話モード (Ctrl-D か /exit、Ctrl-C で生成を止めて終了)
+./build-sm89/warodecode -m model.gguf -i -n 48 --chat-template
+
+# トークナイザだけ (GPU 不要)
+./build-sm89/warodecode -m model.gguf --tokenize-only -p "こんにちは、世界！"
+```
+
+- `-m`/`-p`/`-n`/`-c` は `--model`/`--prompt`/`--generate`/`--ctx` の別名
+- 生成は 1 トークンずつ flush して標準出力に流れる (UTF-8 の途中で切れるトークンは次まで保持)
+- `--temp` は greedy 固定のため 0 以外は警告して無視、`--chat-template` は Qwen 定型のみ適用
+- 既存の `--start-token` + `--generate` の JSON 出力はそのまま (計測・parity 用)
+- 詳細と検証結果: `docs/CLI_AND_TOKENIZER.md`
 
 ## GPU対応方針
 
@@ -169,62 +222,3 @@ RTX 50系(SM120)はCUDA 12.8以降を使います。
 - online-softmax decode attention
 - GPU内argmax
 - CUDA Graph
-- Q4 kernel launch形状の実機autotune
-- CPU inference fallbackなし
-
-Q4_0はロード時に量子値を変えずplanar配置へ再パックします。
-
-## 実行
-
-```bash
-./build-sm86/warodecode \
-  --model /models/model-q4_0.gguf \
-  --ctx 4096 \
-  --generate 128 \
-  --device 0
-```
-
-起動時に代表的なQ4行列を64/128/256/512 threadsで短く実測し、そのGPUで速いlaunch形状を採用します。比較のため無効化もできます。
-
-```bash
-./build-sm86/warodecode --model model.gguf --no-autotune
-```
-
-## llama.cppとのA/B
-
-```bash
-./bench/ab.sh \
-  ./build-sm86/warodecode \
-  /path/to/llama-bench \
-  /models/model-q4_0.gguf \
-  999
-```
-
-5%未満の差は勝ち扱いしません。
-
-## 複数GPU
-
-現在実装済みなのは、**GPUごとに独立したモデルプロセスを同時起動**するモードです。TUIでモデルとGPUをSpace選択して `M` を押します。
-
-1モデルを複数GPUへ分割するtensor parallel / layer splitは未実装です。P2P/NVLinkの有無で最適方式が変わるため、遅い単純層分割を「対応済み」として追加せず、実測できる形で別実装します。
-
-## 「llama.cppより速い」の条件
-
-- 同じGGUF
-- 同じGPU / GPU枚数
-- 同じKV型
-- batch=1
-- 同じ生成長
-- warmup後5回以上
-- GPUクロック・電力状態を記録
-- token/logit品質を別ゲートで確認
-- 5%未満は同等扱い
-
-現環境にはNVIDIA GPU / nvccがないため、CUDA本体の実機性能は未確認です。TUI、GGUF parser、設定・検出部分はホスト側でテストしています。
-
-
-## Qwen3.8-Flash-Next
-
-`qwen4exp`を看板最適化対象に追加しました。split GGUFはTUI上で1モデルにまとめ、metadata-only first shardでも認識します。専用方針は `docs/QWEN38_FLASH_NEXT.md`。
-
-狙うhot pathは **persistent QSA block cache + compact KV gather / direct PLE row reader / hot expert slot cache / grouped low-bit MoE / adaptive MTP2-4** です。現時点ではplannerとPLE direct readerが入り、qwen4exp forward本体は未配線です。

@@ -1,0 +1,73 @@
+Hello, world!
+こんにちは、世界！
+日本語のトークナイザを実装しました。
+1234567890
+3.14159e-10
+  multiple   spaces  
+line1\nline2\n\nline3
+\ttab\tseparated
+code: def foo(x): return x + 1  # comment
+https://github.com/sahenjp/WarpDecode
+emoji: 😀🎉👍🏽🇯🇵
+mixed 日本語 and English 123
+"quoted" 'single' (paren) [bracket] {brace}
+café naïve résumé
+Ω≈ç√∫˜µ≤≥÷ ± × ÷
+Кириллица 漢字 ハングル 한국어
+<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
+it's we're they've I'd he'll she's
+abcABC123!@#$%^&*()
+　全角スペース。、「」『』
+\n
+   
+supercalifragilisticexpialidocious
+1,234,567.89
+e\u0301 combining acute
+ᚠᛇᚻ᛫ᛒᛦᚦ᛫ᚠᚱᚩᚠᚢᚱ᛫ᚠᛁᚱᚪ᛫ᚷᛖᚻᚹᛦᛚᚳᚢᛗ
+Δoς μoι
+!!??!!
+aaaaaaaaaaaaaaaaaaaaaaaa
+
+A
+0
+ 
+\n\n
+日本 語
+テスト 123 abc
+[INST] hello [/INST]
+<|endoftext|>
+tab\tand\nnewline\r\ncrlf
+çok güzel ẞ ß İ ı
+𝔘𝔫𝔦𝔠𝔬𝔡𝔢 𝕄𝕒𝕥𝕙
+अनुच्छेद १: सबको शिक्षा
+กำเนิดใหม่
+tiếng Việt có dấu
+🇯🇵🇺🇸 flags and 👨‍👩‍👧‍👦 family
+🏳️‍🌈 variation selector
+​​ zero width space
+a\t \tb mixed tabs
+\n\n\n
+<|im_start|>assistant\n
+مرحبا بالعالم
+שלום עולם
+∑_{i=1}^{n} x_i^2 = π
+def f():  # 日本語コメント\n    return 42
+日本語日本語日本語日本語
+ＦＵＬＬ　ＷＩＤＴＨ
+①②③ ㍿ ㌔
+\r\n carriagereturn
+end with space 
+end with two spaces  
+   leading spaces then text
+  \n  mixed  \n  
+'' 's 'S 'RE 'V e
+123abc abc123 1a2b3c
+１２３ ａｂｃ ＡＢＣ
+。、！？「」（）【】〜
+Z​WJ with ‍ joiner
+n​o‍-break space
+𝔘𝔫𝔦𝔠𝔬𝔡𝔢 𠮷野家 𡃁
+👍🏽👨‍👩‍👧‍👦🇯🇵
+a\u0300\u0301\u0302 stacked marks
+\u000bvertical tab\u000c
+混在 mixed １２３ abc 日本語

@@ -9,6 +9,7 @@
 #include "qwen38_mtp.cuh"
 #include "qwen38_runtime.cuh"
 #include "qwen38_state.cuh"
+#include "qwen38_tokenizer.cuh"
 #include "qwen38_tuning.hpp"
 
 #include <cuda_fp16.h>
@@ -16,7 +17,9 @@
 #include <math_constants.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -165,6 +168,22 @@ struct Args {
     std::vector<float> debug_ffn_output;
     std::vector<float> debug_hc_residual;
     int state_trace_position = -1;
+    // Task M: llama-cli style text mode. All of these are additive: when
+    // --prompt / --interactive are absent the legacy token-ID JSON path runs
+    // unchanged.
+    std::string prompt;              // -p / --prompt
+    std::string prompt_file;         // -f / --prompt-file (verbatim bytes)
+    bool prompt_given = false;       // -p or -f was passed (empty prompt counts)
+    bool interactive = false;        // -i / --interactive
+    bool no_display_prompt = false;  // --no-display-prompt
+    int chat_template = -1;          // --chat-template / --no-chat-template (-1 auto)
+    int add_bos = -1;                // --add-bos / --no-bos (-1 = follow the GGUF)
+    bool parse_special = true;       // --no-parse-special
+    bool tokenize_only = false;      // --tokenize-only (no GPU needed)
+    std::string stream_json;         // --stream-json PATH
+    int stop_eos = 1;                // --stop-eos / --no-stop-eos
+    bool temp_set = false;           // --temp (accepted, greedy only)
+    double temp = 0.0;
 };
 
 static std::vector<int> parse_token_ids(const std::string & value) {
@@ -297,9 +316,23 @@ static Args parse_args(int argc, char** argv) {
     };
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
-        if (s == "--model") a.model = need(i, "--model");
-        else if (s == "--ctx") a.ctx = std::stoi(need(i, "--ctx"));
-        else if (s == "--generate") a.generate = std::stoi(need(i, "--generate"));
+        if (s == "--model" || s == "-m") a.model = need(i, "--model");
+        else if (s == "--ctx" || s == "-c") a.ctx = std::stoi(need(i, "--ctx"));
+        else if (s == "--generate" || s == "-n") a.generate = std::stoi(need(i, "--generate"));
+        else if (s == "--prompt" || s == "-p") { a.prompt = need(i, "--prompt"); a.prompt_given = true; }
+        else if (s == "--prompt-file" || s == "-f") { a.prompt_file = need(i, "--prompt-file"); a.prompt_given = true; }
+        else if (s == "--interactive" || s == "-i") a.interactive = true;
+        else if (s == "--no-display-prompt") a.no_display_prompt = true;
+        else if (s == "--chat-template") a.chat_template = 1;
+        else if (s == "--no-chat-template") a.chat_template = 0;
+        else if (s == "--add-bos") a.add_bos = 1;
+        else if (s == "--no-bos") a.add_bos = 0;
+        else if (s == "--no-parse-special") a.parse_special = false;
+        else if (s == "--tokenize-only") a.tokenize_only = true;
+        else if (s == "--stream-json") a.stream_json = need(i, "--stream-json");
+        else if (s == "--stop-eos") a.stop_eos = 1;
+        else if (s == "--no-stop-eos") a.stop_eos = 0;
+        else if (s == "--temp") { a.temp = std::stod(need(i, "--temp")); a.temp_set = true; }
         else if (s == "--device") a.device = std::stoi(need(i, "--device"));
         else if (s == "--start-token") a.start_token = std::stoi(need(i, "--start-token"));
         else if (s == "--top-k") a.top_k = std::stoi(need(i, "--top-k"));
@@ -397,6 +430,11 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--mtp-draft") a.mtp_draft = std::stoi(need(i, "--mtp-draft"));
         else if (s == "--state-trace-position") a.state_trace_position = std::stoi(need(i, "--state-trace-position"));
         else if (s == "-h" || s == "--help") {
+            std::cout << "text mode: --prompt/-p \"文字列\" | --prompt-file/-f path | --interactive/-i | -n N | -m model.gguf"
+                         " [--no-display-prompt] [--temp 0] [--chat-template|--no-chat-template]"
+                         " [--add-bos|--no-bos] [--stop-eos|--no-stop-eos] [--stream-json path]"
+                         " [--tokenize-only]\n";
+            std::cout << "   -m/-p/-n/-c は --model/--prompt/--generate/--ctx の別名です\n";
             std::cout << "warodecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--debug-f32-hc-layer0] [--debug-f32-hc-attn-0-8] [--debug-f32-hc-ffn-0-8] [--debug-hc-q8_1-attn-from-layer N --debug-hc-q8_1-attn-through-layer N] [--debug-hc-q8_1-ffn-from-layer N --debug-hc-q8_1-ffn-through-layer N] [--debug-f32-hc-ffn-layer8] [--debug-hc-norm-f32-layer N --debug-hc-norm-f32-file path | --debug-layer0-hc-gate-f32-store | --debug-layer0-hc-gate-f32-sigmoid | --debug-hc-gate-q8_0-layer N | --debug-hc-attn-q8_0-full-layer N | --debug-qsa-q8_0-layer N | --debug-qsa-v-q8_0-layer N] [--debug-attention-input-f32-layer N --debug-attention-input-f32-file path] [--debug-qsa-context-f32-layer N --debug-qsa-context-f32-file path] [--debug-qsa-pregate-f32-layer N --debug-qsa-pregate-f32-file path] [--debug-qsa-query-f32-layer N --debug-qsa-query-f32-file path] [--debug-attention-output-f32-layer N --debug-attention-output-f32-file path] [--debug-hc-attn-combine-layer N --debug-hc-attn-combine-f32-file path] [--debug-hc-inject-f32-layer N --debug-hc-inject-f32-file path] [--debug-layer-input-residual-layer N --debug-layer-input-residual-f32-file path] [--debug-router-cpu-activation-f32-file path] [--debug-moe-ids ids [--debug-moe-weights weights] | --debug-moe-routes-file path] [--debug-routed-moe-output-f32-file path | --debug-routed-moe-output-all-positions-f32-file path] [--debug-layer8-after-attn-residual-f32-file path] [--debug-layer8-hc-ffn-mix-f32-file path | --debug-layer8-output-layer N --debug-layer8-output-f32-file path | --debug-layer-output-all-positions-f32-file path] [--debug-ffn-output-layer N --debug-ffn-output values] [--debug-final-residual-f32-file path | --debug-layer9-gdn-state-layer N --debug-layer9-gdn-state-f32-file path | --debug-layer9-gdn-conv-state-layer N --debug-layer9-gdn-conv-state-f32-file path | --debug-layer14-gdn-core-f32-file path | --debug-layer14-gdn-norm-output-f32-file] [--extended-parity-trace path] [--state-trace path --forced-input-tokens 1,271,2 [--state-trace-position N]] [--prefill-tokens ids | --prefill-tokens-file path] [--bench-repeat N] [--no-graph] [--no-autotune] [--load-only]\n";
             std::cout << "[--debug-qsa-key-store-f32-layer N --debug-qsa-key-store-f32-file path] [--debug-qsa-value-store-f32-layer N --debug-qsa-value-store-f32-file path] [--debug-qsa-key-cache-prefix-f32-layer N --debug-qsa-key-cache-prefix-f32-file path] [--debug-qsa-value-cache-prefix-f32-layer N --debug-qsa-value-cache-prefix-f32-file path]\n";
             std::exit(0);
@@ -848,6 +886,15 @@ static Args parse_args(int argc, char** argv) {
         throw std::runtime_error("state trace requires a forced input for every generated position and cannot be combined with extended parity tracing");
     }
     if (a.model.empty()) throw std::runtime_error("--model が必要です");
+    if (!a.prompt.empty() && !a.prompt_file.empty()) {
+        throw std::runtime_error("--prompt と --prompt-file は同時に指定できません");
+    }
+    if ((a.prompt_given || a.interactive || a.tokenize_only) &&
+        (!a.forced_input_tokens.empty() || !a.prefill_tokens.empty() || !a.state_trace_path.empty() ||
+         !a.extended_parity_trace.empty() || a.mtp || a.bench_repeat > 1 || a.debug_moe_routes_file.size() > 0)) {
+        throw std::runtime_error("--prompt/--interactive/--tokenize-only は "
+                                 "--forced-input-tokens/--prefill-tokens/トレース/--mtp/--bench-repeat と併用できません");
+    }
     if (a.ctx < 16 || a.generate < 1 || a.start_token < 0 || a.top_k < 0 || a.top_k > 256) {
         throw std::runtime_error("引数範囲が不正です");
     }
@@ -1546,11 +1593,265 @@ struct Runtime {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Task M: llama-cli style prompt streaming
+// ---------------------------------------------------------------------------
+//
+// The helpers below live in the namespace that is already open (namespace wd at
+// the top of this file) and are only reached from the qwen4exp branch of main().
+
+// Set by SIGINT so Ctrl-C ends generation after the current token instead of
+// killing the process in the middle of a CUDA step.
+static volatile std::sig_atomic_t g_stream_interrupted = 0;
+
+static void qwen38_stream_sigint(int) { g_stream_interrupted = 1; }
+
+struct Qwen38StreamRequest {
+    std::string prompt;
+    bool interactive = false;
+    bool no_display_prompt = false;
+    bool chat_template = false;
+    bool stop_eos = true;
+    bool add_bos = false;
+    bool show_progress = true;
+    int generate = 128;
+    int start_token = 1;
+    int ctx = 0;
+    std::string stream_json;
+};
+
+struct Qwen38StreamResult {
+    std::vector<int> prompt_tokens;
+    std::vector<int> generated;
+    std::string text;
+    double prefill_seconds = 0.0;
+    double decode_seconds = 0.0;
+    bool stopped_on_eos = false;
+    bool interrupted = false;
+};
+
+// One generation round: prime the KV cache with the prompt tokens and stream
+// the continuation one token at a time.
+//
+// Step order is the one the CPU oracle uses: the sample taken after the last
+// prompt token is the first generated token, and every further token is fed
+// back at the next position. With an empty prompt the caller passes the start
+// token, which reproduces the historical --start-token run exactly
+// (one BOS at position 0 -> 64/64 against reference_tokens_64.json).
+static Qwen38StreamResult qwen38_stream_generate(
+        Qwen38Decoder & decoder,
+        const Qwen38Tokenizer & tokenizer,
+        const Qwen38StreamRequest & request,
+        const std::vector<int> & prompt_tokens) {
+    Qwen38StreamResult result;
+    result.prompt_tokens = prompt_tokens;
+    Qwen38StreamDecoder printer;
+    const int steps = request.generate;
+    const int positions = static_cast<int>(prompt_tokens.size()) + steps - 1;
+    if (positions > request.ctx) {
+        throw std::runtime_error("--ctx がプロンプト長 + --generate に対して不足しています (必要 " +
+                                 std::to_string(positions) + " 位置)");
+    }
+
+    decoder.clear();
+    auto begin = std::chrono::steady_clock::now();
+    int position = 0;
+    int token = -1;
+    for (int id : prompt_tokens) token = decoder.step(id, position++);
+    auto prefill_end = std::chrono::steady_clock::now();
+
+    result.generated.reserve(static_cast<size_t>(steps));
+    for (int i = 0; i < steps; ++i) {
+        result.generated.push_back(token);
+        const std::string piece = printer.push(tokenizer, token, /*skip_special=*/true);
+        if (!piece.empty()) {
+            std::cout << piece << std::flush;
+            result.text += piece;
+        }
+        if (request.stop_eos && tokenizer.is_stop(token)) {
+            result.stopped_on_eos = true;
+            break;
+        }
+        if (g_stream_interrupted) {
+            result.interrupted = true;
+            break;
+        }
+        if (i + 1 >= steps) break;
+        token = decoder.step(token, position++);
+    }
+    const std::string tail = printer.flush();
+    if (!tail.empty()) {
+        std::cout << tail << std::flush;
+        result.text += tail;
+    }
+    auto end = std::chrono::steady_clock::now();
+    result.prefill_seconds = std::chrono::duration<double>(prefill_end - begin).count();
+    result.decode_seconds = std::chrono::duration<double>(end - prefill_end).count();
+    return result;
+}
+
+// Prompt token IDs for the CLI: the model's own tokenizer, with BOS only when
+// the GGUF asks for it (llama-cli behaviour) or when --add-bos forces it.
+static std::vector<int> qwen38_prompt_tokens(
+        const Qwen38Tokenizer & tokenizer,
+        const std::string & text,
+        bool add_bos,
+        int start_token) {
+    std::vector<int> ids = tokenizer.encode(text, /*add_special=*/false, /*parse_special=*/true);
+    if (add_bos && tokenizer.bos_id() >= 0) ids.insert(ids.begin(), tokenizer.bos_id());
+    if (ids.empty()) ids.push_back(start_token);
+    return ids;
+}
+
+static void qwen38_write_stream_json(
+        const std::string & path,
+        const std::string & gpu,
+        const Qwen38StreamRequest & request,
+        const Qwen38StreamResult & result,
+        bool chat_template_applied) {
+    std::ostringstream out;
+    const double seconds = result.prefill_seconds + result.decode_seconds;
+    out << "{\"engine\":\"warodecode-qwen38-stream\",\"gpu\":\"" << gpu << "\""
+        << ",\"tokens\":" << result.generated.size()
+        << ",\"seconds\":" << std::fixed << std::setprecision(6) << seconds
+        << ",\"prefill_seconds\":" << std::setprecision(6) << result.prefill_seconds
+        << ",\"prefill_tokens\":" << result.prompt_tokens.size()
+        << ",\"decode_seconds\":" << std::setprecision(6) << result.decode_seconds
+        << ",\"tok_s\":" << std::setprecision(3)
+        << (result.decode_seconds > 0.0
+                ? static_cast<double>(result.generated.size()) / result.decode_seconds : 0.0)
+        << ",\"prompt_tokens\":" << result.prompt_tokens.size()
+        << ",\"first_token\":" << (result.generated.empty() ? -1 : result.generated.front())
+        << ",\"last_token\":" << (result.generated.empty() ? -1 : result.generated.back())
+        << ",\"stopped_on_eos\":" << (result.stopped_on_eos ? "true" : "false")
+        << ",\"interrupted\":" << (result.interrupted ? "true" : "false")
+        << ",\"chat_template\":" << (chat_template_applied ? "true" : "false")
+        << ",\"prompt_token_ids\":[";
+    for (size_t i = 0; i < result.prompt_tokens.size(); ++i) {
+        if (i) out << ',';
+        out << result.prompt_tokens[i];
+    }
+    out << "],\"token_ids\":[";
+    for (size_t i = 0; i < result.generated.size(); ++i) {
+        if (i) out << ',';
+        out << result.generated[i];
+    }
+    out << "]}\n";
+
+    if (path.empty() || path == "-") {
+        // stdout carries generated text, so the record goes to stderr unless a
+        // file was requested.
+        std::cerr << out.str();
+        return;
+    }
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) throw std::runtime_error("--stream-json を書き込めません: " + path);
+    file << out.str();
+}
+
+static int qwen38_run_stream_mode(
+        const Args & args,
+        Qwen38Decoder & decoder,
+        const Qwen38Tokenizer & tokenizer,
+        const std::string & gpu) {
+    Qwen38StreamRequest request;
+    request.prompt = args.prompt;
+    request.interactive = args.interactive;
+    request.no_display_prompt = args.no_display_prompt;
+    request.chat_template = args.chat_template == 1 ||
+        (args.chat_template < 0 && args.interactive);
+    request.stop_eos = args.stop_eos != 0;
+    request.generate = args.generate;
+    request.start_token = args.start_token;
+    request.ctx = args.ctx;
+    request.stream_json = args.stream_json;
+    request.add_bos = args.add_bos == 1 || (args.add_bos < 0 && tokenizer.add_bos());
+    if (request.chat_template && !tokenizer.supports_qwen_chat_template()) {
+        std::cerr << "[chat-template] GGUFのchat_templateがQwen定型 (<|im_start|>/<|im_end|>) ではないため無効化します\n";
+        request.chat_template = false;
+    }
+    if (request.chat_template) {
+        std::cerr << "[chat-template] applied: qwen <|im_start|>role\\ncontent<|im_end|>\\n (+ '<|im_start|>assistant\\n')\n";
+    }
+    if (args.temp_set && args.temp != 0.0) {
+        std::cerr << "[warn] --temp " << args.temp << " は未対応です (greedy固定)。0として扱います\n";
+    } else if (args.temp_set) {
+        std::cerr << "[warn] --temp 0 = greedy固定です (このランタイムはgreedy専用)\n";
+    }
+    if (request.interactive) {
+        std::cerr << "[interactive] generate=" << request.generate
+                  << " stop_eos=" << (request.stop_eos ? 1 : 0)
+                  << " chat_template=" << (request.chat_template ? 1 : 0)
+                  << " (/exit で終了, Ctrl-D で終了)\n";
+    } else {
+        std::cerr << "[prompt] tokens="
+                  << qwen38_prompt_tokens(tokenizer, request.prompt, request.add_bos,
+                                          request.start_token).size()
+                  << " generate=" << request.generate
+                  << " stop_eos=" << (request.stop_eos ? 1 : 0) << "\n";
+    }
+    if (request.interactive) {
+        std::signal(SIGINT, qwen38_stream_sigint);
+        std::vector<std::pair<std::string, std::string>> history;
+        std::string line;
+        while (!g_stream_interrupted) {
+            std::cout << "> " << std::flush;
+            if (!std::getline(std::cin, line)) break;
+            if (line == "/exit" || line == "/quit") break;
+            if (line.empty()) continue;
+            history.emplace_back("user", line);
+            const std::string rendered = request.chat_template
+                ? tokenizer.apply_qwen_chat_template(history, /*add_generation_prompt=*/true)
+                : line;
+            if (request.no_display_prompt) {
+                std::cout << "\n";
+            } else {
+                std::cout << rendered << std::flush;
+            }
+            const std::vector<int> ids = qwen38_prompt_tokens(
+                tokenizer, rendered, request.add_bos, request.start_token);
+            const Qwen38StreamResult result =
+                qwen38_stream_generate(decoder, tokenizer, request, ids);
+            std::cout << "\n";
+            history.emplace_back("assistant", result.text);
+            if (!args.stream_json.empty()) {
+                qwen38_write_stream_json(args.stream_json, gpu, request, result, request.chat_template);
+            }
+            if (result.interrupted) break;
+        }
+        std::cout << "\n";
+        return 0;
+    }
+
+    std::signal(SIGINT, qwen38_stream_sigint);
+    const std::vector<int> ids =
+        qwen38_prompt_tokens(tokenizer, request.prompt, request.add_bos, request.start_token);
+    if (!request.no_display_prompt) std::cout << request.prompt << std::flush;
+    const Qwen38StreamResult result = qwen38_stream_generate(decoder, tokenizer, request, ids);
+    std::cout << "\n";
+    qwen38_write_stream_json(args.stream_json, gpu, request, result, request.chat_template);
+    std::cerr << "[done] tokens=" << result.generated.size()
+              << " prefill_s=" << std::fixed << std::setprecision(2) << result.prefill_seconds
+              << " decode_s=" << std::setprecision(2) << result.decode_seconds
+              << " tok_s=" << std::setprecision(2)
+              << (result.decode_seconds > 0.0
+                      ? static_cast<double>(result.generated.size()) / result.decode_seconds : 0.0)
+              << (result.interrupted ? " interrupted" : "")
+              << (result.stopped_on_eos ? " eos" : "") << "\n";
+    return 0;
+}
+
 } // namespace wd
 
 int main(int argc, char** argv) {
     try {
         wd::Args args = wd::parse_args(argc, argv);
+        if (!args.prompt_file.empty()) {
+            std::ifstream prompt_in(args.prompt_file, std::ios::binary);
+            if (!prompt_in) throw std::runtime_error("--prompt-file を開けません: " + args.prompt_file);
+            args.prompt.assign(std::istreambuf_iterator<char>(prompt_in),
+                               std::istreambuf_iterator<char>());
+        }
         if (!args.prefill_tokens_file.empty()) {
             if (!args.prefill_tokens.empty()) {
                 throw std::runtime_error("--prefill-tokens と --prefill-tokens-file は同時に指定できません");
@@ -1559,6 +1860,28 @@ int main(int argc, char** argv) {
         }
         if (!args.prefill_tokens.empty() && !args.forced_input_tokens.empty()) {
             throw std::runtime_error("--prefill-tokens と --forced-input-tokens は同時に指定できません");
+        }
+        // Task M: tokenizer-only mode never touches the GPU, so it runs before
+        // any CUDA call and works on a host without an NVIDIA device.
+        if (args.tokenize_only) {
+            wd::Qwen38Tokenizer tokenizer(args.model, /*verbose=*/true);
+            const bool add_bos = args.add_bos == 1 || (args.add_bos < 0 && tokenizer.add_bos());
+            std::vector<int> ids = tokenizer.encode(args.prompt, /*add_special=*/false, args.parse_special);
+            if (add_bos && tokenizer.bos_id() >= 0) ids.insert(ids.begin(), tokenizer.bos_id());
+            std::cout << "{\"engine\":\"warodecode-tokenize\""
+                      << ",\"arch\":\"" << tokenizer.architecture() << "\""
+                      << ",\"pre\":\"" << tokenizer.pre_type_name() << "\""
+                      << ",\"vocab\":" << tokenizer.vocab_size()
+                      << ",\"merges\":" << tokenizer.merge_count()
+                      << ",\"add_bos\":" << (add_bos ? "true" : "false")
+                      << ",\"parse_special\":" << (args.parse_special ? "true" : "false")
+                      << ",\"token_ids\":[";
+            for (size_t i = 0; i < ids.size(); ++i) {
+                if (i) std::cout << ',';
+                std::cout << ids[i];
+            }
+            std::cout << "]}\n";
+            return 0;
         }
         int count = 0; WD_CUDA(cudaGetDeviceCount(&count));
         if (args.device < 0 || args.device >= count) throw std::runtime_error("指定GPUがありません");
@@ -1581,6 +1904,11 @@ int main(int argc, char** argv) {
         if (arch == "qwen4exp") {
             const int memory_mib = static_cast<int>(prop.totalGlobalMem / (1024ull * 1024ull));
             std::cerr << "Qwen3.8-Flash-Next専用runtimeを構築します\n";
+            // Task M: text mode needs the GGUF vocabulary; the tokenizer reads the
+            // metadata section only, so this line appears with the load messages.
+            const bool text_mode = args.prompt_given || args.interactive;
+            std::unique_ptr<wd::Qwen38Tokenizer> tokenizer;
+            if (text_mode) tokenizer.reset(new wd::Qwen38Tokenizer(args.model, /*verbose=*/true));
             auto qrt = wd::load_qwen38_runtime(gguf, args.model, cc, memory_mib);
             wd::Qwen38DecodeState qstate;
             qstate.initialize(qrt, args.ctx);
@@ -1776,6 +2104,12 @@ int main(int argc, char** argv) {
                 args.forced_input_tokens.empty() ? nullptr : &args.forced_input_tokens;
             const std::vector<int> * prefill_tokens_ptr =
                 args.prefill_tokens.empty() ? nullptr : &args.prefill_tokens;
+            // Task M: -p / -i run the text path. The step() order is the one the
+            // CPU oracle uses (sample after the last prompt token = first
+            // generated token), and the legacy JSON path below is untouched.
+            if (text_mode) {
+                return wd::qwen38_run_stream_mode(args, decoder, *tokenizer, prop.name);
+            }
             wd::Qwen38Trace * const trace_ptr =
                 args.top_k > 0 || trace.state_trace ? &trace : nullptr;
             // --bench-repeat>=2 repeats the whole prefill+decode run against the
@@ -2048,6 +2382,10 @@ int main(int argc, char** argv) {
 
         if (!args.prefill_tokens.empty()) {
             throw std::runtime_error("--prefill-tokens は qwen4exp (Qwen3.8-Flash-Next) 専用です");
+        }
+        if (args.prompt_given || args.interactive) {
+            throw std::runtime_error("--prompt/--interactive は qwen4exp (Qwen3.8-Flash-Next) 専用です "
+                                     "(このモデルのarch: " + arch + ")");
         }
         wd::Model model = wd::load_model(gguf);
         if (args.autotune) wd::autotune_q4(model);
