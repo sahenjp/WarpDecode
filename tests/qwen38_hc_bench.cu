@@ -232,6 +232,10 @@ int main(int argc, char ** argv) {
         w.norm.size = static_cast<size_t>(hc_dim);
     }
     w.debug_norm_f32 = norm_values;
+    // Mirrors load_qwen38_hc_weights(): the F32 norm weights stay resident on
+    // the device, so the per-call mix never issues the 40 KB H2D copy.
+    w.norm_f32_device.data = upload_float_values(norm_values);
+    w.norm_f32_device.size = norm_values.size();
     w.debug_inject_f32 = inject_values;
     w.has_inject = true;
     w.has_inject_f32 = true;
@@ -273,6 +277,7 @@ int main(int argc, char ** argv) {
     // the kernel that produced it instead of poisoning the next case.
     if (stages) {
         struct Stage { const char * name; std::function<void()> run; };
+        constexpr int warps = 8;
         const int down_blocks = hc_dim / 32;
         const int low_blocks = low_rank / 32;
         std::vector<Stage> list = {
@@ -314,7 +319,7 @@ int main(int argc, char ** argv) {
                     f32.norm(), f32.gate(), f32.mixed(), hidden, hc);
             }},
             {"inject_gemv", [&] {
-                q38_hc_launch_dense_gemv_f32(w.debug_inject_f32.data(), f32.norm(), f32.inject(), hc, hc_dim, stream);
+                q38_hc_launch_dense_gemv_f32(w.inject_f32.data, f32.norm(), f32.inject(), hc, hc_dim, stream);
             }},
             {"out_copy", [&] {
                 q38_hc_copy_f32_to_half_kernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
@@ -355,7 +360,8 @@ int main(int argc, char ** argv) {
             std::fflush(stdout);
             if (err != cudaSuccess) return 1;
         }
-        return 0;
+        std::printf("# stage isolation complete; timing the compositions next\n");
+        std::fflush(stdout);
     }
 
     std::vector<CaseResult> results;
@@ -485,7 +491,7 @@ int main(int argc, char ** argv) {
             f32.norm(), f32.gate(), f32.mixed(), hidden, hc);
     });
     kernel_case("kernel.q8_inject", [&] {
-        q38_hc_launch_dense_gemv_f32(w.debug_inject_f32.data(), f32.norm(), f32.inject(), hc, hc_dim, stream);
+        q38_hc_launch_dense_gemv_f32(w.inject_f32.data, f32.norm(), f32.inject(), hc, hc_dim, stream);
     });
     kernel_case("kernel.silu", [&] {
         q38_hc_silu_scale_ggml_f32_kernel<<<(low_rank + 255) / 256, 256, 0, stream>>>(

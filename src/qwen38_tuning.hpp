@@ -46,6 +46,14 @@ struct Qwen38Tuning {
     int expert_prefetch_depth = 1;
     bool expert_frequency_prefetch = true;
 
+    // Task K: expert read-ahead. The memory tier below picks the look-ahead depth
+    // (expert_prefetch_depth) and expert_prefetch is the master switch that the
+    // runtime hands to the caches; the pipeline stays off until the environment
+    // turns it on, because how much it helps depends on the cache size.
+    bool expert_prefetch = false;      // WARODECODE_EXPERT_PREFETCH=1
+    int expert_prefetch_threads = 2;   // WARODECODE_EXPERT_PREFETCH_THREADS
+    int expert_prefetch_slots = 0;     // WARODECODE_EXPERT_PREFETCH_SLOTS (0 = auto)
+
     // Task C: expert cache / host->device transfer switches. These mirror the
     // ExpertCacheOptions fields of src/expert_cache.cuh (which is the consumer);
     // qwen38_tuning_for_gpu() reads the environment and the runtime hands the
@@ -104,6 +112,17 @@ inline Qwen38Tuning qwen38_tuning_for_gpu(int sm, int memory_mib) {
         t.expert_layer_evict = std::string(v) == "layer";
     }
     t.expert_shadow_slots = qwen38_tuning_env_slots("WARODECODE_EXPERT_SHADOW");
+
+    // Task K. WARODECODE_EXPERT_PREFETCH_DEPTH overrides the tier depth (and, by
+    // being a positive depth, switches the pipeline on for one A/B run); a value
+    // of 0 keeps it off. The runtime only forwards these to the caches, they are
+    // the consumers that size and run the read-ahead ring.
+    t.expert_prefetch = qwen38_tuning_env_flag("WARODECODE_EXPERT_PREFETCH", false);
+    if (const char * v = std::getenv("WARODECODE_EXPERT_PREFETCH_DEPTH")) {
+        const int depth = std::atoi(v);
+        t.expert_prefetch_depth = depth > 0 ? depth : 0;
+        if (depth > 0) t.expert_prefetch = true;
+    }
 
     if (sm >= 90) t.ple_prefetch_rows = 64;
     else if (sm >= 80) t.ple_prefetch_rows = 48;

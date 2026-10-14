@@ -206,6 +206,11 @@ inline Qwen38Runtime load_qwen38_runtime(
     cache_options.layer_evict = rt.tuning.expert_layer_evict;
     cache_options.layer_count = rt.layout.trunk_layers;
     cache_options.shadow_slots = rt.tuning.expert_shadow_slots;
+    // Task K: the read-ahead ring predicts from a (layer, expert) key, so it needs
+    // the expert tensors of every trunk layer, not just the one the caller is on.
+    cache_options.prefetch_depth = rt.tuning.expert_prefetch ? rt.tuning.expert_prefetch_depth : 0;
+    cache_options.prefetch_threads = rt.tuning.expert_prefetch_threads;
+    cache_options.prefetch_slots = rt.tuning.expert_prefetch_slots;
     if (rt.fused_experts) {
         rt.fused_expert_cache.initialize(
             static_cast<size_t>(rt.tuning.expert_cache_mib),
@@ -217,6 +222,17 @@ inline Qwen38Runtime load_qwen38_runtime(
             *sample.gate, *sample.up, *sample.down,
             max_gate_bytes, max_up_bytes, max_down_bytes, cache_options);
         rt.expert_cache_slots = rt.expert_cache.slot_count();
+    }
+
+    if (cache_options.prefetch_depth > 0) {
+        for (int il = 0; il < rt.layout.trunk_layers; ++il) {
+            const Qwen38MoeLayerTensors & m = rt.layers[static_cast<size_t>(il)].routed;
+            if (rt.fused_experts) {
+                rt.fused_expert_cache.register_layer_experts(il, *m.gate_up, *m.down);
+            } else {
+                rt.expert_cache.register_layer_experts(il, *m.gate, *m.up, *m.down);
+            }
+        }
     }
 
     return rt;

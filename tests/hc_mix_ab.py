@@ -84,6 +84,9 @@ def run_case(name: str, env_extra: dict, reference: list, generate: int, profile
     mismatch = next((i for i, (a, b) in enumerate(zip(reference, tokens)) if a != b), None)
     rec["matched_prefix"] = mismatch if mismatch is not None else len(tokens)
     rec["parity_ok"] = rec["matched_prefix"] == min(generate, len(reference))
+    if os.environ.get("WD_AB_DEBUG"):
+        print("[ab-debug] keys=%s profile_type=%s" % (sorted(ident.keys()), type(ident.get("profile")).__name__),
+              flush=True)
     for key in ("tok_s", "seconds", "decode_seconds", "decode_tokens", "prefill_tokens", "token_hash"):
         if key in ident:
             rec[key] = ident[key]
@@ -100,12 +103,8 @@ def run_case(name: str, env_extra: dict, reference: list, generate: int, profile
 
 def plans(plan: str, repeat: int):
     """Yield (name, env). The first entry is always a warmup (model page cache)."""
-    if plan == "l4":
-        base = {"WARODECODE_EXPERT_CACHE_MIB": "8000"}
-    elif plan == "quick":
-        base = {"WARODECODE_EXPERT_CACHE_MIB": "8000"}
-    else:
-        base = {"WARODECODE_EXPERT_CACHE_MIB": "20000"}
+    default_mib = "8000" if plan in ("l4", "quick", "parity", "bisect") else "20000"
+    base = {"WARODECODE_EXPERT_CACHE_MIB": os.environ.get("WD_EXPERT_CACHE_MIB", default_mib)}
 
     def merged(extra):
         env = dict(base)
@@ -113,20 +112,46 @@ def plans(plan: str, repeat: int):
         return env
 
     yield ("warmup", merged({}))
+    if plan == "bisect":
+        # One Task J switch disabled at a time: the first case that returns to
+        # 64/64 names the switch that changed the arithmetic.
+        yield ("all_on", merged({}))
+        yield ("off_skip_legacy", merged({"WARODECODE_HC_SKIP_LEGACY": "0"}))
+        yield ("off_gamma_resident", merged({"WARODECODE_HC_GAMMA_RESIDENT": "0"}))
+        yield ("off_inject_warp", merged({"WARODECODE_HC_INJECT_F32_WARP": "0"}))
+        yield ("off_down_dp4a", merged({"WARODECODE_HC_Q8_DOWN_DP4A": "0"}))
+        return
+    if plan == "parity":
+        # Smallest plan that still proves both directions: the Task J defaults
+        # must reproduce the reference tokens, and the same run with every Task J
+        # switch forced back to the pre-J order must produce the same tokens.
+        for i in range(repeat):
+            yield ("base-%d" % i, merged({}))
+            yield ("all_off-%d" % i, merged({"WARODECODE_HC_SKIP_LEGACY": "0",
+                                             "WARODECODE_HC_GAMMA_RESIDENT": "0",
+                                             "WARODECODE_HC_INJECT_F32_WARP": "0",
+                                             "WARODECODE_HC_Q8_DOWN_DP4A": "0"}))
+        return
     if plan == "quick":
         for i in range(repeat):
             yield ("base-%d" % i, merged({}))
-            yield ("no_skip_legacy-%d" % i, merged({"WARODECODE_HC_SKIP_LEGACY": "0"}))
             yield ("kprofile-%d" % i, merged({"WARODECODE_HC_PROFILE": "1"}))
         return
     for i in range(repeat):
-        yield ("base-%d" % i, merged({}))
-        yield ("base_offprofile-%d" % i, merged({}))
+        # base_kprofile also proves the per-kernel event brackets did not move
+        # the token timing (compare tok_s against base).
         yield ("base_kprofile-%d" % i, merged({"WARODECODE_HC_PROFILE": "1"}))
-        # Task J A/B switches.
+        yield ("base-%d" % i, merged({}))
+        # Task J A/B switches, one at a time.
         yield ("no_skip_legacy-%d" % i, merged({"WARODECODE_HC_SKIP_LEGACY": "0"}))
-        yield ("no_inject_f32-%d" % i, merged({"WARODECODE_HC_INJECT_F32": "0"}))
-        yield ("no_legacy_q8attn-%d" % i, merged({"WARODECODE_HC_Q8_0_ATTN": "0"}))
+        yield ("no_gamma_resident-%d" % i, merged({"WARODECODE_HC_GAMMA_RESIDENT": "0"}))
+        yield ("no_inject_warp-%d" % i, merged({"WARODECODE_HC_INJECT_F32_WARP": "0"}))
+        yield ("no_down_dp4a-%d" % i, merged({"WARODECODE_HC_Q8_DOWN_DP4A": "0"}))
+        yield ("no_q8_0-%d" % i, merged({"WARODECODE_HC_Q8_0": "0"}))
+        yield ("all_off-%d" % i, merged({"WARODECODE_HC_SKIP_LEGACY": "0",
+                                         "WARODECODE_HC_GAMMA_RESIDENT": "0",
+                                         "WARODECODE_HC_INJECT_F32_WARP": "0",
+                                         "WARODECODE_HC_Q8_DOWN_DP4A": "0"}))
 
 
 def main() -> int:
@@ -152,10 +177,19 @@ def main() -> int:
         results.append(rec)
         brief = {k: rec.get(k) for k in ("case", "tok_s", "matched_prefix", "parity_ok",
                                          "error", "wall_s") if k in rec}
-        if rec.get("profile"):
-            brief["hc_mix_attn_ms"] = rec["profile"].get("hc_mix_attn_ms")
-            brief["hc_mix_ffn_ms"] = rec["profile"].get("hc_mix_ffn_ms")
-            brief["moe_ms"] = rec["profile"].get("moe_ms")
+        prof = rec.get("profile")
+        if isinstance(prof, dict) and prof.get("enabled"):
+            for key in ("total_ms", "hc_mix_attn_ms", "hc_mix_ffn_ms", "attn_ms", "moe_ms"):
+                if key in prof:
+                    brief[key] = prof[key]
+        else:
+            brief["profile"] = "unavailable:%s" % type(prof).__name__
+        hc = rec.get("hc_profile")
+        if isinstance(hc, dict) and hc.get("sites"):
+            for site in ("attn.region_total", "ffn.region_total", "attn.q8_down", "ffn.q8_down",
+                         "attn.q8_inject", "ffn.q8_inject", "ffn.f16_norm"):
+                if site in hc["sites"]:
+                    brief["k_" + site] = hc["sites"][site]["ms_per_token"]
         print(json.dumps(brief), flush=True)
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
         with open(args.out, "w") as fh:

@@ -156,7 +156,8 @@ def main() -> None:
         body = (AB_SCRIPT.replace("__PLAN__", args.plan)
                         .replace("__REPEAT__", str(args.repeat))
                         .replace("__GENERATE__", str(args.generate))
-                        .replace("__LABEL__", args.label))
+                        .replace("__LABEL__", args.label)
+                        .replace("__ARCH__", runner.ARCH))
     starter = STARTER.replace("__BODY__", body).replace("__LABEL__", args.label)
 
     with tempfile.TemporaryDirectory(prefix="warodecode-taskj-") as tmp:
@@ -171,9 +172,19 @@ def main() -> None:
                 f = runner.SOURCE / name
                 if f.is_file():
                     z.write(f, name)
-        print("+ upload source (%d bytes)" % archive.stat().st_size, flush=True)
+        import hashlib as _hashlib
+        _ab = (runner.SOURCE / "tests" / "hc_mix_ab.py").read_bytes()
+        print("+ source=%s ab_sha=%s size=%d bytes" % (
+            runner.SOURCE, _hashlib.sha256(_ab).hexdigest()[:16], archive.stat().st_size), flush=True)
         run(runner.CLI + ["upload", "-s", runner.SESSION, str(archive),
                           "/content/warodecode-source.zip"])
+
+        # The A/B script compares against the canonical reference tokens; a
+        # session that was recreated has lost them, so always (re)upload.
+        ref = ROOT / "issue1_artifacts/reference_tokens_64.json"
+        if ref.exists():
+            run(runner.CLI + ["upload", "-s", runner.SESSION, str(ref),
+                              "/content/reference_tokens_64.json"])
 
         starter_path = tmp_path / "start.py"
         starter_path.write_text(starter)
@@ -206,7 +217,11 @@ def main() -> None:
                 subprocess.run(runner.CLI + ["download", "-s", runner.SESSION, remote, str(local)],
                                text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             done = local_txt.exists() and "BENCH_EXIT=" in local_txt.read_text(errors="replace")
-            done = done or (local_log.exists() and "AB_LOG_READY" in local_log.read_text(errors="replace"))
+            if not done and local_log.exists():
+                log_text = local_log.read_text(errors="replace")
+                # RUN_EXIT without AB_LOG_READY is the failure path (build error),
+                # so it must end the poll loop too.
+                done = "AB_LOG_READY" in log_text or "RUN_EXIT=" in log_text
             print("[poll] %s" % ("DONE" if done else "running"), flush=True)
             if done:
                 break

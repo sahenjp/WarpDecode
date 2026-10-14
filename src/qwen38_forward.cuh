@@ -118,6 +118,23 @@ inline bool q38_hc_skip_legacy_enabled() {
     return enabled;
 }
 
+// One-time line so an on-device A/B log states which HC path actually ran
+// (tok_s alone cannot: the fast and the reference paths are required to be
+// bit-identical, and a stale binary looks exactly like a working switch).
+inline void q38_hc_report_switches_once() {
+    static const bool once = [] {
+        std::fprintf(stderr,
+                     "warodecode: HC mix Task J switches: skip_legacy=%d gamma_resident=%d "
+                     "inject_warp=%d down_dp4a=%d\n",
+                     q38_hc_skip_legacy_enabled() ? 1 : 0,
+                     q38_hc_gamma_resident_enabled() ? 1 : 0,
+                     q38_hc_f32_gemv_warp_enabled() ? 1 : 0,
+                     q38_hc_q8_down_dp4a_enabled() ? 1 : 0);
+        return true;
+    }();
+    (void)once;
+}
+
 __global__ void q38_repeat_embedding_kernel(
         const __half * __restrict__ emb,
         __half * __restrict__ residual,
@@ -890,6 +907,7 @@ public:
             // on A100 (272 ms total), i.e. ~15% of the token was being spent twice.
             const bool attn_f32_mix_active = q38_hc_q8_0_enabled() && q38_hc_q8_0_attn_enabled() &&
                 q38_hc_q8_0_compatible(layer.hc_attn) &&
+                qwen38_hc_f32_inject_enabled(layer.hc_attn) &&
                 !(trace && trace->state_trace && trace->debug_hc_full_q8_0_layer == il);
             __half * cur = nullptr;
             bool attn_f32_inject = false;
@@ -2149,6 +2167,7 @@ public:
             bool ffn_used_f32 = false;
             bool ffn_f32_inject = false;
             profile_.mark_begin(kQwen38StageHcMixFfn, stream);
+            if (il == 0) q38_hc_report_switches_once();
             Q38HcKernelScope hc_ffn_region_scope(
                 kQ38HcSiteFfnF16Norm, kQ38HcMixRegion, stream);
             if (q38_hc_f32_enabled() && !debug_hc_q8_0_ffn && !debug_f32_hc_ffn) {
@@ -2164,8 +2183,14 @@ public:
             // that will produce the mix row, the legacy F16 pass below is skipped
             // entirely (it would be recomputed into the same scratch an instant
             // later). With WARODECODE_HC_SKIP_LEGACY=0 the old order returns.
+            // The exact path must also be the one that produces the [hc] inject
+            // row, otherwise the fallback combine (which reads the half-typed
+            // st.hc_ffn.inject()) would consume a stale buffer: the legacy pass
+            // is the only other writer. Quantised inject tensors (the blk.48 MTP
+            // block) and WARODECODE_HC_INJECT_F32=0 therefore keep the old order.
             const bool ffn_exact_mix_active = q38_hc_q8_0_enabled() && !debug_hc_q8_0_ffn &&
-                q38_hc_q8_0_compatible(layer.hc_ffn) && q38_hc_skip_legacy_enabled();
+                q38_hc_q8_0_compatible(layer.hc_ffn) && q38_hc_skip_legacy_enabled() &&
+                qwen38_hc_f32_inject_enabled(layer.hc_ffn);
             if (!ffn_used_f32 && !ffn_exact_mix_active) {
                 cur = run_qwen38_hc_mix(
                     state_.residual(), layer.hc_ffn, st.hc_ffn, q.rms_eps, stream,

@@ -706,21 +706,89 @@ private:
             int count,
             const std::vector<__half *> & activations,
             cudaStream_t stream) {
+        union_slot_.resize(static_cast<size_t>(count) * static_cast<size_t>(moe_.k()), -1);
+        union_weights_.clear();
         widen_activations(activations);
         moe_batch_.open_all(moe_, weights_.router, batch_activation_ptrs_,
                             rt_->layout.expert_weights_scale, stream, false);
+
+        // The pair list the kernels index is [0, count * k), while the cache is
+        // acquired over the union of the count tokens' expert lists: a token
+        // beyond the first contributes fewer than k fresh experts whenever it
+        // shares one with an earlier token. Every pair therefore has to be told
+        // which slot of the union holds its expert; using the raw top-k index
+        // would hand pair i * k + j the j-th *acquired* expert of the whole
+        // batch, which is not token i's expert j.
         const int k = moe_.k();
+        std::vector<int> union_slot(static_cast<size_t>(count) * static_cast<size_t>(k), -1);
+        int union_size = 0;
         for (int i = 0; i < count; ++i) {
             for (int j = 0; j < k; ++j) {
                 const int expert = moe_.h_ids()[i * k + j];
-                auto w = expert_cache_.acquire(
-                    layer_, expert, *weights_.routed.gate, *weights_.routed.up,
-                    *weights_.routed.down, stream);
-                moe_batch_.set_pair_weights(i * k + j, w.gate, w.up, w.down);
+                int slot = -1;
+                for (int u = 0; u < union_size; ++u) {
+                    if (union_slot_[static_cast<size_t>(u)] == expert) { slot = u; break; }
+                }
+                if (slot < 0) {
+                    slot = union_size++;
+                    union_slot_[static_cast<size_t>(slot)] = expert;
+                    union_weights_.push_back(expert_cache_.acquire(
+                        layer_, expert, *weights_.routed.gate, *weights_.routed.up,
+                        *weights_.routed.down, stream));
+                }
+                union_slot[static_cast<size_t>(i) * static_cast<size_t>(k) + j] = slot;
             }
+        }
+        for (int p = 0; p < count * k; ++p) {
+            const ExpertDeviceWeights & w =
+                union_weights_[static_cast<size_t>(union_slot[static_cast<size_t>(p)])];
+            moe_batch_.set_pair_weights(p, w.gate, w.up, w.down);
         }
         if (!moe_batch_.resolved(true)) return false;
         moe_batch_.run(moe_, *weights_.routed.gate, *weights_.routed.up, *weights_.routed.down, stream);
+
+        // WARODECODE_MTP_BATCH_SELFCHECK: run the same pairs through the serial
+        // expert runner and compare the two routed sums bit for bit. The batch
+        // and the serial path share the router selection and the activation
+        // bytes, so any difference here is the batched expert execution itself.
+        static const bool selfcheck = q38_mtp_flag("WARODECODE_MTP_BATCH_SELFCHECK", false);
+        if (selfcheck) {
+            float * batch_sum = moe_batch_.accumulated(moe_);
+            const int hidden = moe_.hidden();
+            std::vector<float> batch_host(static_cast<size_t>(hidden) * static_cast<size_t>(count));
+            q38_mtp_check(cudaMemcpyAsync(batch_host.data(), batch_sum,
+                static_cast<size_t>(hidden) * static_cast<size_t>(count) * sizeof(float),
+                cudaMemcpyDeviceToHost, stream), "selfcheck copy batch");
+            std::vector<float> serial_host(static_cast<size_t>(hidden) * static_cast<size_t>(count));
+            for (int i = 0; i < count; ++i) {
+                run_qwen38_routed_moe_separate<false>(
+                    layer_, activations[static_cast<size_t>(i)], weights_.router,
+                    *weights_.routed.gate, *weights_.routed.up, *weights_.routed.down,
+                    expert_cache_, moe_, moe_out_, rt_->layout.expert_weights_scale, stream);
+                q38_mtp_check(cudaMemcpyAsync(serial_host.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden),
+                    moe_.d_accum(), static_cast<size_t>(hidden) * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream), "selfcheck copy serial");
+            }
+            q38_mtp_check(cudaStreamSynchronize(stream), "selfcheck sync");
+            int mismatches = 0;
+            int first_token = -1;
+            int first_index = -1;
+            double max_abs = 0.0;
+            for (int t = 0; t < count; ++t) {
+                for (int i = 0; i < hidden; ++i) {
+                    const float a = batch_host[static_cast<size_t>(t) * hidden + i];
+                    const float b = serial_host[static_cast<size_t>(t) * hidden + i];
+                    if (std::memcmp(&a, &b, sizeof(float)) == 0) continue;
+                    if (mismatches == 0) { first_token = t; first_index = i; }
+                    ++mismatches;
+                    const double d = std::fabs(static_cast<double>(a) - static_cast<double>(b));
+                    if (d > max_abs) max_abs = d;
+                }
+            }
+            std::fprintf(stderr,
+                "warodecode: MTP batch selfcheck tokens=%d pairs=%d mismatches=%d first=(t%d,i%d) max_abs=%.6g\n",
+                count, count * moe_.k(), mismatches, first_token, first_index, max_abs);
+        }
         // The layout of moe_slots_ is [k][hidden] and the slots of one pass are
         // always 0..k-1, so the batch output lands exactly on the slices the
         // shared expert and the combine then read.
@@ -984,6 +1052,8 @@ private:
     std::vector<__half *> batch_activations_;
     std::vector<__half *> single_activation_;
     std::vector<const float *> batch_activation_ptrs_;
+    std::vector<int> union_slot_;                 // (token, top-k) -> union slot
+    std::vector<ExpertDeviceWeights> union_weights_;   // [union size] cache views
     float * draft_hidden_dev_ = nullptr;    // [capacity][hc_dim] batch wide residuals
     size_t draft_hidden_capacity_ = 0;
     __half * moe_slots_ = nullptr;          // [draft_len_ - 1][hidden] extra MoE outputs

@@ -31,6 +31,11 @@ struct Qwen38HcWeights {
     // (upload_half_array), which would round the inject weight before the
     // multiply; the CPU reference keeps it F32.
     DeviceFloatArray inject_f32;
+    // The F32 HC RMSNorm weights, resident on the device. load_qwen38_hc_*()
+    // uploads them once so the per-call mix does not have to issue a 40 KB H2D
+    // copy of debug_norm_f32 on every one of the 96 sites per token (Task J
+    // measured that copy at 33 us on L4, i.e. 3.2 ms/token on its own).
+    DeviceFloatArray norm_f32_device;
     std::vector<float> debug_norm_f32;
     std::vector<float> debug_inject_f32;
     bool has_inject = true;
@@ -93,6 +98,7 @@ inline Qwen38HcWeights load_qwen38_hc_weights(
         down.type == GgmlType::Q8_0 && up.type == GgmlType::Q8_0) {
         const float * values = reinterpret_cast<const float *>(norm.data);
         out.debug_norm_f32.assign(values, values + norm.elements());
+        out.norm_f32_device = upload_float_array(norm);
     }
     // Keep the unrounded F32 inject weights resident on the device for every
     // layer and both branches. Quantised inject tensors (blk.48 MTP) keep the
@@ -141,6 +147,7 @@ inline Qwen38HcWeights load_qwen38_hc_head(
     if (norm.type == GgmlType::F32 && down.type == GgmlType::Q8_0 && up.type == GgmlType::Q8_0) {
         const float * values = reinterpret_cast<const float *>(norm.data);
         out.debug_norm_f32.assign(values, values + norm.elements());
+        out.norm_f32_device = upload_float_array(norm);
     }
     out.down = upload_matrix(down);
     out.up = upload_matrix(up);
@@ -362,6 +369,90 @@ __global__ void q38_hc_q8_0_quantize_f32_exact_kernel(
     const int q = amax == 0.0f ? 0 : __float2int_rn(__fmul_rn(value, inverse));
     quantized[i] = static_cast<int8_t>(max(-128, min(127, q)));
     if (lane == 0) scales[block] = __float2half_rn(d);
+}
+
+// Task J: __dp4a form of the exact Q8_0 x Q8_0 row dot, used for the wide HC
+// down projection (rows = low_rank = 320, cols = hc_dim = 40960).
+//
+// The reference kernel walks one 32-value block at a time with a five-step
+// shuffle reduction, so the HC down GEMV performs 1280 reductions per row and
+// reads its 13.9 MB of weights at 34 GB/s on L4 (410 us per call, the single
+// most expensive kernel of the whole HC mix).
+//
+// This variant keeps the arithmetic bit-identical:
+//   * one __dp4a per four values reproduces the integer dot exactly (integer
+//     addition is associative and the products cannot overflow int32), and
+//   * four blocks are in flight at once - an 8-lane group per block - so the
+//     reduction is three shuffles for four blocks instead of twenty, and
+//   * lane 0 still applies "sum += scale * dot" on the four blocks in
+//     increasing block order, so the F32 accumulation sequence is unchanged.
+// The 34-byte Q8_0 blocks place the quants at offset 2, so the four weight
+// bytes are assembled from two 2-byte-aligned uint16_t loads (the same trick
+// lowbit.cuh uses for IQ4_NL).
+__global__ void q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_kernel(
+        const uint8_t * __restrict__ weight,
+        const int8_t * __restrict__ activation,
+        const __half * __restrict__ activation_scales,
+        float * __restrict__ output,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const int blocks_per_row = cols >> 5;
+    const uint8_t * row_ptr =
+        weight + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) * 34u;
+    const int group = lane >> 3;   // which of the four blocks in flight
+    const int sub = lane & 7;      // which four-value chunk of that block
+
+    float sum = 0.0f;
+    int b = 0;
+    for (; b + 4 <= blocks_per_row; b += 4) {
+        const int index = b + group;
+        const uint8_t * blk = row_ptr + static_cast<size_t>(index) * 34u;
+        const uint8_t * qs = blk + 2 + (sub << 2);
+        const unsigned packed =
+            static_cast<unsigned>(*reinterpret_cast<const uint16_t *>(qs)) |
+            (static_cast<unsigned>(*reinterpret_cast<const uint16_t *>(qs + 2)) << 16);
+        const int act = *reinterpret_cast<const int *>(
+            activation + static_cast<size_t>(index) * 32u + static_cast<size_t>(sub) * 4u);
+        int dot = lowbit_dp4a(act, static_cast<int>(packed), 0);
+        dot += __shfl_down_sync(0xffffffffu, dot, 4);
+        dot += __shfl_down_sync(0xffffffffu, dot, 2);
+        dot += __shfl_down_sync(0xffffffffu, dot, 1);
+        const int d0 = __shfl_sync(0xffffffffu, dot, 0);
+        const int d1 = __shfl_sync(0xffffffffu, dot, 8);
+        const int d2 = __shfl_sync(0xffffffffu, dot, 16);
+        const int d3 = __shfl_sync(0xffffffffu, dot, 24);
+        if (lane == 0) {
+            const uint8_t * p = row_ptr + static_cast<size_t>(b) * 34u;
+            const float s0 = lowbit_half(p) * __half2float(activation_scales[b]);
+            sum += s0 * static_cast<float>(d0);
+            const float s1 = lowbit_half(p + 34) * __half2float(activation_scales[b + 1]);
+            sum += s1 * static_cast<float>(d1);
+            const float s2 = lowbit_half(p + 68) * __half2float(activation_scales[b + 2]);
+            sum += s2 * static_cast<float>(d2);
+            const float s3 = lowbit_half(p + 102) * __half2float(activation_scales[b + 3]);
+            sum += s3 * static_cast<float>(d3);
+        }
+    }
+    for (; b < blocks_per_row; ++b) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(b) * 34u;
+        const int8_t qw = *reinterpret_cast<const int8_t *>(blk + 2 + lane);
+        int dot = static_cast<int>(qw) * static_cast<int>(activation[(b << 5) + lane]);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0) {
+            const float scale = lowbit_half(blk) * __half2float(activation_scales[b]);
+            sum += scale * static_cast<float>(dot);
+        }
+    }
+    if (lane == 0) output[row] = sum;
 }
 
 __global__ void q38_hc_q8_0_q8_0_exact_gemv_f32_kernel(
@@ -748,9 +839,88 @@ __global__ void q38_hc_dense_gemv_f32_kernel(
 // q38_hc_dense_gemv_f32_kernel() sums lane-strided with a shfl_down tree
 // instead, which is a different summation order and therefore different bits.
 // This switch selects the oracle order; =0 restores the warp order for A/B.
+// Task J (WARODECODE_HC_Q8_DOWN_DP4A, **default OFF**; also requires sm_80+ and
+// WARODECODE_DP4A=1). Selects the 4-blocks-in-flight __dp4a form of the exact
+// Q8_0 x Q8_0 dot for the wide HC down projection.
+//
+// NEGATIVE RESULT: this path is 6.2x faster on L4 (410.6 -> ~66 us per site)
+// and 11.2 ms/token faster on A100, but it is NOT bit-exact. With it enabled the
+// greedy chain diverges from the CPU oracle at token 41 of 64; with every other
+// Task J switch on and only this one off the run is 64/64 again
+// (tests/hc_mix_ab.py --plan=bisect, A100, 2026-10-14). The integer dot is
+// provably order-independent, so the divergence has to sit in the float
+// accumulation of the four block scales - keep the flag off until that is
+// resolved and re-verified. =1 opts in for experiments only.
+inline bool q38_hc_q8_down_dp4a_enabled() {
+    static const bool enabled = q38_hc_env_flag("WARODECODE_HC_Q8_DOWN_DP4A", false) &&
+        lowbit_dp4a_available();
+    return enabled;
+}
+
+// One-warp-per-row dispatch for the exact Q8_0 x Q8_0 dot. cols is the width of
+// the reduction, so the 4-blocks-in-flight dp4a kernel is selected for the wide
+// HC down projection (cols = hc_dim = 40960) and the reference warp kernel stays
+// for the narrow up projection (cols = low_rank = 320), where ten blocks per row
+// leave no room for four blocks in flight.
+inline void q38_hc_launch_exact_q8_0_gemv_f32(
+        const uint8_t * weight,
+        const int8_t * activation,
+        const __half * activation_scales,
+        float * output,
+        int rows,
+        int cols,
+        cudaStream_t stream) {
+    constexpr int threads = 256;
+    constexpr int warps = threads / 32;
+    const int blocks = (rows + warps - 1) / warps;
+    if (q38_hc_q8_down_dp4a_enabled() && cols >= 1024 && cols % 32 == 0) {
+        q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_kernel<<<blocks, threads, 0, stream>>>(
+            weight, activation, activation_scales, output, rows, cols);
+        return;
+    }
+    q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<blocks, threads, 0, stream>>>(
+        weight, activation, activation_scales, output, rows, cols);
+}
+
 inline bool q38_hc_f32_gemv_avx2_enabled() {
     static const bool enabled = q38_hc_env_flag("WARODECODE_HC_INJECT_F32_AVX2", true);
     return enabled;
+}
+
+// Task J (WARODECODE_HC_INJECT_F32_WARP, default ON).
+//
+// q38_hc_dense_gemv_f32_avx2_kernel() puts one *thread* on each row of the F32
+// inject weight. The inject tensor is [hc_dim, hc] = [40960, 4] for the pinned
+// model, so that is four threads with a 1280-iteration inner loop: measured at
+// 790 us per call on L4 (655 KB of weights, 0.8 GB/s). The loop is latency
+// bound, not bandwidth bound.
+//
+// q38_hc_dense_gemv_f32_avx2_warp_kernel() keeps the ggml_vec_dot_f32
+// arithmetic order exactly and instead puts one *lane* on each of the 32
+// [4][8] accumulators, rebuilding the GGML_F32x8_REDUCE tree with shuffles in
+// the same association order. Same bits, one warp per row.
+inline bool q38_hc_f32_gemv_warp_enabled() {
+    static const bool enabled = q38_hc_env_flag("WARODECODE_HC_INJECT_F32_WARP", true);
+    return enabled;
+}
+
+
+// Task J (WARODECODE_HC_GAMMA_RESIDENT, default ON).
+//
+// The exact Q8_0 mix used to copy the F32 norm weights from the host vector to
+// scratch.gamma() on every call - 40 KB, 96 times per token, 33 us each on L4.
+// load_qwen38_hc_weights() now leaves the tensor resident on the device, so the
+// copy is only needed for weights that were assembled by hand (the probe and
+// micro-benchmark harnesses). =0 restores the per-call copy for A/B runs.
+inline bool q38_hc_gamma_resident_enabled() {
+    static const bool enabled = q38_hc_env_flag("WARODECODE_HC_GAMMA_RESIDENT", true);
+    return enabled;
+}
+
+// Device pointer to the resident F32 norm weights, or nullptr when the caller
+// built the weights by hand without uploading them.
+inline const float * q38_hc_norm_f32_device(const Qwen38HcWeights & w) {
+    return q38_hc_gamma_resident_enabled() ? w.norm_f32_device.data : nullptr;
 }
 
 // Tree reduction half of ggml_vec_dot_f32 on AVX2+FMA, identical to
@@ -769,6 +939,65 @@ __device__ __forceinline__ float q38_hc_reduce_avx2(float sum[4][8]) {
     const float h0 = t0[0] + t0[1];
     const float h1 = t0[2] + t0[3];
     return h0 + h1;
+}
+
+// Bit-exact warp-parallel form of q38_hc_dense_gemv_f32_avx2_kernel().
+//
+// Lane 8*j + l owns the ggml_vec_dot_f32 accumulator sum[j][l] and walks
+// i = 0, 32, 64, ... with the same __fmaf_rn chain, so every accumulator sees
+// exactly the operand sequence the single-thread kernel produced. The reduce
+// half is a shuffle form of q38_hc_reduce_avx2() with the same association:
+//
+//   sum[0][l] += sum[2][l] ; sum[1][l] += sum[3][l]   -> one __shfl_xor(16) add
+//   sum[0][l] += sum[1][l]                            -> lane l += lane l+8
+//   t0[k] = sum[0][k] + sum[0][k+4]                   -> lane k += lane k+4
+//   h0 = t0[0] + t0[1] ; h1 = t0[2] + t0[3] ; h0 + h1 -> lane 0
+//
+// cols must be a multiple of 32 (the model inject width is, and the caller
+// falls back to the one-thread-per-row kernel otherwise).
+__global__ void q38_hc_dense_gemv_f32_avx2_warp_kernel(
+        const float * __restrict__ w,
+        const float * __restrict__ x,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const int j = lane >> 3;   // accumulator row of sum[4][8]
+    const int l = lane & 7;    // accumulator column
+    const float * row_ptr = w + static_cast<size_t>(row) * cols;
+
+    float acc = 0.0f;
+    // The accumulator chain must stay sequential (ggml_vec_dot_f32 order), so
+    // the only headroom is memory-level parallelism: unrolling lets the loads
+    // for several iterations be in flight behind the FMA chain.
+#pragma unroll 4
+    for (int i = 0; i < cols; i += 32) {
+        const int c = i + j * 8 + l;
+        acc = __fmaf_rn(row_ptr[c], x[c], acc);
+    }
+
+    // sum[0][l] += sum[2][l] and sum[1][l] += sum[3][l] in one exchange.
+    acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, 16));
+    // sum[0][l] += sum[1][l] for l = 0..7 (lanes 0..7 read lanes 8..15).
+    const float s1 = __shfl_sync(0xffffffffu, acc, (lane & 7) + 8);
+    if (lane < 8) acc = __fadd_rn(acc, s1);
+    // t0[k] = sum[0][k] + sum[0][k+4] for k = 0..3.
+    const float s4 = __shfl_sync(0xffffffffu, acc, (lane & 3) + 4);
+    if (lane < 4) acc = __fadd_rn(acc, s4);
+
+    const float t1 = __shfl_sync(0xffffffffu, acc, 1);
+    const float t2 = __shfl_sync(0xffffffffu, acc, 2);
+    const float t3 = __shfl_sync(0xffffffffu, acc, 3);
+    if (lane == 0) {
+        const float h0 = __fadd_rn(acc, t1);
+        const float h1 = __fadd_rn(t2, t3);
+        y[row] = __fadd_rn(h0, h1);
+    }
 }
 
 // One ggml_vec_dot_f32 per row of the F32 inject weight, one thread per row.
@@ -817,8 +1046,17 @@ inline void q38_hc_launch_dense_gemv_f32(
         int cols,
         cudaStream_t stream) {
     if (q38_hc_f32_gemv_avx2_enabled()) {
-        // One thread per row, so the grid follows the thread count.
         constexpr int threads = 256;
+        if (q38_hc_f32_gemv_warp_enabled() && cols % 32 == 0) {
+            // One warp per row (the reduce tree is warp-local). One block per
+            // row as well: the HC inject weight has hc = 4 rows, and giving each
+            // row its own block spreads them over four SMs instead of one.
+            constexpr int warps = 1;
+            q38_hc_dense_gemv_f32_avx2_warp_kernel<<<(rows + warps - 1) / warps, warps * 32, 0, stream>>>(
+                w, x, y, rows, cols);
+            return;
+        }
+        // One thread per row, so the grid follows the thread count.
         q38_hc_dense_gemv_f32_avx2_kernel<<<(rows + threads - 1) / threads, threads, 0, stream>>>(
             w, x, y, rows, cols);
         return;
@@ -1144,19 +1382,21 @@ inline void run_qwen38_hc_f32_mix_from_residual(
         throw std::runtime_error("layer-0 HC F32 mix geometry/type mismatch");
     }
     cudaError_t e = cudaSuccess;
-    {
+    const float * gamma = q38_hc_norm_f32_device(w);
+    if (gamma == nullptr) {
         Q38HcKernelScope scope(base_site, kQ38HcMixQ8Gamma, stream);
         e = cudaMemcpyAsync(
             scratch.gamma(), w.debug_norm_f32.data(), static_cast<size_t>(hc_dim) * sizeof(float),
             cudaMemcpyHostToDevice, stream);
+        if (e != cudaSuccess) throw std::runtime_error("copy layer-0 HC F32 norm failed");
+        gamma = scratch.gamma();
     }
-    if (e != cudaSuccess) throw std::runtime_error("copy layer-0 HC F32 norm failed");
 
     constexpr int threads = 256;
     {
         Q38HcKernelScope scope(base_site, kQ38HcMixQ8Norm, stream);
         q38_hc_group_rmsnorm_f32_kernel<<<hc, threads, 0, stream>>>(
-            residual, scratch.gamma(), scratch.norm(), hidden, hc, eps);
+            residual, gamma, scratch.norm(), hidden, hc, eps);
     }
     {
         Q38HcKernelScope scope(base_site, kQ38HcMixQ8Down, stream);
@@ -1216,20 +1456,22 @@ inline void run_qwen38_hc_q8_0_f32_mix_from_residual(
     }
 
     cudaError_t e = cudaSuccess;
-    {
+    const float * gamma = q38_hc_norm_f32_device(w);
+    if (gamma == nullptr) {
         Q38HcKernelScope scope(base_site, kQ38HcMixQ8Gamma, stream);
         e = cudaMemcpyAsync(
             scratch.gamma(), w.debug_norm_f32.data(), static_cast<size_t>(hc_dim) * sizeof(float),
             cudaMemcpyHostToDevice, stream);
+        if (e != cudaSuccess) throw std::runtime_error("copy exact Q8_0 HC norm weights failed");
+        gamma = scratch.gamma();
     }
-    if (e != cudaSuccess) throw std::runtime_error("copy exact Q8_0 HC norm weights failed");
     constexpr int q8_threads = 256;
     constexpr int warps = q8_threads / 32;
     const int down_blocks = hc_dim / 32;
     {
         Q38HcKernelScope scope(base_site, kQ38HcMixQ8Norm, stream);
         q38_hc_group_rmsnorm_f32_kernel<<<hc, 256, 0, stream>>>(
-            residual, scratch.gamma(), scratch.norm(), hidden, hc, eps);
+            residual, gamma, scratch.norm(), hidden, hc, eps);
     }
     {
         Q38HcKernelScope scope(base_site, kQ38HcMixQ8QuantNorm, stream);
@@ -1239,10 +1481,9 @@ inline void run_qwen38_hc_q8_0_f32_mix_from_residual(
     }
     {
         Q38HcKernelScope scope(base_site, kQ38HcMixQ8Down, stream);
-        q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(low_rank + warps - 1) / warps,
-                                                   q8_threads, 0, stream>>>(
+        q38_hc_launch_exact_q8_0_gemv_f32(
             w.down.low.data, scratch.q8_0_values(), scratch.q8_0_scales(),
-            scratch.low_raw(), low_rank, hc_dim);
+            scratch.low_raw(), low_rank, hc_dim, stream);
     }
     {
         Q38HcKernelScope scope(base_site, kQ38HcMixQ8DownCopy, stream);
@@ -1343,14 +1584,19 @@ inline void run_qwen38_hc_q8_0_f32_mix_from_half_residual(
         throw std::runtime_error("exact Q8_0 HC replay weight geometry/type mismatch");
     }
 
-    cudaError_t e = cudaMemcpyAsync(
-        scratch.gamma(), w.debug_norm_f32.data(), static_cast<size_t>(hc_dim) * sizeof(float),
-        cudaMemcpyHostToDevice, stream);
-    if (e != cudaSuccess) throw std::runtime_error("copy exact Q8_0 HC norm weights failed");
+    cudaError_t e = cudaSuccess;
+    const float * gamma = q38_hc_norm_f32_device(w);
+    if (gamma == nullptr) {
+        e = cudaMemcpyAsync(
+            scratch.gamma(), w.debug_norm_f32.data(), static_cast<size_t>(hc_dim) * sizeof(float),
+            cudaMemcpyHostToDevice, stream);
+        if (e != cudaSuccess) throw std::runtime_error("copy exact Q8_0 HC norm weights failed");
+        gamma = scratch.gamma();
+    }
     q38_hc_copy_half_to_f32_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
         residual, scratch.residual(), hc_dim);
     q38_hc_group_rmsnorm_f32_kernel<<<hc, 256, 0, stream>>>(
-        scratch.residual(), scratch.gamma(), scratch.norm(), hidden, hc, eps);
+        scratch.residual(), gamma, scratch.norm(), hidden, hc, eps);
 
     constexpr int q8_threads = 256;
     constexpr int warps = q8_threads / 32;

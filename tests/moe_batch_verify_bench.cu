@@ -186,24 +186,100 @@ int main() {
         ck(cudaStreamSynchronize(stream), "serial sync");
         const auto serial_end = std::chrono::steady_clock::now();
 
+        // ---- fixed per-token expert lists -----------------------------------
+        // Each token gets its own top-k list, so the pair -> expert map has to
+        // build the union and hand out one slot per (token, top-k) - the same
+        // shape the MTP path uses. Reusing one list for every token would not
+        // exercise the mapping at all.
+        std::vector<int> token_expert(static_cast<size_t>(tokens) * k);
+        std::vector<int> token_slot(static_cast<size_t>(tokens) * k, -1);
+        std::vector<float> token_weight(static_cast<size_t>(tokens) * k);
+        {
+            std::mt19937 rng2(500u + static_cast<unsigned>(tokens));
+            std::uniform_int_distribution<int> ed(0, experts - 1);
+            std::uniform_real_distribution<float> wd(0.05f, 0.4f);
+            for (size_t i = 0; i < token_expert.size(); ++i) {
+                token_expert[i] = ed(rng2);
+                token_weight[i] = wd(rng2);
+            }
+        }
+        std::vector<int> union_experts;
+        for (int t = 0; t < tokens; ++t) {
+            for (int j = 0; j < k; ++j) {
+                const int e = token_expert[static_cast<size_t>(t) * k + j];
+                int slot = -1;
+                for (size_t u = 0; u < union_experts.size(); ++u) {
+                    if (union_experts[u] == e) { slot = static_cast<int>(u); break; }
+                }
+                if (slot < 0) {
+                    slot = static_cast<int>(union_experts.size());
+                    union_experts.push_back(e);
+                }
+                token_slot[static_cast<size_t>(t) * k + j] = slot;
+            }
+        }
+        std::vector<int> union_slot_count(union_experts.size() + 1, 0);
+        std::vector<float> union_weight(union_experts.size(), 0.0f);
+        for (size_t i = 0; i < token_expert.size(); ++i) {
+            union_weight[static_cast<size_t>(token_slot[i])] = token_weight[i];
+        }
+        // Every serial pass of the reference runs on the same fixed list.
+        auto set_scratch_topk = [&]() {
+            for (int i = 0; i < tokens * k; ++i) {
+                scratch.h_ids()[i] = token_expert[static_cast<size_t>(i)];
+                scratch.h_weights()[i] = token_weight[static_cast<size_t>(i)];
+            }
+        };
+
+        // ---- serial reference on the fixed lists ----------------------------
+        const auto serial_begin = std::chrono::steady_clock::now();
+        for (int t = 0; t < tokens; ++t) {
+            // Each serial pass walks the token's own slice of the fixed list, so
+            // copy it into the k slots the runner reads.
+            for (int j = 0; j < k; ++j) {
+                scratch.h_ids()[j] = token_expert[static_cast<size_t>(t) * k + j];
+                scratch.h_weights()[j] = token_weight[static_cast<size_t>(t) * k + j];
+            }
+            run_qwen38_routed_moe_separate<false>(
+                /*layer=*/0, d_act[static_cast<size_t>(t)], GpuMatrix{}, gate_info, up_info, down_info,
+                cache, scratch, d_serial[static_cast<size_t>(t)], 1.0f, stream, true);
+        }
+        ck(cudaStreamSynchronize(stream), "serial sync");
+        const auto serial_end = std::chrono::steady_clock::now();
+
         // ---- batch path -----------------------------------------------------
         std::vector<const float *> acts;
         for (int t = 0; t < tokens; ++t) acts.push_back(d_act[static_cast<size_t>(t)]);
+        // Poison the batch workspace so a missing zeroing step cannot hide
+        // behind a fresh allocation (this is the bug that shipped once).
+        {
+            float * accum = static_cast<float *>(
+                scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::Accum, tokens));
+            ck(cudaMemset(accum, 0x7f, static_cast<size_t>(hidden) * tokens * sizeof(float)),
+               "poison batch accum");
+        }
         const auto batch_begin = std::chrono::steady_clock::now();
         batch.open_all(scratch, GpuMatrix{}, acts, 1.0f, stream, true);
-        for (int t = 0; t < tokens; ++t) {
-            for (int j = 0; j < k; ++j) {
-                batch.set_pair_weights(t * k + j, d_gate[static_cast<size_t>(j)], d_up[static_cast<size_t>(j)],
-                                       d_down[static_cast<size_t>(j)]);
-            }
+        for (int i = 0; i < tokens * k; ++i) {
+            batch.set_pair_experts(i, token_expert[static_cast<size_t>(i)], union_weight);
+        }
+        for (size_t u = 0; u < union_experts.size(); ++u) {
+            const int e = union_experts[u];
+            batch.set_pair_weights(static_cast<int>(u), d_gate[static_cast<size_t>(e)],
+                                   d_up[static_cast<size_t>(e)], d_down[static_cast<size_t>(e)]);
+        }
+        // The pair slot of every (token, top-k) carries the union index; pairs
+        // are (token-major, top-k-minor) and the caller passes the union entry
+        // of its own expert. set_pair_weights() above wrote union slot u's
+        // pointers at pair u, so the pair list must be reordered to the union
+        // order the kernels read.
+        for (int p = 0; p < tokens * k; ++p) {
+            const int u = token_slot[static_cast<size_t>(p)];
+            batch.set_pair_weights(p, d_gate[static_cast<size_t>(union_experts[static_cast<size_t>(u)])],
+                                   d_up[static_cast<size_t>(union_experts[static_cast<size_t>(u)])],
+                                   d_down[static_cast<size_t>(union_experts[static_cast<size_t>(u)])]);
         }
         const bool resolved = batch.resolved();
-        if (!resolved) {
-            std::printf("  M=%d: batch not resolved\n", tokens);
-            ++failures;
-        } else {
-            batch.run(scratch, gate_info, up_info, down_info, stream);
-        }
         std::vector<__half *> d_batch(static_cast<size_t>(tokens));
         for (int t = 0; t < tokens; ++t) {
             ck(cudaMalloc(reinterpret_cast<void **>(&d_batch[static_cast<size_t>(t)]),

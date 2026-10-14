@@ -88,6 +88,38 @@ struct ExpertCacheOptions {
     int io_ring = 4;
     int io_threads = 4;
     bool io_stats = false;
+
+    // Task K: expert read-ahead. The on-demand fill blocks the calling thread in
+    // pread() before it can queue the DMA, so the host never runs more than one
+    // expert ahead of the GPU. The read-ahead ring lets a background reader fill
+    // pinned entries for the expert list the *next* layer is expected to need
+    // (the previous token's per-layer list), so acquire() only has to queue the
+    // DMA from an entry that is already complete.
+    //
+    // prefetch_depth counts how many layers ahead the ring is filled:
+    //   0 = off (byte-for-byte the pre-Task-K path)
+    //   1 = the current layer's remaining experts
+    //   2 = the current layer plus the next one
+    // The pre-read bytes are exactly the bytes pread() returns for the same file
+    // offsets, so a prediction that comes true cannot change a single slot byte,
+    // and a prediction that misses only wastes the read.
+    int prefetch_depth = 0;
+    int prefetch_threads = 2;
+    int prefetch_slots = 0;   // 0 = derive from prefetch_depth
+};
+
+// Task K: the per-layer expert tensors a read-ahead job needs. The prediction
+// names a (layer, expert) pair, and the bytes of that pair live in that layer's
+// own tensor, so the cache cannot derive them from the layer it is on. The
+// runtime registers every trunk layer once after initialize(); an unregistered
+// layer is simply never prefetched.
+struct ExpertLayerTensors {
+    TensorInfo gate;
+    TensorInfo up;
+    TensorInfo down;
+    TensorInfo gate_up;
+    bool fused = false;
+    bool valid = false;
 };
 
 // The switch values are parsed from the environment by qwen38_tuning.hpp
@@ -454,6 +486,321 @@ private:
 
 
 // ---------------------------------------------------------------------------
+// Task K: expert read-ahead ring.
+//
+// The on-demand fill blocks the calling thread in pread() *before* it can queue
+// the DMA, so the host can never run more than one expert ahead of the GPU. The
+// read-ahead ring removes that block: a background reader fills pinned entries
+// with the slices of the experts the *next* layer is expected to select (the
+// previous token's per-layer expert list), and submit() only has to queue the
+// DMA from an entry that is already complete.
+//
+// Safety of the bytes: an entry is filled by exactly the same pread() calls, for
+// exactly the same file offsets, as the on-demand path would issue, so a
+// prediction that comes true puts the same bytes in the slot. A prediction that
+// misses leaves the entry unused and it is recycled; nothing in the cache index,
+// the eviction order or the slot layout depends on this ring. With
+// ExpertCacheOptions::prefetch_depth == 0 the ring is not even allocated and
+// submit() takes exactly the path it took before Task K.
+//
+// Entry life cycle (state is atomic; the reader thread only ever moves
+// kQueued -> kReady/kFailed, every other transition happens on the calling
+// thread):
+//
+//   kFree     -- reusable, no DMA has read buf since the last refill
+//   kQueued   -- a reader job is published; the reader may write buf
+//   kReady    -- pread() completed; the bytes are there but nothing used them
+//   kFailed   -- pread() failed; the entry is recycled like kReady
+//   kBorrowed -- submit() took the entry and queued the DMA from buf; the entry
+//                may only be refilled after its DMA completion event fires
+//
+// The DMA completion event per entry is the same guard the on-demand ring uses
+// (the withdrawn WARODECODE_EXPERT_PIN ring corrupted experts because it had no
+// such guard); here it additionally protects the reader from overwriting a
+// buffer the DMA engine is still reading.
+// ---------------------------------------------------------------------------
+constexpr int kExpertSliceMax = 8;
+
+class ExpertReadAhead {
+public:
+    // kInFlight is kBorrowed after the DMA has been queued on its stream, i.e.
+    // after the per-entry completion event describes *this* transfer. Only an
+    // entry in kInFlight may be recycled, because before that the event still
+    // reports the previous generation's completion and recycling would let the
+    // reader overwrite a buffer the DMA engine is about to read.
+    enum State : int { kFree = 0, kQueued = 1, kReady = 2, kFailed = 3, kBorrowed = 4, kInFlight = 5 };
+
+    struct Entry {
+        Entry() = default;
+        Entry(const Entry &) = delete;
+        Entry & operator=(const Entry &) = delete;
+        // The ring is a std::vector so that configure() can size it, and a
+        // std::atomic member would otherwise delete the move constructor the
+        // vector needs. Moving is only ever needed while the ring is being
+        // resized, before the reader thread exists, so the atomic is simply
+        // carried over by value.
+        Entry(Entry && o) noexcept
+            : buf(o.buf), state(o.state.load(std::memory_order_relaxed)), key(o.key),
+              seq(o.seq), fd(o.fd), count(o.count), dma_done(o.dma_done) {
+            for (int i = 0; i < kExpertSliceMax; ++i) {
+                offset[i] = o.offset[i];
+                bytes[i] = o.bytes[i];
+                file_off[i] = o.file_off[i];
+            }
+            o.buf = nullptr;
+            o.dma_done = nullptr;
+        }
+        Entry & operator=(Entry && o) noexcept {
+            if (this != &o) {
+                buf = o.buf;
+                state.store(o.state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                key = o.key;
+                seq = o.seq;
+                fd = o.fd;
+                count = o.count;
+                dma_done = o.dma_done;
+                for (int i = 0; i < kExpertSliceMax; ++i) {
+                    offset[i] = o.offset[i];
+                    bytes[i] = o.bytes[i];
+                    file_off[i] = o.file_off[i];
+                }
+                o.buf = nullptr;
+                o.dma_done = nullptr;
+            }
+            return *this;
+        }
+
+        uint8_t * buf = nullptr;
+        std::atomic<int> state{kFree};
+        uint64_t key = 0;
+        uint64_t seq = 0;
+        int fd = -1;   // carried by the entry, so the reader shares no state
+        int count = 0;
+        size_t offset[kExpertSliceMax] = {};
+        size_t bytes[kExpertSliceMax] = {};
+        uint64_t file_off[kExpertSliceMax] = {};
+        cudaEvent_t dma_done = nullptr;   // DMA that last read buf
+    };
+
+    ExpertReadAhead() = default;
+    ExpertReadAhead(const ExpertReadAhead &) = delete;
+    ExpertReadAhead & operator=(const ExpertReadAhead &) = delete;
+
+    ~ExpertReadAhead() { release(); }
+
+    // Allocates entries of slot_bytes each. Returns false (and leaves the ring
+    // empty) when the pinned allocation fails, which disables read-ahead only.
+    bool configure(int slots, int threads, size_t slot_bytes) {
+        release();
+        if (slots < 1 || slot_bytes == 0) return false;
+        entries_.resize(static_cast<size_t>(slots));
+        for (Entry & e : entries_) {
+            if (cudaMallocHost(reinterpret_cast<void **>(&e.buf), slot_bytes) != cudaSuccess) {
+                e.buf = nullptr;
+                release();
+                return false;
+            }
+            if (cudaEventCreateWithFlags(&e.dma_done, cudaEventDisableTiming) != cudaSuccess) {
+                e.dma_done = nullptr;
+                release();
+                return false;
+            }
+        }
+        slot_bytes_ = slot_bytes;
+        threads_ = threads < 1 ? 1 : threads;
+        running_.store(true, std::memory_order_release);
+        reader_ = std::thread([this] { reader_loop(); });
+        return true;
+    }
+
+    void release() {
+        if (reader_.joinable()) {
+            running_.store(false, std::memory_order_release);
+            reader_.join();
+        }
+        running_.store(false, std::memory_order_release);
+        if (pool_) {
+            pool_->stop();
+            pool_.reset();
+        }
+        for (Entry & e : entries_) {
+            if (e.dma_done) cudaEventDestroy(e.dma_done);
+            if (e.buf) cudaFreeHost(e.buf);
+            e.dma_done = nullptr;
+            e.buf = nullptr;
+            e.state.store(kFree, std::memory_order_relaxed);
+        }
+        entries_.clear();
+        slot_bytes_ = 0;
+    }
+
+    bool enabled() const { return !entries_.empty(); }
+    size_t slots() const { return entries_.size(); }
+
+    // Publishes one read-ahead job. Returns false when the ring is full or the
+    // key is already queued/ready (the caller then simply does not prefetch).
+    bool post(uint64_t key, int fd, const uint64_t * file_off, const size_t * offset,
+              const size_t * bytes, int count) {
+        if (!enabled() || count < 1 || count > kExpertSliceMax) return false;
+        for (const Entry & e : entries_) {
+            const int st = e.state.load(std::memory_order_acquire);
+            if ((st == kQueued || st == kReady) && e.key == key) return false;
+        }
+        Entry * target = nullptr;
+        // 1) a free entry, 2) a stale prediction that was never used,
+        // 3) a borrowed entry whose DMA has completed.
+        for (Entry & e : entries_) {
+            if (e.state.load(std::memory_order_acquire) == kFree) { target = &e; break; }
+        }
+        if (target == nullptr) {
+            for (Entry & e : entries_) {
+                if (e.state.load(std::memory_order_acquire) == kReady ||
+                    e.state.load(std::memory_order_acquire) == kFailed) {
+                    if (target == nullptr || e.seq < target->seq) target = &e;
+                }
+            }
+        }
+        if (target == nullptr) {
+            for (Entry & e : entries_) {
+                if (e.state.load(std::memory_order_acquire) != kInFlight) continue;
+                const cudaError_t q = cudaEventQuery(e.dma_done);
+                if (q == cudaSuccess) {
+                    if (target == nullptr || e.seq < target->seq) target = &e;
+                } else if (q != cudaErrorNotReady) {
+                    (void) cudaGetLastError();
+                }
+            }
+            if (target != nullptr) target->state.store(kFree, std::memory_order_release);
+        }
+        if (target == nullptr) {
+            ++dropped_;
+            return false;
+        }
+
+        target->key = key;
+        target->seq = ++posted_seq_;
+        target->fd = fd;
+        target->count = count;
+        for (int i = 0; i < count; ++i) {
+            target->offset[i] = offset[i];
+            target->bytes[i] = bytes[i];
+            target->file_off[i] = file_off[i];
+        }
+        target->state.store(kQueued, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++queued_;
+        }
+        cv_.notify_all();
+        ++posted_;
+        return true;
+    }
+
+    // Claims the completed entry for key. Returns its pinned buffer, or nullptr
+    // when there is no completed prediction. The caller must queue the DMA from
+    // that buffer and then record the returned event on the DMA stream.
+    uint8_t * borrow(uint64_t key, cudaEvent_t * dma_done_out) {
+        for (Entry & e : entries_) {
+            if (e.state.load(std::memory_order_acquire) != kReady) continue;
+            if (e.key != key) continue;
+            e.state.store(kBorrowed, std::memory_order_release);
+            if (dma_done_out) *dma_done_out = e.dma_done;
+            ++used_;
+            return e.buf;
+        }
+        return nullptr;
+    }
+
+    // Marks the entry borrowed for key as safe to recycle: the caller queued the
+    // DMA from it and recorded dma_done on the stream the DMA runs on.
+    void finish_borrow(uint64_t key) {
+        for (Entry & e : entries_) {
+            if (e.key != key) continue;
+            if (e.state.load(std::memory_order_acquire) != kBorrowed) continue;
+            e.state.store(kInFlight, std::memory_order_release);
+            return;
+        }
+    }
+
+    bool busy() const { return queued_.load(std::memory_order_relaxed) != 0; }
+
+    uint64_t posted() const { return posted_; }
+    uint64_t dropped() const { return dropped_; }
+    uint64_t used() const { return used_; }
+    uint64_t delivered() const { return delivered_; }
+    uint64_t failed() const { return failed_; }
+
+private:
+    void reader_loop() {
+        while (running_.load(std::memory_order_acquire)) {
+            Entry * job = nullptr;
+            for (Entry & e : entries_) {
+                if (e.state.load(std::memory_order_acquire) != kQueued) continue;
+                if (job == nullptr || e.seq < job->seq) job = &e;
+            }
+            if (job == nullptr) {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait_for(lock, std::chrono::microseconds(200));
+                continue;
+            }
+            const bool ok = read_entry(*job);
+            if (ok) {
+                job->state.store(kReady, std::memory_order_release);
+                ++delivered_;
+            } else {
+                job->state.store(kFailed, std::memory_order_release);
+                ++failed_;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (queued_.load(std::memory_order_relaxed) > 0) --queued_;
+            }
+        }
+    }
+
+    bool read_entry(Entry & e) {
+        const int fd = e.fd;
+        if (fd < 0) return false;
+        if (threads_ > 1) {
+            if (!pool_) {
+                pool_ = std::make_unique<ExpertPreadPool>();
+                pool_->start(threads_);
+            }
+            if (pool_ && pool_->threads() > 1) {
+                return pool_->run(fd, e.buf, e.offset, e.bytes, e.file_off, e.count);
+            }
+        }
+        for (int i = 0; i < e.count; ++i) {
+            size_t done = 0;
+            while (done < e.bytes[i]) {
+                const ssize_t n = ::pread(fd, e.buf + e.offset[i] + done,
+                                          e.bytes[i] - done,
+                                          static_cast<off_t>(e.file_off[i] + done));
+                if (n <= 0) return false;
+                done += static_cast<size_t>(n);
+            }
+        }
+        return true;
+    }
+
+    std::vector<Entry> entries_;
+    std::thread reader_;
+    std::unique_ptr<ExpertPreadPool> pool_;
+    std::atomic<bool> running_{false};
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    int threads_ = 1;
+    size_t slot_bytes_ = 0;
+    std::atomic<uint64_t> queued_{0};
+    uint64_t posted_seq_ = 0;
+    uint64_t posted_ = 0;
+    uint64_t dropped_ = 0;
+    uint64_t used_ = 0;
+    uint64_t delivered_ = 0;
+    uint64_t failed_ = 0;
+};
+
+// ---------------------------------------------------------------------------
 // Host->device path of one expert slot.
 //
 // Without a copy stream the slices are staged by the driver on the decode
@@ -506,6 +853,17 @@ public:
         release();
         stage_enabled_ = opt.copy_stream;
         ring_slot_bytes_ = slot_bytes;
+        prefetch_depth_ = expert_cache_env_int("WARODECODE_EXPERT_PREFETCH_DEPTH",
+            expert_cache_env_flag("WARODECODE_EXPERT_PREFETCH", opt.prefetch_depth > 0)
+                ? (opt.prefetch_depth > 0 ? opt.prefetch_depth : 1) : 0);
+        if (prefetch_depth_ < 0) prefetch_depth_ = 0;
+        prefetch_threads_ = expert_cache_env_int("WARODECODE_EXPERT_PREFETCH_THREADS", opt.prefetch_threads);
+        if (prefetch_threads_ < 1) prefetch_threads_ = 1;
+        prefetch_slots_ = expert_cache_env_int("WARODECODE_EXPERT_PREFETCH_SLOTS", opt.prefetch_slots);
+        // Diagnostic: read ahead even for experts that are already resident, so a
+        // run can prove the ring works end to end on real hardware instead of
+        // posting nothing. It can only waste I/O, never change a slot byte.
+        prefetch_all_ = expert_cache_env_flag("WARODECODE_EXPERT_PREFETCH_ALL", false);
         io_enabled_ = expert_cache_env_flag("WARODECODE_EXPERT_IO_PREAD", opt.io_pread);
         io_ring_entries_ = static_cast<size_t>(expert_cache_env_int("WARODECODE_EXPERT_IO_RING", opt.io_ring));
         if (io_ring_entries_ == 0) io_ring_entries_ = 1;
@@ -552,6 +910,22 @@ public:
                 if (io_enabled_) {
                     pool_ = std::make_unique<ExpertPreadPool>();
                     pool_->start(io_threads_);
+                    if (prefetch_depth_ > 0) {
+                        // One reader job per expert, a few layers' worth of them:
+                        // enough that a whole layer (top-10) plus the in-flight
+                        // DMAs fit without the ring recycling a prediction that
+                        // the next layer is about to ask for. The free/borrowed
+                        // recycling in post() keeps this honest when the ring is
+                        // smaller than the demand.
+                        if (prefetch_slots_ <= 0) prefetch_slots_ = prefetch_depth_ * 16;
+                        if (prefetch_slots_ > 64) prefetch_slots_ = 64;
+                        readahead_ = std::make_shared<ExpertReadAhead>();
+                        if (!readahead_->configure(prefetch_slots_, prefetch_threads_, ring_slot_bytes_)) {
+                            std::fprintf(stderr, "expert-io: read-ahead disabled (pinned allocation failed)\n");
+                            prefetch_depth_ = 0;
+                            readahead_.reset();
+                        }
+                    }
                 } else {
                     for (RingEntry & entry : ring_) {
                         if (entry.done) cudaEventDestroy(entry.done);
@@ -566,6 +940,13 @@ public:
     }
 
     void release() {
+        if (readahead_) {
+            readahead_->release();
+            readahead_.reset();
+        }
+        history_.clear();
+        prev_history_.clear();
+        history_valid_ = false;
         if (pool_) {
             pool_->stop();
             pool_.reset();
@@ -585,6 +966,8 @@ public:
         copy_stream_ = nullptr;
         stage_enabled_ = false;
         io_enabled_ = false;
+        prefetch_depth_ = 0;
+        served_prefetch_ = false;
     }
 
     bool enabled() const { return stage_enabled_; }
@@ -599,9 +982,95 @@ public:
     // stream; the plain path keeps the stream order.
     bool needs_retire() const { return copy_stream_ != nullptr; }
 
+    // -----------------------------------------------------------------------
+    // Task K: read-ahead bookkeeping.
+    // -----------------------------------------------------------------------
+    bool prefetch_enabled() const { return prefetch_depth_ > 0 && readahead_ && readahead_->enabled(); }
+    bool prefetch_all() const { return prefetch_all_; }
+    int prefetch_depth() const { return prefetch_depth_; }
+    uint64_t prefetch_candidates() const { return candidates_total_; }
+    uint64_t prefetch_post_calls() const { return post_calls_; }
+    uint64_t prefetch_post_refused() const { return post_refused_; }
+    size_t prefetch_slots() const { return readahead_ ? readahead_->slots() : 0; }
+    uint64_t prefetch_posted() const { return readahead_ ? readahead_->posted() : 0; }
+    uint64_t prefetch_dropped() const { return readahead_ ? readahead_->dropped() : 0; }
+    uint64_t prefetch_used() const { return readahead_ ? readahead_->used() : 0; }
+    uint64_t prefetch_delivered() const { return readahead_ ? readahead_->delivered() : 0; }
+    uint64_t prefetch_failed() const { return readahead_ ? readahead_->failed() : 0; }
+    bool last_served_prefetch() const { return served_prefetch_; }
+
+    // Records one acquire() in the per-layer history and returns the keys the
+    // read-ahead ring should be filled with. The prediction is the previous
+    // token's expert list of the next prefetch_depth() layers, and a layer is
+    // only evaluated on its first acquire of the token, where that list is
+    // complete. The list is owned by this object and is overwritten by the next
+    // call, so the caller has to consume it before the next acquire().
+    const std::vector<uint64_t> & note_access(int layer, uint64_t key) {
+        candidates_.clear();
+        if (prefetch_depth_ <= 0) return candidates_;
+        const size_t li = static_cast<size_t>(layer < 0 ? 0 : layer);
+        if (last_layer_ >= 0 && layer < last_layer_) {
+            // The decode loop walks layer 0..N-1 once per token, so a decreasing
+            // layer index is a token boundary: the list of the token that just
+            // ended becomes the prediction for the next one.
+            prev_history_.swap(history_);
+            for (std::vector<uint64_t> & v : history_) v.clear();
+            history_valid_ = true;
+        }
+        if (history_.size() <= li) history_.resize(li + 1);
+        const bool first_of_layer = history_[li].empty();
+        if (first_of_layer && history_valid_ && prev_history_.size() > li) {
+            size_t last = li + static_cast<size_t>(prefetch_depth_);
+            if (last > prev_history_.size()) last = prev_history_.size();
+            for (size_t l = li; l < last; ++l) {
+                for (uint64_t k : prev_history_[l]) {
+                    if (k != key) candidates_.push_back(k);
+                }
+            }
+        }
+        history_[li].push_back(key);
+        last_layer_ = layer;
+        candidates_total_ += candidates_.size();
+        return candidates_;
+    }
+
+    // Publishes one read-ahead job. The file offsets are resolved here, on the
+    // calling thread, so the reader thread never touches the mapping.
+    bool post_prefetch(uint64_t key, const uint8_t * const * src, const size_t * offset,
+                       const size_t * bytes, int count) {
+        if (!prefetch_enabled() || count < 1 || count > kExpertSliceMax) return false;
+        ++post_calls_;
+        // Resolve first: ExpertFileMap::resolve() may switch to another shard of
+        // the GGUF and reopen the descriptor, so the fd must be read *after* it.
+        uint64_t file_off[kExpertSliceMax];
+        for (int i = 0; i < count; ++i) {
+            if (!map_.resolve(src[i])) {
+                ++post_refused_;
+                return false;
+            }
+            file_off[i] = map_.offset_of(src[i]);
+        }
+        const int fd = map_.fd();
+        if (fd < 0) {
+            ++post_refused_;
+            return false;
+        }
+        // A refused post is either a ring that is full (counted there) or a
+        // duplicate key; either way the acquire simply keeps the on-demand path.
+        const bool posted = readahead_->post(key, fd, file_off, offset, bytes, count);
+        if (!posted) ++post_refused_;
+        return posted;
+    }
+
     // Queue one expert: count slices land at dst + offset[i]. depend orders the
     // DMA after the last consumer of the slot that is being overwritten.
     // Returns true when the pinned pread path served the fill.
+    //
+    // Task K: key identifies the (layer, expert) pair so a completed read-ahead
+    // entry can serve the fill without any pread() on this thread. The DMA is
+    // queued from the read-ahead buffer and its completion event is recorded on
+    // the same stream, so the entry cannot be refilled before the DMA has read
+    // it. A miss on the read-ahead ring falls through to the on-demand path.
     bool submit(
             const uint8_t * const * src,
             const size_t * offset,
@@ -609,10 +1078,31 @@ public:
             int count,
             uint8_t * dst,
             cudaStream_t consumer,
-            cudaEvent_t depend) {
+            cudaEvent_t depend,
+            uint64_t key = 0) {
         // The pinned path works with and without the copy stream: without it the
         // DMA and its reuse event are ordered on the decode stream instead.
         cudaStream_t s = copy_stream_ ? copy_stream_ : consumer;
+        served_prefetch_ = false;
+        if (io_enabled_ && readahead_ && readahead_->enabled() && count <= kExpertSliceMax) {
+            cudaEvent_t reuse = nullptr;
+            uint8_t * ready = readahead_->borrow(key, &reuse);
+            if (ready != nullptr) {
+                wait_depend(s, depend);
+                int i = 0;
+                while (i < count) {
+                    int j = i + 1;
+                    while (j < count && offset[j] == offset[j - 1] + bytes[j - 1]) ++j;
+                    copy(dst + offset[i], ready + offset[i],
+                         offset[j - 1] + bytes[j - 1] - offset[i], s, "expert");
+                    i = j;
+                }
+                copy_record(reuse, s, "expert read-ahead reuse event");
+                readahead_->finish_borrow(key);
+                served_prefetch_ = true;
+                return true;
+            }
+        }
         if (io_enabled_ && fill_pinned(src, offset, bytes, count)) {
             wait_depend(s, depend);
             RingEntry & entry = ring_[ring_next_];
@@ -664,6 +1154,24 @@ private:
     };
 
     void move_from(ExpertStagePath && o) noexcept {
+        readahead_ = o.readahead_;
+        prefetch_all_ = o.prefetch_all_;
+        candidates_total_ = o.candidates_total_;
+        post_calls_ = o.post_calls_;
+        post_refused_ = o.post_refused_;
+        history_ = std::move(o.history_);
+        prev_history_ = std::move(o.prev_history_);
+        history_valid_ = o.history_valid_;
+        last_layer_ = o.last_layer_;
+        prefetch_depth_ = o.prefetch_depth_;
+        prefetch_threads_ = o.prefetch_threads_;
+        prefetch_slots_ = o.prefetch_slots_;
+        o.readahead_.reset();
+        o.history_.clear();
+        o.prev_history_.clear();
+        o.history_valid_ = false;
+        o.last_layer_ = -1;
+        o.prefetch_depth_ = 0;
         copy_stream_ = o.copy_stream_;
         done_ = o.done_;
         stage_enabled_ = o.stage_enabled_;
@@ -810,6 +1318,22 @@ private:
 
     double last_pread_ms_ = 0.0;
     double last_ring_wait_ms_ = 0.0;
+
+    // Task K: read-ahead ring + the per-layer access history it predicts from.
+    int prefetch_depth_ = 0;
+    int prefetch_threads_ = 2;
+    int prefetch_slots_ = 0;
+    bool prefetch_all_ = false;
+    bool served_prefetch_ = false;
+    uint64_t candidates_total_ = 0;
+    uint64_t post_calls_ = 0;
+    uint64_t post_refused_ = 0;
+    bool history_valid_ = false;
+    int last_layer_ = -1;
+    std::shared_ptr<ExpertReadAhead> readahead_;
+    std::vector<std::vector<uint64_t>> history_;
+    std::vector<std::vector<uint64_t>> prev_history_;
+    std::vector<uint64_t> candidates_;
 };
 
 
@@ -960,7 +1484,9 @@ public:
     }
 
     // Task H: pread / pinned ring read path, split out of stage_ms.
-    void note_io_ms(double pread_ms, double ring_wait_ms, bool served) {
+    // Task K adds served_prefetch: the fill was taken from a completed
+    // read-ahead entry, so no pread() ran on the acquiring thread at all.
+    void note_io_ms(double pread_ms, double ring_wait_ms, bool served, bool served_prefetch = false) {
         if (!enabled_) return;
         pread_ms_ += pread_ms;
         ring_wait_ms_ += ring_wait_ms;
@@ -969,7 +1495,55 @@ public:
         } else {
             ++io_fallbacks_;
         }
+        if (served_prefetch) ++io_prefetched_;
     }
+
+    // Task K: the time the cache was *not* inside acquire(), split by whether
+    // the next acquire is in the same layer (kernel launches + expert
+    // accumulate) or in the next one (attention / HC / router / the per-layer
+    // expert-selection sync). Together with acquire_ms this is a complete
+    // host-side timeline of the expert loop, which is what decides whether the
+    // MoE region is host-bound or GPU-bound.
+    void note_gap_ms(double ms, int layer) {
+        if (!enabled_) return;
+        // The first acquire of the run has no predecessor to measure against
+        // (the cache was configured during model load), so it only seeds the
+        // layer it belongs to.
+        if (last_gap_layer_ < 0) {
+            last_gap_layer_ = layer;
+            return;
+        }
+        if (layer == last_gap_layer_) {
+            intra_gap_ms_ += ms;
+        } else {
+            layer_gap_ms_ += ms;
+        }
+        last_gap_layer_ = layer;
+    }
+
+    void note_prefetch_state(int depth, size_t slots, uint64_t posted, uint64_t dropped,
+                             uint64_t used, uint64_t delivered, uint64_t failed,
+                             uint64_t candidates, uint64_t post_calls, uint64_t post_refused) {
+        if (!enabled_) return;
+        prefetch_depth_ = depth;
+        prefetch_slots_ = slots;
+        prefetch_posted_ = posted;
+        prefetch_dropped_ = dropped;
+        prefetch_used_ = used;
+        prefetch_delivered_ = delivered;
+        prefetch_failed_ = failed;
+        prefetch_candidates_ = candidates;
+        prefetch_post_calls_ = post_calls;
+        prefetch_post_refused_ = post_refused;
+    }
+
+    // Why a predicted expert was not posted: it is already resident (the common
+    // case, and the reason a history-based read-ahead can have nothing to do), or
+    // the layer it belongs to was never registered / has another geometry.
+    void note_prefetch_resident_skip() { ++prefetch_resident_skip_; }
+    void note_prefetch_layer_skip() { ++prefetch_layer_skip_; }
+    uint64_t prefetch_resident_skip() const { return prefetch_resident_skip_; }
+    uint64_t prefetch_layer_skip() const { return prefetch_layer_skip_; }
 
     void note_acquire_ms(double ms) {
         if (!enabled_) return;
@@ -1003,6 +1577,24 @@ public:
         s += ",\"io_ring\":" + std::to_string(io_ring_);
         s += ",\"io_fadvise\":" + std::to_string(io_fadvise_);
         s += ",\"io_threads\":" + std::to_string(io_threads_);
+        s += ",\"io_prefetched\":" + std::to_string(io_prefetched_);
+        s += ",\"prefetch_depth\":" + std::to_string(prefetch_depth_);
+        s += ",\"prefetch_slots\":" + std::to_string(prefetch_slots_);
+        s += ",\"prefetch_posted\":" + std::to_string(prefetch_posted_);
+        s += ",\"prefetch_dropped\":" + std::to_string(prefetch_dropped_);
+        s += ",\"prefetch_used\":" + std::to_string(prefetch_used_);
+        s += ",\"prefetch_delivered\":" + std::to_string(prefetch_delivered_);
+        s += ",\"prefetch_failed\":" + std::to_string(prefetch_failed_);
+        s += ",\"prefetch_candidates\":" + std::to_string(prefetch_candidates_);
+        s += ",\"prefetch_resident_skip\":" + std::to_string(prefetch_resident_skip_);
+        s += ",\"prefetch_layer_skip\":" + std::to_string(prefetch_layer_skip_);
+        s += ",\"prefetch_post_calls\":" + std::to_string(prefetch_post_calls_);
+        s += ",\"prefetch_post_refused\":" + std::to_string(prefetch_post_refused_);
+        s += ",\"intra_gap_ms\":" + fixed(intra_gap_ms_, 1);
+        s += ",\"layer_gap_ms\":" + fixed(layer_gap_ms_, 1);
+        s += ",\"intra_gap_per_token\":" + fixed(intra_gap_ms_ / token_count, 2);
+        s += ",\"layer_gap_per_token\":" + fixed(layer_gap_ms_ / token_count, 2);
+        s += ",\"acquire_per_token\":" + fixed(acquire_ms_ / token_count, 2);
         s += ",\"tokens\":" + std::to_string(token_access_.size());
         s += ",\"distinct_pairs\":" + std::to_string(distinct_);
         s += ",\"prev_token_ready\":" + std::to_string(prev_ready_);
@@ -1119,6 +1711,22 @@ private:
     double ring_wait_ms_ = 0.0;
     uint64_t io_served_ = 0;
     uint64_t io_fallbacks_ = 0;
+    uint64_t io_prefetched_ = 0;
+    double intra_gap_ms_ = 0.0;
+    double layer_gap_ms_ = 0.0;
+    int last_gap_layer_ = -1;
+    int prefetch_depth_ = 0;
+    size_t prefetch_slots_ = 0;
+    uint64_t prefetch_posted_ = 0;
+    uint64_t prefetch_dropped_ = 0;
+    uint64_t prefetch_used_ = 0;
+    uint64_t prefetch_delivered_ = 0;
+    uint64_t prefetch_failed_ = 0;
+    uint64_t prefetch_candidates_ = 0;
+    uint64_t prefetch_resident_skip_ = 0;
+    uint64_t prefetch_layer_skip_ = 0;
+    uint64_t prefetch_post_calls_ = 0;
+    uint64_t prefetch_post_refused_ = 0;
     bool io_enabled_ = false;
     size_t io_ring_ = 0;
     int io_fadvise_ = 0;
@@ -1265,6 +1873,28 @@ public:
     size_t slot_count() const { return n_slots_; }
     size_t slot_bytes() const { return slot_bytes_; }
     size_t resident_count() const { return index_.size(); }
+    int prefetch_depth() const { return stage_.prefetch_depth(); }
+    size_t prefetch_slots() const { return stage_.prefetch_slots(); }
+    uint64_t prefetch_posted() const { return stage_.prefetch_posted(); }
+    uint64_t prefetch_used() const { return stage_.prefetch_used(); }
+    uint64_t prefetch_delivered() const { return stage_.prefetch_delivered(); }
+    uint64_t prefetch_dropped() const { return stage_.prefetch_dropped(); }
+    uint64_t prefetch_failed() const { return stage_.prefetch_failed(); }
+
+    // Task K: hands the read-ahead ring the expert tensors of one trunk layer.
+    void register_layer_experts(int layer, const TensorInfo & gate, const TensorInfo & up,
+                                const TensorInfo & down) {
+        if (layer < 0) return;
+        if (layer_tensors_.size() <= static_cast<size_t>(layer)) {
+            layer_tensors_.resize(static_cast<size_t>(layer) + 1);
+        }
+        ExpertLayerTensors & t = layer_tensors_[static_cast<size_t>(layer)];
+        t.gate = gate;
+        t.up = up;
+        t.down = down;
+        t.fused = false;
+        t.valid = true;
+    }
 
     ExpertDeviceWeights acquire(
             int layer,
@@ -1275,6 +1905,7 @@ public:
             cudaStream_t stream) {
         if (!pool_) throw std::runtime_error("expert cache is not initialized");
         const auto acquire_start = clock::now();
+        if (monitor_.enabled()) monitor_.note_gap_ms(ms_since(last_acquire_exit_), layer);
 
         // Every kernel that reads the slot handed out by the previous acquire()
         // has been queued by now, so this is the point after which that slot may
@@ -1284,6 +1915,7 @@ public:
         const uint64_t key = make_key(layer, expert);
         ++clock_;
         monitor_.note_access(layer, key);
+        post_readahead(layer, key);
 
         auto it = index_.find(key);
         if (it != index_.end()) {
@@ -1291,6 +1923,7 @@ public:
             s.last_use = clock_;
             monitor_.note_hit(layer);
             monitor_.note_acquire_ms(ms_since(acquire_start));
+            last_acquire_exit_ = clock::now();
             return views(it->second, true);
         }
 
@@ -1309,10 +1942,11 @@ public:
         const size_t offset[3] = {0, gate_bytes_, gate_bytes_ + up_bytes_};
         const size_t length[3] = {gh.bytes, uh.bytes, dh.bytes};
         const auto stage_start = clock::now();
-        const bool io_served = stage_.submit(src, offset, length, 3, base, stream, meta.retire);
+        const bool io_served = stage_.submit(src, offset, length, 3, base, stream, meta.retire, key);
         stage_.finish(stream);
         monitor_.note_stage_ms(ms_since(stage_start));
-        monitor_.note_io_ms(stage_.last_pread_ms(), stage_.last_ring_wait_ms(), io_served);
+        monitor_.note_io_ms(stage_.last_pread_ms(), stage_.last_ring_wait_ms(), io_served,
+                            stage_.last_served_prefetch());
 
         meta.key = key;
         meta.last_use = clock_;
@@ -1325,11 +1959,57 @@ public:
         meta.down_actual_bytes = dh.bytes;
         index_[key] = slot;
         monitor_.note_fill(layer, gh.bytes + uh.bytes + dh.bytes, evicted);
+        monitor_.note_prefetch_state(stage_.prefetch_depth(), stage_.prefetch_slots(),
+                                     stage_.prefetch_posted(), stage_.prefetch_dropped(),
+                                     stage_.prefetch_used(), stage_.prefetch_delivered(),
+                                     stage_.prefetch_failed(), stage_.prefetch_candidates(),
+                                     stage_.prefetch_post_calls(), stage_.prefetch_post_refused());
         monitor_.note_acquire_ms(ms_since(acquire_start));
+        last_acquire_exit_ = clock::now();
         return views(slot, false);
     }
 
 private:
+    // Task K: publishes the read-ahead jobs the access history predicts. Only
+    // experts that are not resident yet are posted, so a prediction that the
+    // cache already satisfies costs nothing.
+    void post_readahead(int layer, uint64_t key) {
+        if (!stage_.prefetch_enabled()) return;
+        const std::vector<uint64_t> & candidates = stage_.note_access(layer, key);
+        for (uint64_t k : candidates) {
+            if (!stage_.prefetch_all() && index_.find(k) != index_.end()) {
+                monitor_.note_prefetch_resident_skip();
+                continue;
+            }
+            const size_t li = static_cast<size_t>(k >> 32);
+            const int e = static_cast<int>(k & 0xffffffffu);
+            if (li >= layer_tensors_.size() || e < 0) {
+                monitor_.note_prefetch_layer_skip();
+                continue;
+            }
+            const ExpertLayerTensors & t = layer_tensors_[li];
+            if (!t.valid || t.fused || t.gate.dims.size() != 3 ||
+                static_cast<size_t>(e) >= t.gate.dims[2]) {
+                monitor_.note_prefetch_layer_skip();
+                continue;
+            }
+            const auto gh = expert_slice(t.gate, e);
+            const auto uh = expert_slice(t.up, e);
+            const auto dh = expert_slice(t.down, e);
+            if (gh.bytes > gate_bytes_ || uh.bytes > up_bytes_ || dh.bytes > down_bytes_ ||
+                gh.rows != gate_rows_ || gh.cols != gate_cols_ ||
+                uh.rows != up_rows_ || uh.cols != up_cols_ ||
+                dh.rows != down_rows_ || dh.cols != down_cols_) {
+                monitor_.note_prefetch_layer_skip();
+                continue;
+            }
+            const uint8_t * src[3] = {gh.data, uh.data, dh.data};
+            const size_t offset[3] = {0, gate_bytes_, gate_bytes_ + up_bytes_};
+            const size_t length[3] = {gh.bytes, uh.bytes, dh.bytes};
+            stage_.post_prefetch(k, src, offset, length, 3);
+        }
+    }
+
     void release() {
         for (Slot & s : slots_) {
             if (s.retire) cudaEventDestroy(s.retire);
@@ -1344,6 +2024,7 @@ private:
         index_.clear();
         last_slot_ = 0;
         last_slot_valid_ = false;
+        layer_tensors_.clear();
     }
 
     void move_from(GpuExpertCache && o) noexcept {
@@ -1367,6 +2048,8 @@ private:
         layer_count_ = o.layer_count_;
         last_slot_ = o.last_slot_;
         last_slot_valid_ = o.last_slot_valid_;
+        layer_tensors_ = std::move(o.layer_tensors_);
+        last_acquire_exit_ = o.last_acquire_exit_;
 
         o.pool_ = nullptr;
         o.n_slots_ = 0;
@@ -1492,6 +2175,8 @@ private:
     int layer_count_ = 0;
     size_t last_slot_ = 0;
     bool last_slot_valid_ = false;
+    std::vector<ExpertLayerTensors> layer_tensors_;
+    clock::time_point last_acquire_exit_{};
 };
 
 
@@ -1567,6 +2252,26 @@ public:
 
     size_t slot_count() const { return n_slots_; }
     size_t resident_count() const { return index_.size(); }
+    int prefetch_depth() const { return stage_.prefetch_depth(); }
+    size_t prefetch_slots() const { return stage_.prefetch_slots(); }
+    uint64_t prefetch_posted() const { return stage_.prefetch_posted(); }
+    uint64_t prefetch_used() const { return stage_.prefetch_used(); }
+    uint64_t prefetch_delivered() const { return stage_.prefetch_delivered(); }
+    uint64_t prefetch_dropped() const { return stage_.prefetch_dropped(); }
+    uint64_t prefetch_failed() const { return stage_.prefetch_failed(); }
+
+    // Task K: hands the read-ahead ring the expert tensors of one trunk layer.
+    void register_layer_experts(int layer, const TensorInfo & gate_up, const TensorInfo & down) {
+        if (layer < 0) return;
+        if (layer_tensors_.size() <= static_cast<size_t>(layer)) {
+            layer_tensors_.resize(static_cast<size_t>(layer) + 1);
+        }
+        ExpertLayerTensors & t = layer_tensors_[static_cast<size_t>(layer)];
+        t.gate_up = gate_up;
+        t.down = down;
+        t.fused = true;
+        t.valid = true;
+    }
 
     ExpertDeviceFusedWeights acquire(
             int layer,
@@ -1576,18 +2281,21 @@ public:
             cudaStream_t stream) {
         if (!pool_) throw std::runtime_error("fused expert cache is not initialized");
         const auto acquire_start = clock::now();
+        if (monitor_.enabled()) monitor_.note_gap_ms(ms_since(last_acquire_exit_), layer);
 
         if (last_slot_valid_ && stage_.needs_retire()) retire_slot(last_slot_, stream);
 
         const uint64_t key = make_key(layer, expert);
         ++clock_;
         monitor_.note_access(layer, key);
+        post_readahead(layer, key);
 
         auto it = index_.find(key);
         if (it != index_.end()) {
             slots_[it->second].last_use = clock_;
             monitor_.note_hit(layer);
             monitor_.note_acquire_ms(ms_since(acquire_start));
+            last_acquire_exit_ = clock::now();
             return views(it->second, true);
         }
 
@@ -1608,21 +2316,63 @@ public:
         const size_t offset[2] = {0, gate_up_bytes_};
         const size_t length[2] = {guh.bytes, dh.bytes};
         const auto stage_start = clock::now();
-        const bool io_served = stage_.submit(src, offset, length, 2, base, stream, meta.retire);
+        const bool io_served = stage_.submit(src, offset, length, 2, base, stream, meta.retire, key);
         stage_.finish(stream);
         monitor_.note_stage_ms(ms_since(stage_start));
-        monitor_.note_io_ms(stage_.last_pread_ms(), stage_.last_ring_wait_ms(), io_served);
+        monitor_.note_io_ms(stage_.last_pread_ms(), stage_.last_ring_wait_ms(), io_served,
+                            stage_.last_served_prefetch());
 
         meta.key = key;
         meta.last_use = clock_;
         meta.valid = true;
         index_[key] = slot;
         monitor_.note_fill(layer, guh.bytes + dh.bytes, evicted);
+        monitor_.note_prefetch_state(stage_.prefetch_depth(), stage_.prefetch_slots(),
+                                     stage_.prefetch_posted(), stage_.prefetch_dropped(),
+                                     stage_.prefetch_used(), stage_.prefetch_delivered(),
+                                     stage_.prefetch_failed(), stage_.prefetch_candidates(),
+                                     stage_.prefetch_post_calls(), stage_.prefetch_post_refused());
         monitor_.note_acquire_ms(ms_since(acquire_start));
+        last_acquire_exit_ = clock::now();
         return views(slot, false);
     }
 
 private:
+    // Task K: see GpuExpertCache::post_readahead.
+    void post_readahead(int layer, uint64_t key) {
+        if (!stage_.prefetch_enabled()) return;
+        const std::vector<uint64_t> & candidates = stage_.note_access(layer, key);
+        for (uint64_t k : candidates) {
+            if (!stage_.prefetch_all() && index_.find(k) != index_.end()) {
+                monitor_.note_prefetch_resident_skip();
+                continue;
+            }
+            const size_t li = static_cast<size_t>(k >> 32);
+            const int e = static_cast<int>(k & 0xffffffffu);
+            if (li >= layer_tensors_.size() || e < 0) {
+                monitor_.note_prefetch_layer_skip();
+                continue;
+            }
+            const ExpertLayerTensors & t = layer_tensors_[li];
+            if (!t.valid || !t.fused || t.gate_up.dims.size() != 3 ||
+                static_cast<size_t>(e) >= t.gate_up.dims[2]) {
+                monitor_.note_prefetch_layer_skip();
+                continue;
+            }
+            const auto guh = expert_slice(t.gate_up, e);
+            const auto dh = expert_slice(t.down, e);
+            if (guh.bytes != gate_up_bytes_ || guh.rows != gate_up_rows_ || guh.cols != gate_up_cols_ ||
+                dh.bytes != down_bytes_ || dh.rows != down_rows_ || dh.cols != down_cols_) {
+                monitor_.note_prefetch_layer_skip();
+                continue;
+            }
+            const uint8_t * src[2] = {guh.data, dh.data};
+            const size_t offset[2] = {0, gate_up_bytes_};
+            const size_t length[2] = {guh.bytes, dh.bytes};
+            stage_.post_prefetch(k, src, offset, length, 2);
+        }
+    }
+
     void release() {
         for (Slot & s : slots_) {
             if (s.retire) cudaEventDestroy(s.retire);
@@ -1637,6 +2387,7 @@ private:
         index_.clear();
         last_slot_ = 0;
         last_slot_valid_ = false;
+        layer_tensors_.clear();
     }
 
     void move_from(GpuFusedExpertCache && o) noexcept {
@@ -1662,6 +2413,8 @@ private:
         layer_count_ = o.layer_count_;
         last_slot_ = o.last_slot_;
         last_slot_valid_ = o.last_slot_valid_;
+        layer_tensors_ = std::move(o.layer_tensors_);
+        last_acquire_exit_ = o.last_acquire_exit_;
 
         o.pool_ = nullptr;
         o.n_slots_ = 0;
@@ -1764,6 +2517,8 @@ private:
     int layer_count_ = 0;
     size_t last_slot_ = 0;
     bool last_slot_valid_ = false;
+    std::vector<ExpertLayerTensors> layer_tensors_;
+    clock::time_point last_acquire_exit_{};
 };
 
 } // namespace wd

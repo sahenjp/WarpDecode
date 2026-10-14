@@ -132,3 +132,25 @@ Colab は**使っていないセッションを自動回収する**ことがあ�
 - MTP は batch=1 verify では -3.8〜6.2%（原理的にプラスにならない）。M トークン同時 verify が必須。
 - expert 融合（60→5 launch/層）は +0.55%。launch 削減は上限近く。
 - 出力ヘッドは 189 GiB/s で帯域律速。最適化対象ではない。
+
+## 2026-10-14 19:50 時点の状態
+
+Colab のセッション回収が頻繁に起きている。現在の生存セッション:
+
+| セッション | GPU | 状態 |
+|---|---|---|
+| warpdecode-a100 | A100 40GB | 再作成済み・モデルDL中 |
+| warpdecode-l4b | L4 24GB | 生存 |
+
+warpdecode-l4 / l4f / t4 は回収された。再作成のたびに 85.9GB のモデルDLが必要（約5分）。
+
+### 共有ツリーのビルドが壊れた件（修正済み）
+- `src/qwen38_forward.cuh:2175` が `q38_hc_f32_inject_enabled`（正しくは `qwen38_hc_f32_inject_enabled`）を
+  参照しており nvcc が停止していた。typo を修正し、構文検査 PASS（307 launch 箇所）。
+- 教訓: **サブエージェントは編集前に必ず共有ツリーがビルドできるか確認する**こと。
+  壊れている場合は `git stash` ではなく、自分の変更だけを凍結ツリー（`WARODECODE_SOURCE_DIR`）で試す。
+
+### Task I の parity リスク（要注意）
+- `WARODECODE_MTP=1 + MTP_BATCH_VERIFY=1 + MOE_BATCH_K=4` の実行で **matched_prefix=41**（64/64 でない）。
+  バッチ verify が MoE の数値を変えている疑い。既定スイッチは OFF のままだが、
+  ON にする前に必ず原因を特定して 64/64 に戻すこと。

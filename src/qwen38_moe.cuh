@@ -2201,6 +2201,17 @@ public:
     // every base is checked for the 2-byte alignment the IQ4_NL decoder needs
     // and for the type the dispatcher was built for, so run() can re-check the
     // whole batch and fall back to the serial loop on any mismatch.
+    // Pins the expert a pair belongs to when the caller already ran the router
+    // (the batch's own preselected path). Used by the device bench to compare a
+    // fixed per-token expert list against the serial runner.
+    void set_pair_experts(int pair, int expert, const std::vector<float> & weights_by_pair) {
+        if (pair < 0 || pair >= kMoeBatchTokenMax * kLowBitExpertBatchMax) {
+            throw std::runtime_error("MoE token batch pair index out of range");
+        }
+        set_pair_experts_[pair] = expert;
+        if (weights_ != nullptr) weights_[pair] = weights_by_pair[static_cast<size_t>(pair)];
+    }
+
     // One pair's weight pointers. Whether the batch is still runnable after the
     // acquire loop is decided by resolved(true), which uses these pointers.
     void set_pair_weights(
@@ -2345,6 +2356,19 @@ public:
         if (cuda_error != cudaSuccess) {
             throw std::runtime_error(std::string("MoE token batch upload failed: ") +
                                      cudaGetErrorString(cuda_error));
+        }
+
+        // The weighted-sum kernel folds the k expert products INTO the
+        // accumulation buffer, so it has to start from zero - the serial runner
+        // does the same with a cudaMemsetAsync on d_accum() before its loop.
+        // Skipping this reads whatever the previous layer left in the workspace.
+        {
+            const cudaError_t zero = cudaMemsetAsync(
+                accum, 0, static_cast<size_t>(tokens_) * static_cast<size_t>(hidden) * sizeof(float), stream);
+            if (zero != cudaSuccess) {
+                throw std::runtime_error(std::string("MoE token batch zero accumulation failed: ") +
+                                         cudaGetErrorString(zero));
+            }
         }
 
         constexpr int threads = 256;
@@ -2519,6 +2543,7 @@ private:
     std::vector<const float *> activations_;
     int * ids_ = nullptr;
     float * weights_ = nullptr;
+    int set_pair_experts_[kMoeBatchTokenMax * kLowBitExpertBatchMax] = {};
 };
 
 // ---------------------------------------------------------------------------
