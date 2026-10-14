@@ -1434,3 +1434,49 @@ exact attention カーネルの追加コストで 3.78 → 3.20 tok/s になっ�
 8. MoE 出力の F32 経路（共有エキスパートの half ミラー排除）
 9. QSA attention の CPU 順（max 先行 → 全要素 exp → double 行和 → 確率の F16 丸め → 4×8 アキュムレータ）
 10. **スコアドットの q の F16 丸め** ← 最後の決定打
+
+
+---
+
+# 追記 25 (2026-10-14 夕): A100 / L4 実測と MTP の実装状況
+
+## 33.1 A100 計測（モデル: Qwen3.8-Flash-Next-IQ3E-Q8D-MTP, 64トークン, ctx=128）
+
+| GPU | expert cache | 速度 | parity |
+|---|---|---|---|
+| L4 (24GB) | 1536 MiB (既定) | 3.195 tok/s | 64/64 |
+| **L4** | **8000 MiB** | **3.893 tok/s** | 64/64 |
+| L4 | 18000 MiB | VRAM 不足で起動不可 | — |
+| A100-SXM4-40GB | 1536 MiB (既定) | **1.084 tok/s** | 64/64 |
+| A100-SXM4-40GB | 20000 MiB | 3.512 tok/s | 64/64 |
+| **A100-SXM4-40GB** | **30000 MiB** | **3.517 tok/s** | 64/64 |
+
+**わかったこと**:
+- A100 は**既定の expert cache (1536 MiB) だと L4 より遅い** (1.08 tok/s)。86GB のモデルを
+  40GB の VRAM に載せるため、専門家の読み込みがディスク I/O 律速になる。
+- cache を 20〜30GB にすると 3.5 tok/s まで回復し、9002〜13503 スロットで頭打ち（作業集合が収まる）。
+- それでも L4 の 8GB 構成 (3.893) をわずかに下回る。これは **sm80 の Tensor Core カーネルが未実装**で、
+  A100 でも共通カーネルが走るため（`target kernel plan: decode=int4/int8-tensorcore` は計画値で、
+  実装は Q4_0 SIMT 共通カーネルが基準）。A100 の実力は DP4A/Tensor Core 実装後に出る。
+- **全構成で 64/64 一致**（アーキテクチャを変えても parity が保たれることを確認）。
+
+## 33.2 MTP（multi-token prediction）の実装状況
+
+**投機実行は未実装**。`"mtp":false` は JSON 出力にハードコードされており、
+以下は用意されているが**実行経路がない**:
+- `src/qwen38_layout.hpp`: `is_mtp()`, `mtp_layers`（GGUF の `nextn_predict_layers` を読む）
+- `src/model_profile.hpp`: `mtp_path = "adaptive-mtp2-4+M2/M4-verify"`（TUI の計画表示用の文字列）
+- `src/qwen38_tuning.hpp`: `mtp_draft_candidates{2,3,4}` と報酬 EWMA（使われていない）
+
+そのため「MTP でどれだけ速くなったか」の**実測値は存在しない**。
+実装する場合の作業: (1) MTP ブロック (blk.48) の forward、(2) draft→verify ループ、
+(3) 受理判定、(4) それらを parity 検証と組み合わせる、の4段。
+設計上の期待値は draft 2〜4 で受理率 2 トークン/ステップ前後なら 1.5〜2.5倍だが、**未検証**。
+
+## 33.3 公開準備
+
+- README に Issue #1 の結果（64/64、速度、効いた修正の一覧、再現方法）を追記
+- `.gitignore` に検証用ローカル成果物（`issue1_artifacts/`, `.serena/`, `.venv/`, zip, webp）を追加
+- nvcc 不要の CUDA 構文検査 (`tests/qwen38_cuda_syntax_check.sh`) を CI (`tests/host_checks.sh`) に登録 → PASS 確認
+- ホスト検証ハーネス群（rope / router / shexp gate / exact math）を `tests/` に収録
+- コミット `8bcc64b`（push は未実施）

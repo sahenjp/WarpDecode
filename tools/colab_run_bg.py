@@ -21,7 +21,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CLI = ["rtk", "uvx", "--from", "google-colab-cli", "colab", "--auth=oauth2"]
 SESSION = os.environ.get("WARODECODE_COLAB_SESSION", "warpdecode-l4")
 MODEL = "/content/models/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf"
-ENGINE = "/content/warodecode/build-sm89/warodecode"
+ARCH = os.environ.get("WARODECODE_COLAB_ARCH", "89")
+ENGINE = "/content/warodecode/build-sm%s/warodecode" % ARCH
 REFERENCE_SHA256 = "2bb72a88252610cf9ec75b14aefe6dfda1e99d9639ff625c9e967cfeab253b60"
 
 STARTER = '''import subprocess, pathlib, zipfile
@@ -29,10 +30,10 @@ zipfile.ZipFile("/content/warodecode-source.zip").extractall("/content/warodecod
 script = pathlib.Path("/content/run_bg.sh")
 script.write_text("""#!/bin/bash
 cd /content/warodecode
-if [ ! -d build-sm89 ]; then
-  cmake -S . -B build-sm89 -DCMAKE_BUILD_TYPE=Release -DWARODECODE_BUILD_ENGINE=ON -DCMAKE_CUDA_ARCHITECTURES=89 > /content/build_bg.log 2>&1
+if [ ! -d build-sm__ARCH__ ]; then
+  cmake -S . -B build-sm__ARCH__ -DCMAKE_BUILD_TYPE=Release -DWARODECODE_BUILD_ENGINE=ON -DCMAKE_CUDA_ARCHITECTURES=__ARCH__ > /content/build_bg.log 2>&1
 fi
-cmake --build build-sm89 -j4 --target warodecode >> /content/build_bg.log 2>&1
+cmake --build build-sm__ARCH__ -j4 --target warodecode >> /content/build_bg.log 2>&1
 BUILD_EXIT=$?
 echo BUILD_EXIT=$BUILD_EXIT >> /content/build_bg.log
 if [ "$BUILD_EXIT" -ne 0 ]; then
@@ -134,7 +135,8 @@ def main() -> None:
         run(CLI + ["upload", "-s", SESSION, str(archive), "/content/warodecode-source.zip"])
 
         starter = tmp_path / "start.py"
-        starter.write_text(STARTER.replace("__ENGINE_CMD__", cmd_line))
+        starter.write_text(
+            STARTER.replace("__ENGINE_CMD__", cmd_line).replace("__ARCH__", ARCH))
         print("+ start VM background run", flush=True)
         run(CLI + ["exec", "-s", SESSION, "--timeout", "600", "-f", str(starter)])
 
