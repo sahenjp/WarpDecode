@@ -1921,6 +1921,16 @@ int main(int argc, char** argv) {
             std::cerr << "expert-cache=" << qrt.tuning.expert_cache_mib
                       << " MiB slots=" << qrt.expert_cache_slots
                       << " fused=" << (qrt.fused_experts ? "true" : "false") << "\n";
+            if (qrt.cpu_moe) {
+                std::cerr << "cpu-moe=on layers=" << qrt.cpu_moe_layers << "/"
+                          << qrt.layout.trunk_layers
+                          << " threads=" << wd::cpu_moe::thread_count()
+                          << " (WARODECODE_CPU_MOE="
+                          << (wd::cpu_moe::env_flag("WARODECODE_CPU_MOE", false) ? 1 : 0)
+                          << ")\n";
+            } else {
+                std::cerr << "cpu-moe=off\n";
+            }
             const bool head_q8_k = wd::lowbit_q6_k_head_q8_k_eligible(qrt.output);
             std::cerr << "output-head q8_k=" << (head_q8_k ? "on" : "off")
                       << " (WARODECODE_HEAD_Q8_K="

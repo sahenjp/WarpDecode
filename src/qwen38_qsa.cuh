@@ -1815,10 +1815,9 @@ inline void q38_qsa_exact_q8_0_project(
         __half * output,
         cudaStream_t stream) {
     constexpr int threads = 256;
-    constexpr int warps = threads / 32;
-    q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(w.rows + warps - 1) / warps, threads, 0, stream>>>(
+    q38_hc_launch_exact_q8_0_gemv_f32(
         w.low.data, scratch.act_q8(), scratch.act_scales(), scratch.gemv_f32(),
-        w.rows, w.cols);
+        w.rows, w.cols, stream);
     q38_hc_copy_f32_to_half_kernel<<<(w.rows + threads - 1) / threads, threads, 0, stream>>>(
         scratch.gemv_f32(), output, w.rows);
 }
@@ -1907,10 +1906,8 @@ inline void q38_qsa_exact_q8_0_project_f32(
         const Qwen38QsaScratch & scratch,
         float * output,
         cudaStream_t stream) {
-    constexpr int threads = 256;
-    constexpr int warps = threads / 32;
-    q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(w.rows + warps - 1) / warps, threads, 0, stream>>>(
-        w.low.data, scratch.act_q8(), scratch.act_scales(), output, w.rows, w.cols);
+    q38_hc_launch_exact_q8_0_gemv_f32(
+        w.low.data, scratch.act_q8(), scratch.act_scales(), output, w.rows, w.cols, stream);
 }
 
 inline void q38_qsa_dense_f32_project_f32(
@@ -2013,6 +2010,9 @@ inline __half * q38_qsa_run_f32_mid(
     const int threads = 256;
     const Qwen38Layout index_rope = q38_qsa_index_rope_layout(q);
 
+    // Task P: outer bracket of one QSA layer (see the GDN twin above).
+    Q38AttnKernelScope qsa_region_scope(kQ38AttnSiteQsaRegion, stream);
+
     // Same guard as the legacy branch: the Q8_0 activation scratch has to cover
     // the widest activation (the hidden row) and the widest projection output.
     if (exact_q8_0) {
@@ -2037,17 +2037,20 @@ inline __half * q38_qsa_run_f32_mid(
     // picks the representation per weight: Q8_0 quantises the F32 activation, a
     // float weight multiplies it as is. An F32 caller is copied bit-exactly (no
     // rounding anywhere); the F16 entry hands its own row, which widens exactly.
-    if (x_f32 != nullptr) {
-        if (x_f32 != scratch.act_f32()) {
-            const cudaError_t e = cudaMemcpyAsync(scratch.act_f32(), x_f32,
-                static_cast<size_t>(q.hidden) * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            if (e != cudaSuccess) throw std::runtime_error("QSA F32 activation staging failed");
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaStage, stream);
+        if (x_f32 != nullptr) {
+            if (x_f32 != scratch.act_f32()) {
+                const cudaError_t e = cudaMemcpyAsync(scratch.act_f32(), x_f32,
+                    static_cast<size_t>(q.hidden) * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+                if (e != cudaSuccess) throw std::runtime_error("QSA F32 activation staging failed");
+            }
+        } else {
+            q38_qsa_widen_half(x_half, scratch.act_f32(), q.hidden, stream);
         }
-    } else {
-        q38_qsa_widen_half(x_half, scratch.act_f32(), q.hidden, stream);
-    }
-    if (path_q == 0 || path_k == 0 || path_v == 0) {
-        q38_qsa_exact_q8_0_quantize_f32(scratch.act_f32(), q.hidden, scratch, stream);
+        if (path_q == 0 || path_k == 0 || path_v == 0) {
+            q38_qsa_exact_q8_0_quantize_f32(scratch.act_f32(), q.hidden, scratch, stream);
+        }
     }
 
     // The legacy __half GEMV fallbacks read an F16 activation row. An F16 caller
@@ -2074,30 +2077,48 @@ inline __half * q38_qsa_run_f32_mid(
             q38_qsa_widen_half(staging, output, rows, stream);
         }
     };
-    project_core(w.q, path_q, q_full_n, scratch.q_full_f32(), scratch.q_full());
-    project_core(w.k, path_k, kv_n, scratch.k_f32(), scratch.k());
-    project_core(w.v, path_v, q.kv_heads * q.value_length, scratch.v_f32(), scratch.v());
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaQkv, stream);
+        project_core(w.q, path_q, q_full_n, scratch.q_full_f32(), scratch.q_full());
+        project_core(w.k, path_k, kv_n, scratch.k_f32(), scratch.k());
+        project_core(w.v, path_v, q.kv_heads * q.value_length, scratch.v_f32(), scratch.v());
+    }
 
-    q38_qsa_extract_q_gate_f32_kernel<<<(q_n + threads - 1) / threads, threads, 0, stream>>>(
-        scratch.q_full_f32(), scratch.q_f32(), scratch.gate_f32(), head_dim, q.heads);
-    q38_qsa_mirror_half(scratch.gate_f32(), scratch.gate(), q_n, stream);
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaExtract, stream);
+        q38_qsa_extract_q_gate_f32_kernel<<<(q_n + threads - 1) / threads, threads, 0, stream>>>(
+            scratch.q_full_f32(), scratch.q_f32(), scratch.gate_f32(), head_dim, q.heads);
+        q38_qsa_mirror_half(scratch.gate_f32(), scratch.gate(), q_n, stream);
+    }
 
-    q38_qsa_launch_norm_heads_f32(
-        scratch.q_f32(), w.q_norm_f32.data, w.q_norm.data,
-        head_dim, q.heads, q.rms_eps, stream);
-    q38_qsa_launch_norm_heads_f32(
-        scratch.k_f32(), w.k_norm_f32.data, w.k_norm.data,
-        head_dim, q.kv_heads, q.rms_eps, stream);
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaNorm, stream);
+        q38_qsa_launch_norm_heads_f32(
+            scratch.q_f32(), w.q_norm_f32.data, w.q_norm.data,
+            head_dim, q.heads, q.rms_eps, stream);
+        q38_qsa_launch_norm_heads_f32(
+            scratch.k_f32(), w.k_norm_f32.data, w.k_norm.data,
+            head_dim, q.kv_heads, q.rms_eps, stream);
+    }
 
-    q38_qsa_launch_imrope_f32(scratch.q_f32(), head_dim, q.heads, position, q, stream);
-    q38_qsa_launch_imrope_f32(scratch.k_f32(), head_dim, q.kv_heads, position, q, stream);
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaImrope, stream);
+        q38_qsa_launch_imrope_f32(scratch.q_f32(), head_dim, q.heads, position, q, stream);
+        q38_qsa_launch_imrope_f32(scratch.k_f32(), head_dim, q.kv_heads, position, q, stream);
+    }
 
     // Mirrors are written once a value is final, so the layer*.qsa.* trace keeps
     // reporting the values the attention actually consumes.
-    q38_qsa_mirror_half(scratch.q_f32(), scratch.q(), q_n, stream);
-    q38_qsa_mirror_half(scratch.k_f32(), scratch.k(), kv_n, stream);
-    q38_qsa_mirror_half(scratch.v_f32(), scratch.v(), kv_n, stream);
-    q38_qsa_store_kv(state, scratch, q, pos, stream);
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaMirror, stream);
+        q38_qsa_mirror_half(scratch.q_f32(), scratch.q(), q_n, stream);
+        q38_qsa_mirror_half(scratch.k_f32(), scratch.k(), kv_n, stream);
+        q38_qsa_mirror_half(scratch.v_f32(), scratch.v(), kv_n, stream);
+    }
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaStoreKv, stream);
+        q38_qsa_store_kv(state, scratch, q, pos, stream);
+    }
 
     // Both indexer projections consume the same activation row, so its exact
     // representation (Q8_0 for a quantised indexer, BF16-rounded F32 otherwise) is
@@ -2129,12 +2150,16 @@ inline __half * q38_qsa_run_f32_mid(
     // Raw index keys are cached in F32 exactly as projected. Pooling + norm +
     // IMRoPE happens once when a block becomes complete.
     float * idx_k_store = state.index_raw_f32() + static_cast<size_t>(pos) * idx_dim;
-    project_index_f32(w.index_k, idx_k_store, scratch.idx_k(), exact_index_k, index_k_f32);
-    q38_qsa_mirror_half(
-        idx_k_store, state.index_raw() + static_cast<size_t>(pos) * idx_dim, idx_dim, stream);
-    q38_qsa_mirror_half(idx_k_store, scratch.idx_k(), idx_dim, stream);
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaIndexK, stream);
+        project_index_f32(w.index_k, idx_k_store, scratch.idx_k(), exact_index_k, index_k_f32);
+        q38_qsa_mirror_half(
+            idx_k_store, state.index_raw() + static_cast<size_t>(pos) * idx_dim, idx_dim, stream);
+        q38_qsa_mirror_half(idx_k_store, scratch.idx_k(), idx_dim, stream);
+    }
 
     if ((pos + 1) % ratio == 0) {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaPool, stream);
         const int block_id = pos / ratio;
         float * pooled = state.index_block_f32() + static_cast<size_t>(block_id) * idx_dim;
         q38_qsa_launch_pool_block_f32(
@@ -2154,25 +2179,35 @@ inline __half * q38_qsa_run_f32_mid(
     const int * selected_ids = state.ids();
 
     if (full_blocks > block_budget) {
-        project_index_f32(w.index_q, scratch.idx_q_f32(), scratch.idx_q(), exact_index_q, index_q_f32);
-        q38_qsa_launch_norm_heads_f32(
-            scratch.idx_q_f32(), w.index_q_norm_f32.data, w.index_q_norm.data,
-            idx_dim, q.indexer_heads, q.rms_eps, stream);
-        q38_qsa_launch_imrope_f32(
-            scratch.idx_q_f32(), idx_dim, q.indexer_heads,
-            position, index_rope, stream);
-        q38_qsa_mirror_half(scratch.idx_q_f32(), scratch.idx_q(), idx_q_n, stream);
+        {
+            Q38AttnKernelScope scope(kQ38AttnSiteQsaIndexQ, stream);
+            project_index_f32(w.index_q, scratch.idx_q_f32(), scratch.idx_q(), exact_index_q, index_q_f32);
+            q38_qsa_launch_norm_heads_f32(
+                scratch.idx_q_f32(), w.index_q_norm_f32.data, w.index_q_norm.data,
+                idx_dim, q.indexer_heads, q.rms_eps, stream);
+            q38_qsa_launch_imrope_f32(
+                scratch.idx_q_f32(), idx_dim, q.indexer_heads,
+                position, index_rope, stream);
+            q38_qsa_mirror_half(scratch.idx_q_f32(), scratch.idx_q(), idx_q_n, stream);
+        }
 
-        q38_qsa_score_blocks_f32_kernel<<<full_blocks, 256, 0, stream>>>(
-            scratch.idx_q_f32(), state.index_block_f32(), state.scores(),
-            full_blocks, idx_dim, q.indexer_heads);
+        {
+            Q38AttnKernelScope scope(kQ38AttnSiteQsaScore, stream);
+            q38_qsa_score_blocks_f32_kernel<<<full_blocks, 256, 0, stream>>>(
+                scratch.idx_q_f32(), state.index_block_f32(), state.scores(),
+                full_blocks, idx_dim, q.indexer_heads);
+        }
 
         size_t sort_temp_bytes = state.sort_temp_bytes();
-        const cudaError_t sort_error = cub::DeviceRadixSort::SortPairsDescending(
-            state.sort_temp(), sort_temp_bytes,
-            state.scores(), state.scores_sorted(),
-            state.ids(), state.ids_sorted(),
-            full_blocks, 0, 32, stream);
+        cudaError_t sort_error = cudaSuccess;
+        {
+            Q38AttnKernelScope scope(kQ38AttnSiteQsaSort, stream);
+            sort_error = cub::DeviceRadixSort::SortPairsDescending(
+                state.sort_temp(), sort_temp_bytes,
+                state.scores(), state.scores_sorted(),
+                state.ids(), state.ids_sorted(),
+                full_blocks, 0, 32, stream);
+        }
         if (sort_error != cudaSuccess) {
             throw std::runtime_error(std::string("QSA block sort failed: ") + cudaGetErrorString(sort_error));
         }
@@ -2188,37 +2223,46 @@ inline __half * q38_qsa_run_f32_mid(
     // shared arrays cannot hold (indexer_top_k + ratio > Q38_QSA_EXACT_MAX_VISIBLE).
     const int tail_tokens = pos >= tail_start ? pos - tail_start + 1 : 0;
     const int visible_tokens = selected_blocks * ratio + tail_tokens;
-    if (q38_qsa_exact_softmax_enabled() &&
-        visible_tokens <= Q38_QSA_EXACT_MAX_VISIBLE &&
-        selected_blocks <= Q38_QSA_EXACT_MAX_BLOCKS) {
-        q38_qsa_sparse_attention_exact_f32_kernel<<<q.heads, 256, 0, stream>>>(
-            scratch.q_f32(), scratch.gate_f32(),
-            state.k_cache(), state.v_cache(),
-            selected_ids, scratch.attn_f32(), pre_gate_trace,
-            selected_blocks, ratio, tail_start, pos, state.max_ctx(),
-            q.heads, q.kv_heads, head_dim, scale);
-    } else {
-        q38_qsa_sparse_attention_f32_kernel<<<q.heads, 256, 0, stream>>>(
-            scratch.q_f32(), scratch.gate_f32(),
-            state.k_cache(), state.v_cache(),
-            selected_ids, scratch.attn_f32(), pre_gate_trace,
-            selected_blocks, ratio, tail_start, pos,
-            q.heads, q.kv_heads, head_dim, scale);
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaSparse, stream);
+        if (q38_qsa_exact_softmax_enabled() &&
+            visible_tokens <= Q38_QSA_EXACT_MAX_VISIBLE &&
+            selected_blocks <= Q38_QSA_EXACT_MAX_BLOCKS) {
+            q38_qsa_sparse_attention_exact_f32_kernel<<<q.heads, 256, 0, stream>>>(
+                scratch.q_f32(), scratch.gate_f32(),
+                state.k_cache(), state.v_cache(),
+                selected_ids, scratch.attn_f32(), pre_gate_trace,
+                selected_blocks, ratio, tail_start, pos, state.max_ctx(),
+                q.heads, q.kv_heads, head_dim, scale);
+        } else {
+            q38_qsa_sparse_attention_f32_kernel<<<q.heads, 256, 0, stream>>>(
+                scratch.q_f32(), scratch.gate_f32(),
+                state.k_cache(), state.v_cache(),
+                selected_ids, scratch.attn_f32(), pre_gate_trace,
+                selected_blocks, ratio, tail_start, pos,
+                q.heads, q.kv_heads, head_dim, scale);
+        }
+        q38_qsa_mirror_half(scratch.attn_f32(), scratch.attn(), q_n, stream);
     }
-    q38_qsa_mirror_half(scratch.attn_f32(), scratch.attn(), q_n, stream);
 
-    if (exact_q8_0) {
-        // The CPU quantises the F32 attention output for the Q8_0 output
-        // projection, so the quantiser reads the F32 buffer directly.
-        q38_qsa_exact_q8_0_quantize_f32(scratch.attn_f32(), w.out.cols, scratch, stream);
-        q38_qsa_exact_q8_0_project_f32(w.out, scratch, scratch.final_f32(), stream);
-    } else if (q38_qsa_dense_f32_matrix_ok(w.out, q.hidden, q_n)) {
-        launch_matrix_gemv_f32_input(w.out, scratch.attn_f32(), scratch.final_f32(), stream, threads);
-    } else {
-        launch_matrix_gemv_half(w.out, scratch.attn(), scratch.final(), stream);
-        q38_qsa_widen_half(scratch.final(), scratch.final_f32(), q.hidden, stream);
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteQsaOut, stream);
+        if (exact_q8_0) {
+            // The CPU quantises the F32 attention output for the Q8_0 output
+            // projection, so the quantiser reads the F32 buffer directly.
+            {
+                Q38AttnKernelScope quant_scope(kQ38AttnSiteQsaOutQuant, stream);
+                q38_qsa_exact_q8_0_quantize_f32(scratch.attn_f32(), w.out.cols, scratch, stream);
+            }
+            q38_qsa_exact_q8_0_project_f32(w.out, scratch, scratch.final_f32(), stream);
+        } else if (q38_qsa_dense_f32_matrix_ok(w.out, q.hidden, q_n)) {
+            launch_matrix_gemv_f32_input(w.out, scratch.attn_f32(), scratch.final_f32(), stream, threads);
+        } else {
+            launch_matrix_gemv_half(w.out, scratch.attn(), scratch.final(), stream);
+            q38_qsa_widen_half(scratch.final(), scratch.final_f32(), q.hidden, stream);
+        }
+        q38_qsa_mirror_half(scratch.final_f32(), scratch.final(), q.hidden, stream);
     }
-    q38_qsa_mirror_half(scratch.final_f32(), scratch.final(), q.hidden, stream);
     return scratch.final();
 }
 

@@ -371,24 +371,32 @@ __global__ void q38_hc_q8_0_quantize_f32_exact_kernel(
     if (lane == 0) scales[block] = __float2half_rn(d);
 }
 
-// Task J: __dp4a form of the exact Q8_0 x Q8_0 row dot, used for the wide HC
-// down projection (rows = low_rank = 320, cols = hc_dim = 40960).
+// Task P: __dp4a form of the exact Q8_0 x Q8_0 row dot that keeps the
+// reference's F32 accumulation order.
 //
-// The reference kernel walks one 32-value block at a time with a five-step
-// shuffle reduction, so the HC down GEMV performs 1280 reductions per row and
-// reads its 13.9 MB of weights at 34 GB/s on L4 (410 us per call, the single
-// most expensive kernel of the whole HC mix).
+// The Task J attempt (four blocks in flight, one lane-0 float chain over the
+// blocks) was 6.2x faster on L4 but not bit-exact: it summed the eight 4-value
+// chunks of a block in *integer* space - which is exact - and then ran a single
+// float chain over the block totals, while the reference runs eight independent
+// float chains (one per chunk) and only combines them in a tree at the end.
+// Integer addition may be reassociated; float addition may not. That, not the
+// block-scale arithmetic, is what moved token 41 of the A/B run.
 //
-// This variant keeps the arithmetic bit-identical:
-//   * one __dp4a per four values reproduces the integer dot exactly (integer
-//     addition is associative and the products cannot overflow int32), and
-//   * four blocks are in flight at once - an 8-lane group per block - so the
-//     reduction is three shuffles for four blocks instead of twenty, and
-//   * lane 0 still applies "sum += scale * dot" on the four blocks in
-//     increasing block order, so the F32 accumulation sequence is unchanged.
-// The 34-byte Q8_0 blocks place the quants at offset 2, so the four weight
-// bytes are assembled from two 2-byte-aligned uint16_t loads (the same trick
-// lowbit.cuh uses for IQ4_NL).
+// This kernel keeps the reference's float order exactly:
+//   * lane c in 0..7 owns 4-value chunk c of every 32-value block and carries
+//     the same accumulator = __fmaf_rn(scale_b, dot_c_b, accumulator) chain over
+//     b = 0, 1, ... blocks_per_row-1,
+//   * dot_c_b is one __dp4a of that chunk. The reference's two int16-saturating
+//     pair sums cannot saturate (2 * 127 * 127 = 32258 < 32767) and every Q8_0
+//     or Q8_1 quantised activation is in [-127, 127], so the -128 corner of
+//     q38_hc_q8_0_sign_i8() is unreachable and the integer values are equal,
+//   * the closing tree is the reference's: ((a4+a0)+(a6+a2)) + ((a5+a1)+(a7+a3)).
+// Only the loads and the multiply-accumulates change: one unaligned 4-byte
+// weight load replaces four int8 loads (the 34-byte block puts its quants at
+// offset 2, so the chunk is 4-byte aligned inside the block), one unaligned int
+// activation load replaces four more, and the four integer products become a
+// single instruction. The loop is unrolled so the independent loads can be
+// issued ahead of the serial FMA chain.
 __global__ void q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_kernel(
         const uint8_t * __restrict__ weight,
         const int8_t * __restrict__ activation,
@@ -405,54 +413,45 @@ __global__ void q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_kernel(
     const int blocks_per_row = cols >> 5;
     const uint8_t * row_ptr =
         weight + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) * 34u;
-    const int group = lane >> 3;   // which of the four blocks in flight
-    const int sub = lane & 7;      // which four-value chunk of that block
+    float accumulator = 0.0f;
+    if (lane < 8) {
+        const int base = lane << 2;   // this lane's four-value chunk of the block
+#pragma unroll 4
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t * block = row_ptr + static_cast<size_t>(b) * 34u;
+            // Two 2-byte loads, not one 4-byte load: the 34-byte block stride
+            // makes the 4-byte chunk address only 2-byte aligned for an odd
+            // blocks_per_row (cols = 32 * odd), and an unaligned LDG.E.32 is an
+            // Xid 13 fault on this hardware. The byte order is irrelevant here,
+            // the dot product is symmetric.
+            const uint16_t * w16 = reinterpret_cast<const uint16_t *>(block + 2 + base);
+            const unsigned packed =
+                static_cast<unsigned>(w16[0]) | (static_cast<unsigned>(w16[1]) << 16);
+            const int act = *reinterpret_cast<const int *>(
+                activation + static_cast<size_t>(b) * 32u + static_cast<size_t>(base));
+            const int dot = lowbit_dp4a(act, static_cast<int>(packed), 0);
+            const float weight_scale = lowbit_half(block);
+            const float activation_scale = __half2float(activation_scales[b]);
+            const float scale = __fmul_rn(weight_scale, activation_scale);
+            accumulator = __fmaf_rn(scale, static_cast<float>(dot), accumulator);
+        }
+    }
 
-    float sum = 0.0f;
-    int b = 0;
-    for (; b + 4 <= blocks_per_row; b += 4) {
-        const int index = b + group;
-        const uint8_t * blk = row_ptr + static_cast<size_t>(index) * 34u;
-        const uint8_t * qs = blk + 2 + (sub << 2);
-        const unsigned packed =
-            static_cast<unsigned>(*reinterpret_cast<const uint16_t *>(qs)) |
-            (static_cast<unsigned>(*reinterpret_cast<const uint16_t *>(qs + 2)) << 16);
-        const int act = *reinterpret_cast<const int *>(
-            activation + static_cast<size_t>(index) * 32u + static_cast<size_t>(sub) * 4u);
-        int dot = lowbit_dp4a(act, static_cast<int>(packed), 0);
-        dot += __shfl_down_sync(0xffffffffu, dot, 4);
-        dot += __shfl_down_sync(0xffffffffu, dot, 2);
-        dot += __shfl_down_sync(0xffffffffu, dot, 1);
-        const int d0 = __shfl_sync(0xffffffffu, dot, 0);
-        const int d1 = __shfl_sync(0xffffffffu, dot, 8);
-        const int d2 = __shfl_sync(0xffffffffu, dot, 16);
-        const int d3 = __shfl_sync(0xffffffffu, dot, 24);
-        if (lane == 0) {
-            const uint8_t * p = row_ptr + static_cast<size_t>(b) * 34u;
-            const float s0 = lowbit_half(p) * __half2float(activation_scales[b]);
-            sum += s0 * static_cast<float>(d0);
-            const float s1 = lowbit_half(p + 34) * __half2float(activation_scales[b + 1]);
-            sum += s1 * static_cast<float>(d1);
-            const float s2 = lowbit_half(p + 68) * __half2float(activation_scales[b + 2]);
-            sum += s2 * static_cast<float>(d2);
-            const float s3 = lowbit_half(p + 102) * __half2float(activation_scales[b + 3]);
-            sum += s3 * static_cast<float>(d3);
-        }
-    }
-    for (; b < blocks_per_row; ++b) {
-        const uint8_t * blk = row_ptr + static_cast<size_t>(b) * 34u;
-        const int8_t qw = *reinterpret_cast<const int8_t *>(blk + 2 + lane);
-        int dot = static_cast<int>(qw) * static_cast<int>(activation[(b << 5) + lane]);
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            dot += __shfl_down_sync(0xffffffffu, dot, offset);
-        }
-        if (lane == 0) {
-            const float scale = lowbit_half(blk) * __half2float(activation_scales[b]);
-            sum += scale * static_cast<float>(dot);
-        }
-    }
-    if (lane == 0) output[row] = sum;
+    const float a0 = __shfl_sync(0xffffffffu, accumulator, 0);
+    const float a1 = __shfl_sync(0xffffffffu, accumulator, 1);
+    const float a2 = __shfl_sync(0xffffffffu, accumulator, 2);
+    const float a3 = __shfl_sync(0xffffffffu, accumulator, 3);
+    const float a4 = __shfl_sync(0xffffffffu, accumulator, 4);
+    const float a5 = __shfl_sync(0xffffffffu, accumulator, 5);
+    const float a6 = __shfl_sync(0xffffffffu, accumulator, 6);
+    const float a7 = __shfl_sync(0xffffffffu, accumulator, 7);
+    const float r0 = __fadd_rn(a4, a0);
+    const float r1 = __fadd_rn(a5, a1);
+    const float r2 = __fadd_rn(a6, a2);
+    const float r3 = __fadd_rn(a7, a3);
+    const float s0 = __fadd_rn(r0, r2);
+    const float s1 = __fadd_rn(r1, r3);
+    if (lane == 0) output[row] = __fadd_rn(s0, s1);
 }
 
 __global__ void q38_hc_q8_0_q8_0_exact_gemv_f32_kernel(
@@ -839,29 +838,31 @@ __global__ void q38_hc_dense_gemv_f32_kernel(
 // q38_hc_dense_gemv_f32_kernel() sums lane-strided with a shfl_down tree
 // instead, which is a different summation order and therefore different bits.
 // This switch selects the oracle order; =0 restores the warp order for A/B.
-// Task J (WARODECODE_HC_Q8_DOWN_DP4A, **default OFF**; also requires sm_80+ and
-// WARODECODE_DP4A=1). Selects the 4-blocks-in-flight __dp4a form of the exact
-// Q8_0 x Q8_0 dot for the wide HC down projection.
+// Task P (WARODECODE_Q8_DP4A_GEMV, **default ON** after the A100 A/B; also
+// requires WARODECODE_DP4A=1 and sm_80+). Selects the __dp4a form of the exact
+// Q8_0 x Q8_0 dot for every width: the HC down projection (320 x 40960), the HC
+// up projection (40960 x 320) and the GDN/QSA Q8_0 projections (qkv / z /
+// ssm_out / q / k / v / out / index) that share the same kernel.
 //
-// NEGATIVE RESULT: this path is 6.2x faster on L4 (410.6 -> ~66 us per site)
-// and 11.2 ms/token faster on A100, but it is NOT bit-exact. With it enabled the
-// greedy chain diverges from the CPU oracle at token 41 of 64; with every other
-// Task J switch on and only this one off the run is 64/64 again
-// (tests/hc_mix_ab.py --plan=bisect, A100, 2026-10-14). The integer dot is
-// provably order-independent, so the divergence has to sit in the float
-// accumulation of the four block scales - keep the flag off until that is
-// resolved and re-verified. =1 opts in for experiments only.
+// Task J's earlier dp4a kernel (WARODECODE_HC_Q8_DOWN_DP4A) was 6.2x faster but
+// not bit-exact because it summed the eight 4-value chunks of a block in
+// integer space before the float chain; see the kernel comment for the fix and
+// tests/qwen38_hc_dp4a_host_test.cpp for the byte-level equivalence proof.
+// The old switch name is still honoured, and wins when it is set explicitly, so
+// the recorded negative-result A/B stays reproducible.
 inline bool q38_hc_q8_down_dp4a_enabled() {
-    static const bool enabled = q38_hc_env_flag("WARODECODE_HC_Q8_DOWN_DP4A", false) &&
-        lowbit_dp4a_available();
+    static const bool enabled = [] {
+        const char * legacy = std::getenv("WARODECODE_HC_Q8_DOWN_DP4A");
+        const bool requested = (legacy != nullptr && legacy[0] != '\0')
+            ? legacy[0] != '0'
+            : q38_hc_env_flag("WARODECODE_Q8_DP4A_GEMV", true);
+        return requested && lowbit_dp4a_available();
+    }();
     return enabled;
 }
 
-// One-warp-per-row dispatch for the exact Q8_0 x Q8_0 dot. cols is the width of
-// the reduction, so the 4-blocks-in-flight dp4a kernel is selected for the wide
-// HC down projection (cols = hc_dim = 40960) and the reference warp kernel stays
-// for the narrow up projection (cols = low_rank = 320), where ten blocks per row
-// leave no room for four blocks in flight.
+// One-warp-per-row dispatch for the exact Q8_0 x Q8_0 dot. Both kernels below
+// accumulate in the same order, so the switch is a pure speed A/B.
 inline void q38_hc_launch_exact_q8_0_gemv_f32(
         const uint8_t * weight,
         const int8_t * activation,
@@ -873,7 +874,7 @@ inline void q38_hc_launch_exact_q8_0_gemv_f32(
     constexpr int threads = 256;
     constexpr int warps = threads / 32;
     const int blocks = (rows + warps - 1) / warps;
-    if (q38_hc_q8_down_dp4a_enabled() && cols >= 1024 && cols % 32 == 0) {
+    if (q38_hc_q8_down_dp4a_enabled() && cols % 32 == 0) {
         q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_kernel<<<blocks, threads, 0, stream>>>(
             weight, activation, activation_scales, output, rows, cols);
         return;
@@ -1247,7 +1248,18 @@ public:
         // Nested brackets (a wrapper around a helper that also brackets) stay
         // one interval: only the outermost pair records.
         if (depth_[site]++ != 0) return;
-        pending_start_[site] = start_[index(site, 0)];
+        // Task P: one start event per *call*, not one per site. The previous
+        // form recorded every call into slot 0, so a site entered N times per
+        // token produced N-1 negative intervals (they were measured against the
+        // last call's start) and the printed ms/token was meaningless. Per-site
+        // numbers from before this fix must not be compared against newer ones;
+        // the microbench (tests/qwen38_hc_bench.cu --stages) is unaffected.
+        const int slot = written_[site];
+        if (slot >= kCap) {
+            ++overflow_[site];
+            return;
+        }
+        pending_start_[site] = start_[index(site, slot)];
         if (cudaEventRecord(pending_start_[site], stream) != cudaSuccess) {
             pending_start_[site] = nullptr;
         }
@@ -1361,6 +1373,238 @@ public:
 private:
     int base_site_;
     int offset_;
+    cudaStream_t stream_;
+};
+
+// ---------------------------------------------------------------------------
+// Task P: attention-region kernel-level attribution (GDN + QSA).
+//
+// The Task F region number ("attn" = ~44 ms/token on A100) brackets the whole
+// GDN/QSA dispatch with two events, so it cannot say which launch inside the
+// region owns the time. This profiler brackets every launch in the two paths
+// with its own event pair and reports the summed GPU-timeline duration per
+// site, exactly like the Task J HC profiler above.
+//
+// Sites are shared between the two paths where the work is the same kind
+// (Gemv / mirror / quantise), so a reader can compare e.g. gdn.qkv against
+// qsa.qkv. "region_total" is the outer bracket of one layer's attention call
+// and is what the Task F "attn" stage splits into.
+//
+// Enabled by WARODECODE_ATTN_PROFILE=1. With the switch off the class is empty
+// and every hook is one predictable branch, so the default decode path is
+// unchanged bit for bit.
+// ---------------------------------------------------------------------------
+enum Q38AttnSite : int {
+    kQ38AttnSiteGdnRegion = 0,
+    kQ38AttnSiteGdnActQuant,
+    kQ38AttnSiteGdnQkv,
+    kQ38AttnSiteGdnZ,
+    kQ38AttnSiteGdnBeta,
+    kQ38AttnSiteGdnAlpha,
+    kQ38AttnSiteGdnConvAdopt,
+    kQ38AttnSiteGdnConv,
+    kQ38AttnSiteGdnL2Norm,
+    kQ38AttnSiteGdnGateParams,
+    kQ38AttnSiteGdnAr,
+    kQ38AttnSiteGdnNorm,
+    kQ38AttnSiteGdnOutQuant,
+    kQ38AttnSiteGdnOut,
+    kQ38AttnSiteGdnMirror,
+    kQ38AttnSiteGdnOther,
+    kQ38AttnSiteQsaRegion,
+    kQ38AttnSiteQsaStage,
+    kQ38AttnSiteQsaQkv,
+    kQ38AttnSiteQsaExtract,
+    kQ38AttnSiteQsaNorm,
+    kQ38AttnSiteQsaImrope,
+    kQ38AttnSiteQsaMirror,
+    kQ38AttnSiteQsaStoreKv,
+    kQ38AttnSiteQsaIndexK,
+    kQ38AttnSiteQsaPool,
+    kQ38AttnSiteQsaIndexQ,
+    kQ38AttnSiteQsaScore,
+    kQ38AttnSiteQsaSort,
+    kQ38AttnSiteQsaSparse,
+    kQ38AttnSiteQsaOutQuant,
+    kQ38AttnSiteQsaOut,
+    kQ38AttnSiteCount
+};
+
+inline const char * q38_attn_site_name(int site) {
+    switch (site) {
+        case kQ38AttnSiteGdnRegion: return "gdn.region_total";
+        case kQ38AttnSiteGdnActQuant: return "gdn.act_quant";
+        case kQ38AttnSiteGdnQkv: return "gdn.qkv_gemv";
+        case kQ38AttnSiteGdnZ: return "gdn.z_gemv";
+        case kQ38AttnSiteGdnBeta: return "gdn.beta_gemv";
+        case kQ38AttnSiteGdnAlpha: return "gdn.alpha_gemv";
+        case kQ38AttnSiteGdnConvAdopt: return "gdn.conv_adopt";
+        case kQ38AttnSiteGdnConv: return "gdn.conv";
+        case kQ38AttnSiteGdnL2Norm: return "gdn.l2_norm";
+        case kQ38AttnSiteGdnGateParams: return "gdn.gate_params";
+        case kQ38AttnSiteGdnAr: return "gdn.ar";
+        case kQ38AttnSiteGdnNorm: return "gdn.gated_rmsnorm";
+        case kQ38AttnSiteGdnOutQuant: return "gdn.out_quant";
+        case kQ38AttnSiteGdnOut: return "gdn.out_gemv";
+        case kQ38AttnSiteGdnMirror: return "gdn.f16_mirror";
+        case kQ38AttnSiteGdnOther: return "gdn.other";
+        case kQ38AttnSiteQsaRegion: return "qsa.region_total";
+        case kQ38AttnSiteQsaStage: return "qsa.stage_act";
+        case kQ38AttnSiteQsaQkv: return "qsa.qkv_gemv";
+        case kQ38AttnSiteQsaExtract: return "qsa.extract_q_gate";
+        case kQ38AttnSiteQsaNorm: return "qsa.norm_heads";
+        case kQ38AttnSiteQsaImrope: return "qsa.imrope";
+        case kQ38AttnSiteQsaMirror: return "qsa.f16_mirror";
+        case kQ38AttnSiteQsaStoreKv: return "qsa.store_kv";
+        case kQ38AttnSiteQsaIndexK: return "qsa.index_k_gemv";
+        case kQ38AttnSiteQsaPool: return "qsa.pool_block";
+        case kQ38AttnSiteQsaIndexQ: return "qsa.index_q_gemv";
+        case kQ38AttnSiteQsaScore: return "qsa.score_blocks";
+        case kQ38AttnSiteQsaSort: return "qsa.block_sort";
+        case kQ38AttnSiteQsaSparse: return "qsa.sparse_attn";
+        case kQ38AttnSiteQsaOutQuant: return "qsa.out_quant";
+        case kQ38AttnSiteQsaOut: return "qsa.out_gemv";
+        default: return "unknown";
+    }
+}
+
+struct Q38AttnSiteStat {
+    unsigned long long calls = 0;
+    double total_ms = 0.0;
+};
+
+class Q38AttnKernelProfiler {
+public:
+    static constexpr int kCap = 96;
+
+    static Q38AttnKernelProfiler & instance() {
+        static Q38AttnKernelProfiler profiler;
+        return profiler;
+    }
+
+    bool enabled() const { return enabled_; }
+
+    void mark_begin(int site, cudaStream_t stream) {
+        if (!enabled_) return;
+        if (site < 0 || site >= kQ38AttnSiteCount) return;
+        // A nested bracket stays one interval: only the outermost pair records.
+        if (depth_[site]++ != 0) return;
+        const int slot = written_[site];
+        if (slot >= kCap) {
+            ++overflow_[site];
+            return;
+        }
+        if (cudaEventRecord(start_[index(site, slot)], stream) != cudaSuccess) {
+            ++overflow_[site];
+            return;
+        }
+        pending_start_[site] = start_[index(site, slot)];
+    }
+
+    void mark_end(int site, cudaStream_t stream) {
+        if (!enabled_) return;
+        if (site < 0 || site >= kQ38AttnSiteCount) return;
+        if (depth_[site] <= 0) return;
+        if (--depth_[site] != 0) return;
+        const int slot = written_[site];
+        if (slot >= kCap || pending_start_[site] == nullptr) {
+            ++overflow_[site];
+            pending_start_[site] = nullptr;
+            return;
+        }
+        if (cudaEventRecord(stop_[index(site, slot)], stream) != cudaSuccess) {
+            ++overflow_[site];
+            pending_start_[site] = nullptr;
+            return;
+        }
+        start_[index(site, slot)] = pending_start_[site];
+        pending_start_[site] = nullptr;
+        ++written_[site];
+    }
+
+    // Called once per decode token, after the stream synchronise: every recorded
+    // event is complete there, so cudaEventElapsedTime() cannot return
+    // cudaErrorNotReady.
+    void flush_token() {
+        if (!enabled_) return;
+        for (int s = 0; s < kQ38AttnSiteCount; ++s) {
+            Q38AttnSiteStat & stat = stats_[s];
+            for (int i = 0; i < written_[s]; ++i) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, start_[index(s, i)], stop_[index(s, i)]) == cudaSuccess) {
+                    stat.total_ms += static_cast<double>(ms);
+                    ++stat.calls;
+                }
+            }
+            written_[s] = 0;
+            depth_[s] = 0;
+            pending_start_[s] = nullptr;
+        }
+        ++tokens_;
+    }
+
+    void print_summary() const {
+        if (!enabled_ || tokens_ == 0) return;
+        const double div = static_cast<double>(tokens_);
+        std::fprintf(stderr, "[attn-profile] tokens=%llu unit=ms_per_token\n",
+                     static_cast<unsigned long long>(tokens_));
+        for (int s = 0; s < kQ38AttnSiteCount; ++s) {
+            const Q38AttnSiteStat & stat = stats_[s];
+            if (stat.calls == 0) continue;
+            std::fprintf(stderr, "[attn-profile] %-22s %9.4f  calls/token=%.2f\n",
+                         q38_attn_site_name(s), stat.total_ms / div,
+                         static_cast<double>(stat.calls) / div);
+        }
+    }
+
+private:
+    Q38AttnKernelProfiler() {
+        const char * v = std::getenv("WARODECODE_ATTN_PROFILE");
+        enabled_ = v != nullptr && v[0] != '\0' && v[0] != '0';
+        if (!enabled_) return;
+        for (size_t i = 0; i < start_.size(); ++i) {
+            if (cudaEventCreate(&start_[i]) != cudaSuccess ||
+                cudaEventCreate(&stop_[i]) != cudaSuccess) {
+                enabled_ = false;
+                return;
+            }
+        }
+    }
+
+    ~Q38AttnKernelProfiler() { print_summary(); }
+
+    Q38AttnKernelProfiler(const Q38AttnKernelProfiler &) = delete;
+    Q38AttnKernelProfiler & operator=(const Q38AttnKernelProfiler &) = delete;
+
+    static size_t index(int site, int slot) {
+        return static_cast<size_t>(site) * static_cast<size_t>(kCap) + static_cast<size_t>(slot);
+    }
+
+    bool enabled_ = false;
+    unsigned long long tokens_ = 0;
+    std::array<cudaEvent_t, static_cast<size_t>(kQ38AttnSiteCount) * kCap> start_{};
+    std::array<cudaEvent_t, static_cast<size_t>(kQ38AttnSiteCount) * kCap> stop_{};
+    int written_[kQ38AttnSiteCount] = {};
+    int overflow_[kQ38AttnSiteCount] = {};
+    int depth_[kQ38AttnSiteCount] = {};
+    cudaEvent_t pending_start_[kQ38AttnSiteCount] = {};
+    Q38AttnSiteStat stats_[kQ38AttnSiteCount] = {};
+};
+
+// RAII bracket for one kernel launch inside the attention region.
+class Q38AttnKernelScope {
+public:
+    Q38AttnKernelScope(int site, cudaStream_t stream) : site_(site), stream_(stream) {
+        Q38AttnKernelProfiler::instance().mark_begin(site_, stream_);
+    }
+    ~Q38AttnKernelScope() {
+        Q38AttnKernelProfiler::instance().mark_end(site_, stream_);
+    }
+    Q38AttnKernelScope(const Q38AttnKernelScope &) = delete;
+    Q38AttnKernelScope & operator=(const Q38AttnKernelScope &) = delete;
+
+private:
+    int site_;
     cudaStream_t stream_;
 };
 
@@ -1507,10 +1751,9 @@ inline void run_qwen38_hc_q8_0_f32_mix_from_residual(
     }
     {
         Q38HcKernelScope scope(base_site, kQ38HcMixQ8Up, stream);
-        q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(hc_dim + warps - 1) / warps,
-                                                   q8_threads, 0, stream>>>(
+        q38_hc_launch_exact_q8_0_gemv_f32(
             w.up.low.data, scratch.q8_0_values(), scratch.q8_0_scales(),
-            scratch.gate(), hc_dim, low_rank);
+            scratch.gate(), hc_dim, low_rank, stream);
     }
     {
         Q38HcKernelScope scope(base_site, kQ38HcMixQ8Mix, stream);
@@ -1604,10 +1847,9 @@ inline void run_qwen38_hc_q8_0_f32_mix_from_half_residual(
     q38_hc_q8_0_quantize_f32_exact_kernel<<<(down_blocks + warps - 1) / warps,
                                               q8_threads, 0, stream>>>(
         scratch.norm(), hc_dim, scratch.q8_0_values(), scratch.q8_0_scales());
-    q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(low_rank + warps - 1) / warps,
-                                               q8_threads, 0, stream>>>(
+    q38_hc_launch_exact_q8_0_gemv_f32(
         w.down.low.data, scratch.q8_0_values(), scratch.q8_0_scales(),
-        scratch.low_raw(), low_rank, hc_dim);
+        scratch.low_raw(), low_rank, hc_dim, stream);
     e = cudaMemcpyAsync(scratch.low(), scratch.low_raw(),
                         static_cast<size_t>(low_rank) * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
@@ -1619,10 +1861,9 @@ inline void run_qwen38_hc_q8_0_f32_mix_from_half_residual(
     q38_hc_q8_0_quantize_f32_exact_kernel<<<(low_blocks + warps - 1) / warps,
                                               q8_threads, 0, stream>>>(
         scratch.low(), low_rank, scratch.q8_0_values(), scratch.q8_0_scales());
-    q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(hc_dim + warps - 1) / warps,
-                                               q8_threads, 0, stream>>>(
+    q38_hc_launch_exact_q8_0_gemv_f32(
         w.up.low.data, scratch.q8_0_values(), scratch.q8_0_scales(),
-        scratch.gate(), hc_dim, low_rank);
+        scratch.gate(), hc_dim, low_rank, stream);
     q38_hc_mix_f32_cpu_order_kernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
         scratch.norm(), scratch.gate(), scratch.mixed(), hidden, hc);
 }

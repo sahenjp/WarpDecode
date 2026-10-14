@@ -2351,7 +2351,34 @@ public:
             const bool moe_f32_mid = q38_moe_f32_out_opt_in() && moe_f32_in &&
                 st.moe.moe_out_f32() != nullptr;
             float * moe_out_f32 = nullptr;
-            if (rt_.fused_experts) {
+            if (rt_.cpu_moe && rt_.cpu_moe->active_for(il)) {
+                // Task N: routed experts on the CPU over the GGUF mapping. The
+                // CPU GEMV chain consumes the same Q8_K/Q8_0 activations and
+                // applies ggml's block scales in the same lane order as the CUDA
+                // path (tests/qwen38_cpu_moe_oracle_test.cpp pins that against
+                // the pinned llama.cpp AVX2 kernels), so d_accum() comes out
+                // bit-identical to the GPU runner's.
+                if (!layer.routed.gate || !layer.routed.up || !layer.routed.down) {
+                    throw std::runtime_error("Qwen3.8 separate expert tensor set is incomplete");
+                }
+                if (!moe_f32_in) {
+                    throw std::runtime_error(
+                        "CPU MoE needs the unrounded F32 MoE input: WARODECODE_CPU_MOE "
+                        "requires WARODECODE_MOE_F32_MID=1 and the F32 HC mix row "
+                        "(WARODECODE_HC_Q8_0=1, its default)");
+                }
+                if (selected_output_trace) {
+                    throw std::runtime_error(
+                        "CPU MoE does not fill the selected-expert trace buffer; "
+                        "run the selected-expert trace without WARODECODE_CPU_MOE");
+                }
+                if (!experts_preselected) {
+                    q38_moe_select_experts_input<float>(
+                        layer.router, hc_f32_scratch.mixed(), st.moe, q.expert_weights_scale, stream);
+                }
+                rt_.cpu_moe->run_layer(il, hc_f32_scratch.mixed(), st.moe, stream);
+                moe_out_f32 = nullptr;
+            } else if (rt_.fused_experts) {
                 if (!layer.routed.gate_up || !layer.routed.down) {
                     throw std::runtime_error("Qwen3.8 fused expert tensor set is incomplete");
                 }
@@ -2823,6 +2850,7 @@ public:
         // with cudaErrorNotReady.
         profile_.flush_token();
         Q38HcKernelProfiler::instance().flush_token();
+        Q38AttnKernelProfiler::instance().flush_token();
         if (profile_on) profile_.note_token_host(Qwen38StageProfiler::host_now() - profile_token_start);
         if (*host_has_nonfinite_) throw std::runtime_error("Qwen3.8 output logits contain NaN or infinity");
 

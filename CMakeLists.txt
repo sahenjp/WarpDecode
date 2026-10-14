@@ -51,8 +51,14 @@ if(WARODECODE_BUILD_ENGINE)
 
   add_executable(warodecode src/warodecode.cu)
   target_include_directories(warodecode PRIVATE src)
+  # Task N: the CPU MoE kernels (src/qwen38_cpu_moe.cuh) are AVX2/FMA host code
+  # compiled into this translation unit, so the host compiler needs the same
+  # flags the L4/A100 hosts and tests/qwen38_cpu_moe_host_check.sh use. Without
+  # them the header silently falls back to its scalar twins (correct, ~4x
+  # slower). These are compile flags only: the CUDA device flags below are
+  # unchanged and no host arithmetic is reassociated.
   target_compile_options(warodecode PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-lineinfo;-Xptxas=-warn-spills>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-lineinfo;-Xptxas=-warn-spills;-Xcompiler=-mavx2,-mfma>
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
   )
   set_target_properties(warodecode PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)

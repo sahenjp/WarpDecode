@@ -6,6 +6,7 @@
 #include "qwen38_gdn.cuh"
 #include "qwen38_hc.cuh"
 #include "qwen38_layout.hpp"
+#include "qwen38_cpu_moe_runtime.cuh"
 #include "qwen38_moe.cuh"
 #include "qwen38_ple.cuh"
 #include "qwen38_qsa.cuh"
@@ -52,6 +53,12 @@ struct Qwen38Runtime {
     GpuExpertCache expert_cache;
     GpuFusedExpertCache fused_expert_cache;
     bool fused_experts = false;
+
+    // Task N: routed expert GEMV on the CPU over the GGUF mapping (null unless
+    // WARODECODE_CPU_MOE / WARODECODE_CPU_MOE_LAYERS asked for it). The GPU keeps
+    // every non-expert block, the router and the shared expert.
+    std::unique_ptr<Qwen38CpuMoe> cpu_moe;
+    int cpu_moe_layers = 0;
 
     size_t expert_cache_slots = 0;
     size_t resident_weight_bytes = 0;
@@ -199,6 +206,25 @@ inline Qwen38Runtime load_qwen38_runtime(
         g, rt.layout.hidden, rt.layout.hc_count, rt.layout.hc_low_rank);
 
     if (rt.layers.empty()) throw std::runtime_error("Qwen3.8 has no trunk layers");
+
+    // Task N: the CPU MoE path keeps the expert bytes in the mapping and never
+    // uploads them, so it can only be selected for the separate gate/up layout.
+    if (cpu_moe::enabled()) {
+        if (rt.fused_experts) {
+            throw std::runtime_error(
+                "CPU MoE (WARODECODE_CPU_MOE) needs the separate expert gate/up tensors; "
+                "this GGUF stores the fused gate_up layout");
+        }
+        std::vector<Qwen38MoeLayerTensors> expert_tensors;
+        expert_tensors.reserve(rt.layers.size());
+        for (const Qwen38RuntimeLayer & layer : rt.layers) {
+            expert_tensors.push_back(layer.routed);
+        }
+        rt.cpu_moe_layers = cpu_moe::layer_count(rt.layout.trunk_layers);
+        rt.cpu_moe = std::make_unique<Qwen38CpuMoe>();
+        rt.cpu_moe->configure(rt.layout, expert_tensors, rt.cpu_moe_layers, rt.fused_experts);
+    }
+
     const auto & sample = rt.layers.front().routed;
     ExpertCacheOptions cache_options;
     cache_options.stats = rt.tuning.expert_stats;

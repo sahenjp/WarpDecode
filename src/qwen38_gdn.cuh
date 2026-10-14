@@ -176,7 +176,9 @@ inline bool q38_gdn_exact_exp_enabled() {
     static const bool enabled = [] {
         const int value = q38_gdn_env_flag("WARODECODE_EXACT_EXP", true) ? 1 : 0;
         const cudaError_t e = cudaMemcpyToSymbol(q38_gdn_exact_exp_flag, &value, sizeof(value));
-        if (e != cudaSuccess) throw std::runtime_error("publish WARODECODE_EXACT_EXP failed");
+        if (e != cudaSuccess) {
+            throw std::runtime_error(std::string("publish WARODECODE_EXACT_EXP failed: ") + cudaGetErrorString(e));
+        }
         return value != 0;
     }();
     return enabled;
@@ -252,7 +254,9 @@ inline bool q38_gdn_exact_scalar_fma_enabled() {
     static const bool enabled = [] {
         const int value = q38_gdn_env_flag("WARODECODE_EXACT_SCALAR_FMA", true) ? 1 : 0;
         const cudaError_t e = cudaMemcpyToSymbol(q38_gdn_exact_scalar_fma_flag, &value, sizeof(value));
-        if (e != cudaSuccess) throw std::runtime_error("publish WARODECODE_EXACT_SCALAR_FMA failed");
+        if (e != cudaSuccess) {
+            throw std::runtime_error(std::string("publish WARODECODE_EXACT_SCALAR_FMA failed: ") + cudaGetErrorString(e));
+        }
         return value != 0;
     }();
     return enabled;
@@ -318,7 +322,9 @@ inline bool q38_gdn_first_token_exact_enabled() {
     static const bool enabled = [] {
         const int value = q38_gdn_env_flag("WARODECODE_EXACT_FIRST_TOKEN", true) ? 1 : 0;
         const cudaError_t e = cudaMemcpyToSymbol(q38_gdn_first_token_exact_flag, &value, sizeof(value));
-        if (e != cudaSuccess) throw std::runtime_error("publish WARODECODE_EXACT_FIRST_TOKEN failed");
+        if (e != cudaSuccess) {
+            throw std::runtime_error(std::string("publish WARODECODE_EXACT_FIRST_TOKEN failed: ") + cudaGetErrorString(e));
+        }
         return value != 0;
     }();
     return enabled;
@@ -1160,6 +1166,113 @@ __global__ void q38_gdn_dense_f32_gemv_avx2_kernel(
     y[row] = acc;
 }
 
+// Task P (WARODECODE_GDN_F32_GEMV_WARP, default ON).
+//
+// q38_gdn_dense_f32_gemv_avx2_kernel() puts one *thread* on each row of an F32
+// weight, so the ssm_beta / ssm_alpha projections (rows = ssm_dt_rank, 32-64)
+// run as one or two warps with a cols-long serial FMA chain each. Measured on
+// A100: 7.82 + 7.81 ms/token, i.e. 36% of the whole attention region, at about
+// 12 GB/s. The loop is latency bound, not bandwidth bound - the same failure
+// Task J fixed for the HC inject projection.
+//
+// This is the identical fix: lane 8*j + l of a warp owns the ggml_vec_dot_f32
+// accumulator sum[j][l] and walks i = 0, 32, 64, ... with the same __fmaf_rn
+// chain, so every accumulator sees exactly the operand sequence the one-thread
+// kernel produced. The reduce half rebuilds q38_gdn_reduce_avx2() with shuffles
+// in the same association order:
+//
+//   sum[0][l] += sum[2][l] ; sum[1][l] += sum[3][l]    -> one __shfl_xor(16) add
+//   sum[0][l] += sum[1][l]                             -> lane l += lane l+8
+//   t0[k] = sum[0][k] + sum[0][k+4]                    -> lane k += lane k+4
+//   h0 = t0[0] + t0[1] ; h1 = t0[2] + t0[3] ; h0 + h1  -> lane 0
+//
+// The non-fused tail stays on lane 0 after the tree, which is where
+// q38_gdn_dense_f32_gemv_avx2_kernel() adds it as well.
+__global__ void q38_gdn_dense_f32_gemv_avx2_warp_kernel(
+        const float * __restrict__ w,
+        const float * __restrict__ x,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const int j = lane >> 3;   // accumulator row of sum[4][8]
+    const int l = lane & 7;    // accumulator column
+    const float * row_ptr = w + static_cast<size_t>(row) * cols;
+
+    float acc = 0.0f;
+    // The accumulator chain must stay sequential (ggml_vec_dot_f32 order), so
+    // the only headroom is memory-level parallelism: unrolling lets the loads
+    // for several iterations be in flight behind the FMA chain. The loop stops
+    // at the last whole 32-value block: everything past it belongs to the
+    // non-fused tail below, exactly as in the one-thread kernel.
+    const int np = cols & ~31;
+#pragma unroll 4
+    for (int i = 0; i < np; i += 32) {
+        const int c = i + j * 8 + l;
+        acc = __fmaf_rn(row_ptr[c], x[c], acc);
+    }
+
+    // sum[0][l] += sum[2][l] and sum[1][l] += sum[3][l] in one exchange.
+    acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, 16));
+    // sum[0][l] += sum[1][l] for l = 0..7 (lanes 0..7 read lanes 8..15).
+    const float s1 = __shfl_sync(0xffffffffu, acc, (lane & 7) + 8);
+    if (lane < 8) acc = __fadd_rn(acc, s1);
+    // t0[k] = sum[0][k] + sum[0][k+4] for k = 0..3.
+    const float s4 = __shfl_sync(0xffffffffu, acc, (lane & 3) + 4);
+    if (lane < 4) acc = __fadd_rn(acc, s4);
+
+    const float t1 = __shfl_sync(0xffffffffu, acc, 1);
+    const float t2 = __shfl_sync(0xffffffffu, acc, 2);
+    const float t3 = __shfl_sync(0xffffffffu, acc, 3);
+    if (lane == 0) {
+        float out = __fadd_rn(__fadd_rn(acc, t1), __fadd_rn(t2, t3));
+        for (int c = np; c < cols; ++c) {
+            out = __fadd_rn(out, __fmul_rn(row_ptr[c], x[c]));
+        }
+        y[row] = out;
+    }
+}
+
+inline bool q38_gdn_f32_gemv_warp_enabled() {
+    static const bool enabled = q38_gdn_env_flag("WARODECODE_GDN_F32_GEMV_WARP", true);
+    return enabled;
+}
+
+// One dispatch for both F32 orderings, so the replay path and the production
+// path can never plan a different kernel. "avx2" selects the oracle order
+// (WARODECODE_EXACT_SCALAR_FMA, default ON) and is what the warp kernel
+// accelerates; the warp form needs a whole 32-value block, so a narrow or
+// unaligned width keeps the one-thread-per-row kernel.
+inline void q38_gdn_launch_dense_f32_gemv_avx2(
+        const float * w,
+        const float * x,
+        float * y,
+        int rows,
+        int cols,
+        cudaStream_t stream) {
+    constexpr int threads = 256;
+    constexpr int warps = threads / 32;
+    if (q38_gdn_exact_scalar_fma_enabled()) {
+        if (q38_gdn_f32_gemv_warp_enabled() && cols >= 32 && (cols % 32) == 0) {
+            constexpr int rows_per_block = 4;
+            const int blocks = (rows + rows_per_block - 1) / rows_per_block;
+            q38_gdn_dense_f32_gemv_avx2_warp_kernel<<<blocks, rows_per_block * 32, 0, stream>>>(
+                w, x, y, rows, cols);
+            return;
+        }
+        q38_gdn_dense_f32_gemv_avx2_kernel<<<(rows + threads - 1) / threads, threads, 0, stream>>>(
+            w, x, y, rows, cols);
+        return;
+    }
+    q38_gdn_dense_f32_gemv_kernel<<<(rows + warps - 1) / warps, threads, 0, stream>>>(
+        w, x, y, rows, cols);
+}
+
 // Position-0 half of ggml_compute_forward_ssm_conv_f32 (ggml-cpu/ops.cpp:9703).
 // The sliding window is s[i0 + i1*ncs] with ncs = d_conv - 1 + n_t = d_conv: the
 // first d_conv-1 taps read the conv state, which is all zero for the first token,
@@ -1465,10 +1578,12 @@ inline float * run_qwen38_gdn_f32_first_token(
     if (exact) {
         // ssm_beta / ssm_alpha are F32 weights, so ggml evaluates these two
         // projections as one ggml_vec_dot_f32 per row, in the AVX2 visit order.
-        q38_gdn_dense_f32_gemv_avx2_kernel<<<(q.ssm_dt_rank + threads - 1) / threads, threads, 0, stream>>>(
-            scratch.beta_weights(), input, scratch.beta(), q.ssm_dt_rank, q.hidden);
-        q38_gdn_dense_f32_gemv_avx2_kernel<<<(q.ssm_dt_rank + threads - 1) / threads, threads, 0, stream>>>(
-            scratch.alpha_weights(), input, scratch.alpha(), q.ssm_dt_rank, q.hidden);
+        // Task P added the warp-parallel form of that same order behind the
+        // shared dispatcher; the arithmetic is unchanged.
+        q38_gdn_launch_dense_f32_gemv_avx2(
+            scratch.beta_weights(), input, scratch.beta(), q.ssm_dt_rank, q.hidden, stream);
+        q38_gdn_launch_dense_f32_gemv_avx2(
+            scratch.alpha_weights(), input, scratch.alpha(), q.ssm_dt_rank, q.hidden, stream);
     } else {
         q38_gdn_dense_f32_gemv_kernel<<<(q.ssm_dt_rank + 7) / 8, threads, 0, stream>>>(
             scratch.beta_weights(), input, scratch.beta(), q.ssm_dt_rank, q.hidden);
@@ -2012,9 +2127,9 @@ inline void q38_gdn_q8_0_gemv_to_half(
         __half * out,
         cudaStream_t stream) {
     constexpr int threads = 256;
-    constexpr int warps = threads / 32;
-    q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(w.rows + warps - 1) / warps, threads, 0, stream>>>(
-        w.low.data, scratch.act_q8(), scratch.act_scales(), scratch.gemv_f32(), w.rows, w.cols);
+    q38_hc_launch_exact_q8_0_gemv_f32(
+        w.low.data, scratch.act_q8(), scratch.act_scales(), scratch.gemv_f32(),
+        w.rows, w.cols, stream);
     q38_gdn_float_to_half_kernel<<<(w.rows + threads - 1) / threads, threads, 0, stream>>>(
         scratch.gemv_f32(), out, w.rows);
 }
@@ -2038,22 +2153,16 @@ inline void q38_gdn_f32_gemv_to_half(
         const Qwen38GdnScratch & scratch,
         cudaStream_t stream) {
     constexpr int threads = 256;
-    constexpr int warps = threads / 32;
     if (!w.valid()) throw std::runtime_error("GDN F32 GEMV requires an F32 weight matrix");
     // Defence in depth: q38_gdn_f32_projection_usable() already checked the
     // scratch range, but an overflow here would corrupt the next projection.
     if (w.rows > scratch.gemv_elements()) throw std::runtime_error("GDN F32 GEMV output scratch mismatch");
-    if (q38_gdn_exact_scalar_fma_enabled()) {
-        // The oracle reaches 1.0f/sqrtf-style F32 matmuls through one
-        // ggml_vec_dot_f32 per row (AVX2: 4x8 accumulators + F32x8 reduce).
-        // The warp-order reduction differs on 12-26 of 48 rows by 1 ulp, which
-        // survives into the gate parameters and the written GDN state.
-        q38_gdn_dense_f32_gemv_avx2_kernel<<<(w.rows + threads - 1) / threads, threads, 0, stream>>>(
-            w.data, x, scratch.gemv_f32(), w.rows, w.cols);
-    } else {
-        q38_gdn_dense_f32_gemv_kernel<<<(w.rows + warps - 1) / warps, threads, 0, stream>>>(
-            w.data, x, scratch.gemv_f32(), w.rows, w.cols);
-    }
+    // The oracle reaches 1.0f/sqrtf-style F32 matmuls through one
+    // ggml_vec_dot_f32 per row (AVX2: 4x8 accumulators + F32x8 reduce). The
+    // warp-order reduction differs on 12-26 of 48 rows by 1 ulp, which survives
+    // into the gate parameters and the written GDN state - hence the AVX2 order,
+    // now warp-parallel (Task P) but arithmetically identical.
+    q38_gdn_launch_dense_f32_gemv_avx2(w.data, x, scratch.gemv_f32(), w.rows, w.cols, stream);
     q38_gdn_float_to_half_kernel<<<(w.rows + threads - 1) / threads, threads, 0, stream>>>(
         scratch.gemv_f32(), out, w.rows);
 }
@@ -2110,9 +2219,8 @@ inline void q38_gdn_q8_0_gemv_to_f32(
         float * out,
         cudaStream_t stream) {
     constexpr int threads = 256;
-    constexpr int warps = threads / 32;
-    q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(w.rows + warps - 1) / warps, threads, 0, stream>>>(
-        w.low.data, scratch.act_q8(), scratch.act_scales(), out, w.rows, w.cols);
+    q38_hc_launch_exact_q8_0_gemv_f32(
+        w.low.data, scratch.act_q8(), scratch.act_scales(), out, w.rows, w.cols, stream);
 }
 
 // F32 weight x F32 activation -> F32 in ggml's F32 dot order: the same kernel as
@@ -2122,16 +2230,8 @@ inline void q38_gdn_f32_gemv_to_f32(
         const float * x,
         float * out,
         cudaStream_t stream) {
-    constexpr int threads = 256;
-    constexpr int warps = threads / 32;
     if (!w.valid()) throw std::runtime_error("GDN F32 GEMV requires an F32 weight matrix");
-    if (q38_gdn_exact_scalar_fma_enabled()) {
-        q38_gdn_dense_f32_gemv_avx2_kernel<<<(w.rows + threads - 1) / threads, threads, 0, stream>>>(
-            w.data, x, out, w.rows, w.cols);
-    } else {
-        q38_gdn_dense_f32_gemv_kernel<<<(w.rows + warps - 1) / warps, threads, 0, stream>>>(
-            w.data, x, out, w.rows, w.cols);
-    }
+    q38_gdn_launch_dense_f32_gemv_avx2(w.data, x, out, w.rows, w.cols, stream);
 }
 
 // F32 twin of q38_gdn_param_projection(): same dispatch from the weight type,
@@ -2262,6 +2362,10 @@ inline float * run_qwen38_gdn_f32_x(
         throw std::runtime_error("GDN F32 path requires the F32 state and scratch buffers");
     }
 
+    // Task P: outer bracket of one GDN layer. With WARODECODE_ATTN_PROFILE unset
+    // this is a single predictable branch on the profiler's enabled() flag.
+    Q38AttnKernelScope gdn_region_scope(kQ38AttnSiteGdnRegion, stream);
+
     float * const qkv_f32 = scratch.qkv_f32();
     float * const conv_out_f32 = scratch.conv_out_f32();
     float * const z_f32 = scratch.z_f32();
@@ -2282,13 +2386,28 @@ inline float * run_qwen38_gdn_f32_x(
         // read the same hidden state: stage it once and quantise that copy once,
         // then reuse it for every Q8_0 dot. The row is already F32, so no
         // half -> F32 conversion happens anywhere on this route.
-        q38_gdn_q8_0_quantize_activation(x, q.hidden, scratch, stream);
-        q38_gdn_q8_0_gemv_to_f32(w.qkv, scratch, qkv_f32, stream);
-        q38_gdn_q8_0_gemv_to_f32(w.z, scratch, z_f32, stream);
-        q38_gdn_param_projection_f32_x(w.beta, w.beta_f32, x, true, beta_f32,
-            scratch.beta(), activation_half, scratch, q, stream);
-        q38_gdn_param_projection_f32_x(w.alpha, w.alpha_f32, x, true, alpha_f32,
-            scratch.alpha(), activation_half, scratch, q, stream);
+        {
+            Q38AttnKernelScope scope(kQ38AttnSiteGdnActQuant, stream);
+            q38_gdn_q8_0_quantize_activation(x, q.hidden, scratch, stream);
+        }
+        {
+            Q38AttnKernelScope scope(kQ38AttnSiteGdnQkv, stream);
+            q38_gdn_q8_0_gemv_to_f32(w.qkv, scratch, qkv_f32, stream);
+        }
+        {
+            Q38AttnKernelScope scope(kQ38AttnSiteGdnZ, stream);
+            q38_gdn_q8_0_gemv_to_f32(w.z, scratch, z_f32, stream);
+        }
+        {
+            Q38AttnKernelScope scope(kQ38AttnSiteGdnBeta, stream);
+            q38_gdn_param_projection_f32_x(w.beta, w.beta_f32, x, true, beta_f32,
+                scratch.beta(), activation_half, scratch, q, stream);
+        }
+        {
+            Q38AttnKernelScope scope(kQ38AttnSiteGdnAlpha, stream);
+            q38_gdn_param_projection_f32_x(w.alpha, w.alpha_f32, x, true, alpha_f32,
+                scratch.alpha(), activation_half, scratch, q, stream);
+        }
     } else {
         // WARODECODE_GDN_Q8_0=0: keep the legacy projections with their own
         // activation rounding, but widen the results so the token still runs
@@ -2311,60 +2430,83 @@ inline float * run_qwen38_gdn_f32_x(
     // only reach the F16 mirror, so adopt whatever it changed before reading.
     const size_t conv_state_n = state.conv_state_elements();
     if (conv_state_n > 0) {
+        Q38AttnKernelScope scope(kQ38AttnSiteGdnConvAdopt, stream);
         q38_gdn_conv_state_adopt_half_kernel<<<
             (static_cast<int>(conv_state_n) + threads - 1) / threads, threads, 0, stream>>>(
             state.conv_state_f32(), state.conv_state(), static_cast<int>(conv_state_n));
     }
 
     const int conv_blocks = (conv_dim + threads - 1) / threads;
-    if (w.conv_f32.valid()) {
-        q38_gdn_conv_f32_state_kernel<float><<<conv_blocks, threads, 0, stream>>>(
-            qkv_f32, state.conv_state_f32(), w.conv_f32.data, conv_out_f32,
-            conv_dim, q.ssm_conv_kernel);
-    } else {
-        q38_gdn_conv_f32_state_kernel<__half><<<conv_blocks, threads, 0, stream>>>(
-            qkv_f32, state.conv_state_f32(), w.conv.data, conv_out_f32,
-            conv_dim, q.ssm_conv_kernel);
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteGdnConv, stream);
+        if (w.conv_f32.valid()) {
+            q38_gdn_conv_f32_state_kernel<float><<<conv_blocks, threads, 0, stream>>>(
+                qkv_f32, state.conv_state_f32(), w.conv_f32.data, conv_out_f32,
+                conv_dim, q.ssm_conv_kernel);
+        } else {
+            q38_gdn_conv_f32_state_kernel<__half><<<conv_blocks, threads, 0, stream>>>(
+                qkv_f32, state.conv_state_f32(), w.conv.data, conv_out_f32,
+                conv_dim, q.ssm_conv_kernel);
+        }
     }
 
     float * const q_conv = conv_out_f32;
     float * const k_conv = conv_out_f32 + key_dim;
     float * const v_conv = conv_out_f32 + key_dim * 2;
-    q38_gdn_l2_norm_f32_kernel<<<q.ssm_group_count, threads, 0, stream>>>(
-        q_conv, q.ssm_state_size, q.ssm_group_count, rms_eps);
-    q38_gdn_l2_norm_f32_kernel<<<q.ssm_group_count, threads, 0, stream>>>(
-        k_conv, q.ssm_state_size, q.ssm_group_count, rms_eps);
-
-    const int param_blocks = (heads + threads - 1) / threads;
-    if (w.dt_f32.data != nullptr && w.a_f32.data != nullptr) {
-        q38_gdn_gate_params_f32_kernel<<<param_blocks, threads, 0, stream>>>(
-            beta_f32, alpha_f32, w.dt_f32.data, w.a_f32.data, scratch.gate(), heads);
-    } else {
-        q38_gdn_gate_params_f32_halfparam_kernel<<<param_blocks, threads, 0, stream>>>(
-            beta_f32, alpha_f32, w.dt.data, w.a.data, scratch.gate(), heads);
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteGdnL2Norm, stream);
+        q38_gdn_l2_norm_f32_kernel<<<q.ssm_group_count, threads, 0, stream>>>(
+            q_conv, q.ssm_state_size, q.ssm_group_count, rms_eps);
+        q38_gdn_l2_norm_f32_kernel<<<q.ssm_group_count, threads, 0, stream>>>(
+            k_conv, q.ssm_state_size, q.ssm_group_count, rms_eps);
     }
 
-    q38_gdn_ar_f32_kernel<<<heads, q.ssm_state_size, 0, stream>>>(
-        q_conv, k_conv, v_conv, scratch.gate(), beta_f32,
-        state.state(), core_out_f32,
-        q.ssm_state_size, q.ssm_group_count, heads);
+    const int param_blocks = (heads + threads - 1) / threads;
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteGdnGateParams, stream);
+        if (w.dt_f32.data != nullptr && w.a_f32.data != nullptr) {
+            q38_gdn_gate_params_f32_kernel<<<param_blocks, threads, 0, stream>>>(
+                beta_f32, alpha_f32, w.dt_f32.data, w.a_f32.data, scratch.gate(), heads);
+        } else {
+            q38_gdn_gate_params_f32_halfparam_kernel<<<param_blocks, threads, 0, stream>>>(
+                beta_f32, alpha_f32, w.dt.data, w.a.data, scratch.gate(), heads);
+        }
+    }
 
-    if (w.norm_f32.data != nullptr) {
-        q38_gdn_gated_rmsnorm_f32_kernel<<<heads, threads, 0, stream>>>(
-            core_out_f32, w.norm_f32.data, z_f32, norm_out_f32,
-            q.ssm_state_size, heads, rms_eps);
-    } else {
-        q38_gdn_gated_rmsnorm_f32_kernel<<<heads, threads, 0, stream>>>(
-            core_out_f32, w.norm.data, z_f32, norm_out_f32,
-            q.ssm_state_size, heads, rms_eps);
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteGdnAr, stream);
+        q38_gdn_ar_f32_kernel<<<heads, q.ssm_state_size, 0, stream>>>(
+            q_conv, k_conv, v_conv, scratch.gate(), beta_f32,
+            state.state(), core_out_f32,
+            q.ssm_state_size, q.ssm_group_count, heads);
+    }
+
+    {
+        Q38AttnKernelScope scope(kQ38AttnSiteGdnNorm, stream);
+        if (w.norm_f32.data != nullptr) {
+            q38_gdn_gated_rmsnorm_f32_kernel<<<heads, threads, 0, stream>>>(
+                core_out_f32, w.norm_f32.data, z_f32, norm_out_f32,
+                q.ssm_state_size, heads, rms_eps);
+        } else {
+            q38_gdn_gated_rmsnorm_f32_kernel<<<heads, threads, 0, stream>>>(
+                core_out_f32, w.norm.data, z_f32, norm_out_f32,
+                q.ssm_state_size, heads, rms_eps);
+        }
     }
 
     if (q8_0) {
         // ssm_out reads the gated-RMSNorm output, so it needs its own
         // quantisation pass (value_dim elements).
-        q38_gdn_q8_0_quantize_activation_f32(norm_out_f32, value_dim, scratch, stream);
-        q38_gdn_q8_0_gemv_to_f32(w.out, scratch, final_out_f32, stream);
+        {
+            Q38AttnKernelScope scope(kQ38AttnSiteGdnOutQuant, stream);
+            q38_gdn_q8_0_quantize_activation_f32(norm_out_f32, value_dim, scratch, stream);
+        }
+        {
+            Q38AttnKernelScope scope(kQ38AttnSiteGdnOut, stream);
+            q38_gdn_q8_0_gemv_to_f32(w.out, scratch, final_out_f32, stream);
+        }
     } else {
+        Q38AttnKernelScope scope(kQ38AttnSiteGdnOut, stream);
         q38_gdn_float_to_half_kernel<<<(value_dim + threads - 1) / threads, threads, 0, stream>>>(
             norm_out_f32, scratch.norm_out(), value_dim);
         launch_matrix_gemv_half(w.out, scratch.norm_out(), scratch.final_out(), stream);
@@ -2378,6 +2520,7 @@ inline float * run_qwen38_gdn_f32_x(
     const auto mirror = [&](const float * src, __half * dst, int n) {
         q38_gdn_float_to_half_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(src, dst, n);
     };
+    Q38AttnKernelScope mirror_scope(kQ38AttnSiteGdnMirror, stream);
     mirror(qkv_f32, scratch.qkv(), conv_dim);
     mirror(conv_out_f32, scratch.conv_out(), conv_dim);
     mirror(z_f32, scratch.z(), value_dim);
