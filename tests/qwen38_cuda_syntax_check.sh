@@ -54,7 +54,12 @@ cat > "$STUB/cuda_runtime.h" <<'RUNTIME_EOF'
 #include <cstdint>
 
 struct q38_stub_dim3 {
-    unsigned int x, y, z;
+    unsigned int x = 1, y = 1, z = 1;
+    q38_stub_dim3() = default;
+    // nvcc's dim3 takes one, two or three extents; the expert-batched MoE
+    // launchers use the two-dimensional form.
+    q38_stub_dim3(unsigned int x_, unsigned int y_, unsigned int z_ = 1)
+        : x(x_), y(y_), z(z_) {}
 };
 extern const q38_stub_dim3 threadIdx;
 extern const q38_stub_dim3 blockIdx;
@@ -97,6 +102,16 @@ inline cudaError_t cudaMemsetAsync(void * p, int v, std::size_t n, cudaStream_t 
     (void) p; (void) v; (void) n; (void) st; return cudaSuccess;
 }
 inline cudaError_t cudaStreamSynchronize(cudaStream_t st) { (void) st; return cudaSuccess; }
+// The DP4A launchers pick their kernel from the current device's sm, so the
+// host check needs the two runtime queries that supplies.
+enum cudaDeviceAttr {
+    cudaDevAttrComputeCapabilityMajor = 75,
+    cudaDevAttrComputeCapabilityMinor = 76,
+};
+inline cudaError_t cudaGetDevice(int * device) { if (device) *device = 0; return cudaSuccess; }
+inline cudaError_t cudaDeviceGetAttribute(int * value, cudaDeviceAttr attr, int device) {
+    (void) attr; (void) device; if (value) *value = 8; return cudaSuccess;
+}
 inline cudaError_t cudaDeviceSynchronize() { return cudaSuccess; }
 inline cudaError_t cudaGetLastError() { return cudaSuccess; }
 inline cudaError_t cudaEventCreate(cudaEvent_t * e) { (void) e; return cudaSuccess; }
@@ -106,6 +121,31 @@ inline cudaError_t cudaEventElapsedTime(float * ms, cudaEvent_t a, cudaEvent_t b
     (void) ms; (void) a; (void) b; return cudaSuccess;
 }
 inline cudaError_t cudaEventDestroy(cudaEvent_t e) { (void) e; return cudaSuccess; }
+// Device properties are read by the benchmark harnesses (GPU name + sm).
+struct q38_stub_device_prop {
+    char name[64] = "stub-device";
+    int major = 8;
+    int minor = 9;
+};
+using cudaDeviceProp = q38_stub_device_prop;
+inline cudaError_t cudaGetDeviceProperties(cudaDeviceProp * p, int device) {
+    (void) device; if (p) *p = cudaDeviceProp(); return cudaSuccess;
+}
+// Streams/events used by the expert-cache transfer path (Task C).
+static constexpr unsigned int cudaStreamNonBlocking = 1;
+static constexpr unsigned int cudaEventDisableTiming = 2;
+static constexpr cudaError_t cudaErrorNotReady = 34;
+inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t * s, unsigned int f) {
+    (void) f; *s = nullptr; return cudaSuccess;
+}
+inline cudaError_t cudaStreamDestroy(cudaStream_t st) { (void) st; return cudaSuccess; }
+inline cudaError_t cudaStreamWaitEvent(cudaStream_t st, cudaEvent_t e, unsigned int f) {
+    (void) st; (void) e; (void) f; return cudaSuccess;
+}
+inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t * e, unsigned int f) {
+    (void) f; *e = nullptr; return cudaSuccess;
+}
+inline cudaError_t cudaEventQuery(cudaEvent_t e) { (void) e; return cudaSuccess; }
 
 inline void __syncthreads() {}
 inline float __fmaf_rn(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
@@ -132,6 +172,10 @@ inline T __shfl_sync(unsigned int mask, T var, int src, int width = 32) {
 template <typename T>
 inline T __shfl_down_sync(unsigned int mask, T var, unsigned int delta, int width = 32) {
     (void) mask; (void) delta; (void) width; return var;
+}
+template <typename T>
+inline T __shfl_xor_sync(unsigned int mask, T var, int lane_mask, int width = 32) {
+    (void) mask; (void) lane_mask; (void) width; return var;
 }
 RUNTIME_EOF
 
@@ -197,10 +241,11 @@ for pattern in ("src/*.cuh", "src/*.hpp"):
         text, n = rewrite(path.read_text(), str(path))
         (work / "src" / path.name).write_text(text)
         total += n
-path = root / "tests/qwen38_moe_cuda_test.cu"
-text, n = rewrite(path.read_text(), str(path))
-(work / "tests" / "qwen38_moe_cuda_test.cpp").write_text(text)
-total += n
+for name in ("tests/qwen38_moe_cuda_test.cu", "tests/moe_fused_grid_bench.cu"):
+    path = root / name
+    text, n = rewrite(path.read_text(), str(path))
+    (work / "tests" / (path.stem + ".cpp")).write_text(text)
+    total += n
 print("launch sites rewritten: %d" % total)
 PY_EOF
 
@@ -213,5 +258,12 @@ g++ -std=c++17 -fsyntax-only -ffp-contract=off -mavx2 -mfma -mf16c -D__CUDACC__ 
   -Wno-unknown-pragmas -Wno-attributes \
   -include "$STUB/cuda_prelude.h" -I "$STUB" -I "$WORK/src" \
   tests/qwen38_moe_cuda_test.cpp
+
+# The Task G harness is compiled the same way so its own launch sites and the
+# expert-batched API it calls are checked without a CUDA toolchain.
+g++ -std=c++17 -fsyntax-only -ffp-contract=off -mavx2 -mfma -mf16c -D__CUDACC__ \
+  -Wno-unknown-pragmas -Wno-attributes \
+  -include "$STUB/cuda_prelude.h" -I "$STUB" -I "$WORK/src" \
+  tests/moe_fused_grid_bench.cpp
 
 echo "PASS (g++ -fsyntax-only, launch syntax rewritten)"

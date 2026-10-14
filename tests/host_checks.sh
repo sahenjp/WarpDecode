@@ -61,6 +61,12 @@ assert m['shards'] == 2, m
 assert m['quant'] == 'iq3e', m
 PY2
 
+# DP4A 経路 (IQ2_S/IQ3_S/IQ4_NL) の整数部が参照実装と bit 一致することを確認する
+bash tests/lowbit_dp4a_host_check.sh
+
+# Task G: expert 統合 MoE の加算順序と index 対応が従来と bit 一致することを確認する
+bash tests/moe_fused_grid_host_check.sh
+
 # nvcc が無くても CUDA カーネルの構文・型を検査できる (CI で実行する)
 bash tests/qwen38_cuda_syntax_check.sh
 

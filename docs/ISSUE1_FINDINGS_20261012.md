@@ -1480,3 +1480,310 @@ exact attention カーネルの追加コストで 3.78 → 3.20 tok/s になっ�
 - nvcc 不要の CUDA 構文検査 (`tests/qwen38_cuda_syntax_check.sh`) を CI (`tests/host_checks.sh`) に登録 → PASS 確認
 - ホスト検証ハーネス群（rope / router / shexp gate / exact math）を `tests/` に収録
 - コミット `8bcc64b`（push は未実施）
+
+---
+
+# 追記 26 (2026-10-14 夜): MoE expert cache / 転送最適化 (Task C)
+
+対象は routed expert 重みの RAM/ディスク → VRAM 転送。変更は
+`src/expert_cache.cuh` (本体)・`src/qwen38_tuning.hpp` (スイッチ)・
+`src/qwen38_runtime.cuh` (配線)・`tests/qwen38_cuda_syntax_check.sh` (CUDA API スタブ追加)
+に閉じており、**`src/qwen38_forward.cuh` と `src/qwen38_moe.cuh` は未変更**。
+qwen3.8 の MoE は 512 expert / top-10 なので、1 トークン = 48 層 × 10 = **480 回の acquire**。
+
+## 34.1 計測の仕組み (`WARODECODE_EXPERT_STATS=1`)
+
+プロセス終了時に 1 行 JSON を stderr へ出す。計測点は cache の `acquire()` だけで、
+forward 側にフックを足していないので推論結果には影響しない。
+
+| フィールド | 意味 |
+|---|---|
+| accesses / hits / misses / hit_rate / evictions | スロットの当たり外れ |
+| bytes_copied / gib_copied | H2D に実際に流したバイト数 |
+| stage_ms / acquire_ms / stage_share | `cudaMemcpyAsync` 呼び出し (pageable ステージング含む) の host 時間 / acquire() 全体 |
+| token_host_ms | 層 index が減ったら次トークン、で区切った host 側トークン所要時間 |
+| layer_misses / token_miss / token_stage_ms | 層別・トークン別の内訳 |
+| distinct_pairs | 64 トークンで触れた (layer, expert) の異なり数 |
+| prev_token_reuse | 直前トークンと同じ (layer, expert) だった割合 (時間的再利用の上限) |
+| shadow | `WARODECODE_EXPERT_SHADOW=a,b,..` の容量別 LRU シミュレーション (global / 層分割) |
+
+## 34.2 ボトルネックの計測結果
+
+### A100-SXM4-40GB / 既定 cache 1536 MiB (691 slots) / 64 トークン
+
+| 指標 | 値 |
+|---|---|
+| acquire 回数 | 30720 (480/トークン) |
+| hits / misses / hit_rate | 11914 / 18806 / **0.3878** |
+| evictions | 18115 |
+| 転送量 | 37.25 GB = 34.69 GiB (543 MB/トークン) |
+| distinct_pairs | 7448 (全アクセスの 24.2% は絶対に外す強制ミス) |
+| stage_ms / acquire_ms | 9281 / 9636 (**stage_share 0.963**) |
+| stage_ms 平均 | **144 ms/トークン** (= wall 時間の 41%) |
+| host_ms/token | 350 ms (≒ wall 350 ms → host 律速) |
+| prev_token_reuse | 0.3877 (≒ hit_rate と一致) |
+| 実効ステージング帯域 | 34.69 GiB / 9.3 s ≒ **3.7 GB/s** |
+
+**読み方**:
+
+1. acquire 時間の 96% は expert スライスの staging (`cudaMemcpyAsync` の pageable
+   ステージング = CPU memcpy + ページフォルト) で、これが wall 時間の 41% を占める。
+   host 時間 ≒ wall 時間なので、既定 cache では **転送律速**である。
+2. 実効 3.7 GB/s は memcpy の限界 (~10 GB/s) より低く、**ページフォルト/ディスク側**が
+   効いている (86 GB のモデルは VM の RAM に収まらない)。
+3. 76% のアクセスは「使うと決まっている」専門家の再取得。影 LRU シミュレーションでは
+   容量 800→43.5%、1600→55.9%、3200→66.9%、6400→75.6%、12800→75.8% で、
+   実測 9002 slots (=20 GiB) の 0.7576 と一致する。**容量が効くのであって policy ではない**
+   (層分割は小容量で 1〜2 ポイント悪い)。
+4. prev_token_reuse 0.3877 ≒ hit_rate 0.3878。**この容量では LRU が時間的再利用の
+   上限に既に到達**しており、prefetch の予測上限もこの数字 (39%) を超えない。
+5. layer_misses は 234〜569 と全 48 層で満遍なく外れる (特別に熱い層は無い)。
+
+## 34.3 実装した改善と環境変数
+
+| 環境変数 | 既定 | 内容 |
+|---|---|---|
+| `WARODECODE_EXPERT_STATS` | 0 | 統計 JSON を終了時に stderr へ出す |
+| `WARODECODE_EXPERT_SHADOW` | 空 | `a,b,..` の容量で影 LRU を回し到達可能ヒット率を出す |
+| `WARODECODE_EXPERT_COPY_STREAM` | **1** | 転送を専用 non-blocking stream に分離 (0 で旧経路) |
+| `WARODECODE_EXPERT_EVICT` | global | `layer` で層ごとの LRU パーティション |
+| `WARODECODE_EXPERT_CACHE_MIB` | 既存 | 容量 (既存スイッチ) |
+
+### (1) 専用 copy stream + retire event (既定 ON)
+
+**変更前**: `cudaMemcpyAsync` を decode stream に発行していた。pageable な host →
+device コピーは「対象ストリームの同期 → ドライバのステージング memcpy → DMA」の順で、
+ステージングは呼び出しスレッドで同期実行される。対象が decode stream である以上、
+**GPU が溜まっているとホストがその完了を待ってから**次の専門家を積むことになる。
+
+**変更後**: プライベートな non-blocking stream に DMA を発行する。スロットを上書きする
+前に「そのスロットの最後の消費者がすべて enqueue された点」を retire event として
+decode stream に記録し、copy stream はそれだけを待つ。decode stream 側は転送完了の
+done event を待つ。これでホストの staging と GPU のカーネルが重なる。
+
+parity は不変 (コピーするバイトは同じ)。効果は下記の通り **GPU の混み具合に依存**する。
+
+### (2) 層ごとの LRU パーティション (`WARODECODE_EXPERT_EVICT=layer`)
+
+実装したが**効果は無し**(1536 MiB で 2.869 vs 2.859、8000 MiB で 3.507 vs 3.507、
+20000 MiB で 3.716 vs 3.715)。影 LRU でも小容量で 1〜2 ポイント悪く、policy は
+レバーではないと結論。A/B 用に残してある。
+
+### (3) 撤回: pinned ring staging (`WARODECODE_EXPERT_PIN`)
+
+`cudaMallocHost` のリングに CPU memcpy してから DMA する案。8000/20000 MiB では
+stage_ms が 36% 減り tok_s +20% だったが、**1536 MiB で parity が壊れた**
+(64/64 → 35/64, 10/64)。原因を特定できないまま既定に入れるのは危険なので**コードごと削除**した。
+再挑戦する場合は、リングの再利用ガード (event query) と DMA の順序をもう一度詰めること。
+
+### (4) 見送り: ワーカースレッドによる prefetch
+
+prev_token_reuse = 0.388 なので「前トークンの専門家を先読み」の上限は +39% ヒット。
+ただし staging は今もホスト側の同期処理で、**メインスレッドで先読みしても同じ memcpy を
+前倒しするだけ**。効果を出すには staging 自体をワーカースレッド + pinned ring に移す
+必要があり、今回の時間内では実装しなかった (上記 (3) の失敗もありリスクが高い)。
+
+## 34.4 実機 A/B (A100-SXM4-40GB, arch=80)
+
+**静かな VM** (実行中に他プロセス 0 を確認) で、転送経路だけを切り替えた 3 反復:
+
+| cache | 転送経路 | tok_s (3 反復) | 平均 | stage_ms | hit_rate | parity |
+|---|---|---|---|---|---|---|
+| 1536 MiB (691 slots) | pageable (COPY_STREAM=0) | 2.857 / 2.871 / 2.868 | 2.865 | 9281 | 0.388 | 64/64 ×3 |
+| 1536 MiB | **copy stream (既定)** | 2.869 / 2.870 / 2.859 | **2.866** | 9177 | 0.388 | 64/64 ×3 |
+| 8000 MiB (3600) | pageable | 3.516 | 3.516 | 5052 | 0.687 | 64/64 |
+| 8000 MiB | copy stream | 3.507 | 3.507 | 5092 | 0.687 | 64/64 |
+| 20000 MiB (9002) | pageable | 3.715 | 3.715 | 4074 | 0.758 | 64/64 |
+| 20000 MiB | copy stream | 3.716 | 3.716 | 4056 | 0.758 | 64/64 |
+
+→ **GPU が空いているときは差が無い** (±0.5%)。ホスト staging が律速で、GPU 待ちが
+発生していないため。既定 cache の 34.69 GiB 転送は残る (時間の 41%)。
+
+## 34.5 L4 (他担当ベンチマークと同時実行 = GPU 混雑下)
+
+同じ日に L4 では他担当の `bench/phases.sh` が 2 プロセス常時走っており
+(GPU 14 GB + 7.5 GB 使用)、その条件での対比較:
+
+| cache | 転送経路 | tok_s (3 反復) | 平均 | stage_ms | parity |
+|---|---|---|---|---|---|
+| 1536 MiB | pageable | 2.231 / 2.119 / 1.733 | 2.028 | 16963 | 64/64 ×3 |
+| 1536 MiB | **copy stream** | 2.572 / 2.805 / 2.733 | **2.703 (+33%)** | 9060 | 64/64 ×3 |
+| 8000 MiB | pageable | 2.760 | 2.760 | 8531 | 64/64 |
+| 8000 MiB | **copy stream** | 3.132 | **3.132 (+13.5%)** | 4972 | 64/64 |
+
+**GPU が混んでいるときは copy stream が効く**: 旧経路は stage_ms が 14.8 s → 20.6 s と
+悪化していく (GPU 待ちが増える) のに対し、copy stream は 9.0〜9.1 s で横ばい。
+ホストが GPU の進捗に依存しなくなるため、**共有 GPU 環境での劣化に強い**。
+これが既定 ON の根拠 (空いていて損は無く、混んでいれば大きく得)。
+
+## 34.6 parity
+
+最終コード (pinned ring 削除後) で **64/64** を確認した実行:
+
+| 条件 | 実行数 |
+|---|---|
+| A100 1536 MiB × COPY_STREAM=0/1 | 6 |
+| A100 8000 MiB / 20000 MiB × 0/1 | 4 |
+| L4 1536 MiB × 0/1, 8000 MiB × 0/1 | 8 |
+| それ以前のラウンド (COPY_STREAM, EVICT=layer 各種) | 12 以上 |
+
+COPY_STREAM の既定 ON は A100/L4・3 容量・のべ 20 本以上で 64/64。
+統計 ON でもトークン列は不変 (統計はホスト側カウンタのみ)。
+
+## 34.7 次の一手 (効果順)
+
+1. **staging をワーカースレッド化**する。現状 144 ms/トークンをホストが同期実行して
+   いる。pinned ring + 1〜2 本のワーカーで前倒しできれば、転送の 41% を隠せる見込み
+   (上限は wall の ~40%)。
+2. **容量を増やす** (VRAM が許すなら 8000 MiB 以上)。1536→8000 で +22%、8000→20000 で
+   +6%。影 LRU の到達可能ヒット率は 0.687 → 0.758 なので伸びしろは小さい。
+3. mmap の読み出しをまとめる (`madvise(MADV_WILLNEED)` を層単位で、など)。
+   予測が当たればページフォルトを先に潰せるが、外すとページキャッシュを汚す。
+4. dp4a / tensor core 化 (既存課題)。転送が隠れれば計算側が次の律速になる。
+
+## 34.8 未検証リスク
+
+- **retire event の契約**: 「スロットを使うカーネルは次の acquire() より前に enqueue
+  される」ことに依存する。qwen38_moe.cuh の 4 か所の acquire ループは全てこの形だが、
+  将来ループの外へビューを持ち出すと静かに壊れる。ヘッダにコメントで明記した。
+- **測定環境**: A100/L4 は他担当と共有しており、同一構成でも 2.0〜2.9 tok/s とばらつく。
+  上の表は対比較 (同じ時間帯・交互実行) のみを根拠にしている。
+- **pinned ring staging のバグは未解明**: 「1536 MiB の高 churn 時のみ壊れる」までしか
+  分かっていない。削除したが、同じ設計に再挑戦する場合は要注意。
+- **統計のトークン境界**は「層 index が減ったら次トークン」で判定する。decode 専用の
+  前提で、prefill/verify のように 1 ステップで複数トークンを処理する経路では内訳が崩れる。
+- **統計 ON のオーバーヘッド**は 1% 未満 (dflt 2.755 vs cs 2.737 の差は同条件の再測定で
+  0.3% 以内)。
+- L4 の 20000 MiB は 24 GB VRAM に載らないため未測定 (docs 追記 25 で 18000 MiB も失敗)。
+
+---
+
+# 追記 26 (2026-10-14 夜): MTP 投機的デコードの実装と実測
+
+詳細は docs/MTP_SPECULATIVE_DECODE.md。要点のみ:
+
+## 35.1 実装
+
+src/qwen38_mtp.cuh (新規) に blk.48 の forward と draft→verify ループを実装した。
+MTP ブロックは **blk.48 の QSA 層そのもの** (ratio 4) + nextn 7 テンソル
+(enorm / hnorm / eh_proj / hc_head_{norm,down,up} / shared_head_head)。
+forward は hnorm(trunk 広域残差) と enorm(次トークン埋め込み) を stream ごとに concat →
+eh_proj → 既存の QSA/MoE/HC カーネル → hc_head_mix → shared_head_head (Q4_0 専用 GEMV)。
+
+- 環境変数: WARODECODE_MTP (既定 OFF) / WARODECODE_MTP_DRAFT (k, 既定 2) /
+  WARODECODE_MTP_EXPERT_CACHE_MIB (既定 1024) / WARODECODE_MTP_PROFILE
+- CLI: --mtp / --mtp-draft K
+- JSON: mtp, mtp_draft, mtp_calls, mtp_draft_tokens, mtp_accepts, mtp_accept_rate,
+  mtp_full_rounds, mtp_rounds, mtp_draft_ms, mtp_stage_*
+
+## 35.2 parity
+
+MTP OFF / ON k=2,3,4 のすべてで **64/64 一致** (L4 と A100、token_hash は
+0x6684298df825c691 で全 run 同一)。受理判定は trunk の argmax との int 完全一致で、
+draft を trunk に食わせるのは一致したときだけなので、出力列は構造的に不変。
+
+## 35.3 実測 (64 トークン, trunk expert cache: L4 8000 / A100 20000 MiB)
+
+| GPU | OFF | ON k=2 | ON k=3 | ON k=4 | 受理率 (k=2/3/4) |
+|---|---|---|---|---|---|
+| L4 24GB | 4.105 | 3.941 | 3.851 | 3.888 | 0.500 / 0.386 / 0.313 |
+| A100 40GB | 3.722 | 3.581 | 3.563 | 3.558 | 0.500 / 0.386 / 0.313 |
+
+**MTP は遅くなる (-3.8 〜 -6.2%)**。ON の時間 = OFF の時間 + draft 時間で、trunk step 数は
+トークン数と 1:1 のまま (1 ラウンドで出るトークン数 = trunk step 数)。
+draft 1 回は A100 8〜11 ms / L4 8.7〜12 ms で、trunk 1 step (A100 269 ms / L4 244 ms) の
+4% 程度。したがって「draft を速くする」方向では利得が出ず、**M トークン同時 verify** が
+必要。受理率は悪くなく (k=2 の内訳から 1 個目 62.5%、2 個目 60%)、M=3 verify の
+期待出力は 2.0 トークン。verify バッチの相対コスト c が 1.2〜1.5 なら 1.26〜1.56x の見込み
+(未実装)。
+
+192 トークン (ctx 512) も 1 回ずつ測ったが、OFF 3.622 / ON 4.093 と逆向きの差が出た。
+共有 VM のばらつきが MTP の数 % を覆い隠すため、長期 1 回では判定できない。
+
+## 35.4 副産物: このエンジンはカーネル起動律速
+
+A100 の trunk 1 step 269 ms の内訳 (WARODECODE_PROFILE=1): MoE 141 ms (52%)、
+hc_mix attn/ffn 各 40 ms (30%)、attention 44 ms (16%)、head 1.3 ms、PLE 0.6 ms。
+重み転送量 ~4.4 GB/token を 269 ms で割ると **16 GB/s** (A100 HBM は 1.9 TB/s) にしか
+ならない。HC mix 1 回は 7 MB (0.03 ms 相当) を 0.83 ms で処理しており、1 トークンで
+2,000〜2,500 カーネル × 約 107 µs という「起動・同期レイテンシ支配」が確定した。
+MTP の draft も同じで、1 forward の 70〜79% は MoE の 50 launch である。
+
+この事実は MTP の見通しにとって良い材料でもある: M トークンを 1 パスにすると
+カーネル数がほぼ M 分の 1 になるため、帯域律速なら得られない利得が期待できる。
+
+## 35.5 未検証リスク
+
+- MTP の attention は学習時と同じ QSA (ratio 4)。参照実装の llama.cpp は draft に
+  dense attention を使っており、acceptance を最大化する構成は未検証。
+- M トークン verify は未実装 (現状は batch=1 の逐次 verify で、高速化しない)。
+- VRAM 増は +約 3.7 GB (head 0.64 GB + MTP expert pool 3072 MiB)。A100 で trunk
+  cache 30000 MiB と併用するのは非現実的。
+- 64 トークンの短いベンチは MTP expert 2.7 GB の初回読み込みを平均に含む
+  (コールド時 55 ms/step → 温時 8.7〜12 ms/step)。
+
+
+## 36. Task H: expert 重み転送の帯域改善 (pread + pinned ring + 並列 pread)
+
+詳細は `docs/TASK_H_EXPERT_IO.md`。ここには結論だけ残す。
+
+### 36.1 切り分け
+
+`tests/expert_io_bandwidth.cu` で 2 MiB チャンク 128 本を各経路で読んだ (A100):
+
+| 経路 | GB/s | ms/2MiB |
+|---|---|---|
+| `mmap+h2d` (= 旧経路) | 3.75 | 0.559 |
+| `pageable+h2d` (ホットな malloc 元) | 6.83 | 0.307 |
+| `pinpread+h2d` (pinned へ pread → DMA) | 6.68 | 0.314 |
+| `pin+h2d` (充填済み pinned からの純 DMA) | 12.1 (同期時) | 0.002 (enqueue) |
+| `odirect` | 1.82 | 1.152 |
+| `mmap` (resident 36%) | 0.46 | 4.553 |
+
+- 旧経路 0.559 ms のうち **約 0.25 ms はマッピングのページフォルト**
+  (64 KiB fault-around で 33 回/2MiB)、残りがドライバの pageable ステージング。
+- A100 は転送 34.69 GiB のうち 93% がページキャッシュ resident。
+  **ディスク律速ではなくページフォルト律速** (§34.2 の推定のうちディスク側を否定)。
+- L4 は resident 59% で旧経路が major fault により **0.32 GB/s** まで崩壊する。
+  同一バイト列を `pread` なら 6.8 GB/s。
+- `MADV_WILLNEED/POPULATE_READ/SEQUENTIAL` も `posix_fadvise(WILLNEED)` も
+  mmap 経路を改善しない (3.68 / 3.36 GB/s)。`O_DIRECT` は 1.8 GB/s で非採用。
+- 単一コアの memcpy が上限。並列 pread は 2 スレッド 12.3 / 4 スレッド 17.8 GB/s。
+
+### 36.2 実装 (`src/expert_cache.cuh`)
+
+`/proc/self/maps` でポインタ→file offset と fd を解決し、`pread()` で pinned リング
+(スロットと同じレイアウト) に読み、連続領域を 1 回の `cudaMemcpyAsync` で DMA する。
+DMA は copy stream 上なのでホストはクリティカルパスから外れる。ring エントリごとに
+DMA 完了イベントを持ち、再利用前に `cudaEventSynchronize()` する
+(§34.3 で撤回した `WARODECODE_EXPERT_PIN` はこのガードが無かったのが原因と推定)。
+
+| 環境変数 | 既定 | 内容 |
+|---|---|---|
+| `WARODECODE_EXPERT_IO_PREAD` | 1 | 0 で旧 pageable 経路 |
+| `WARODECODE_EXPERT_IO_THREADS` | 4 | pread ワーカー数 (1 = スレッド無し) |
+| `WARODECODE_EXPERT_IO_RING` | 4 | pinned リング本数 |
+| `WARODECODE_EXPERT_IO_FADVISE` | off | willneed 等 (効果なし) |
+
+parity ガード: 起動時の `verify_mapping()` (スロット全体を memcmp)、
+ring 再利用イベント、短読み時の旧経路フォールバック、
+`tests/expert_io_pool_host_check.sh` (13 チェック)。
+
+### 36.3 実測 (64 token greedy, 同一条件の対比較)
+
+| | 旧経路 | pread 1 スレッド | pread 既定 (4 スレッド) |
+|---|---|---|---|
+| A100 1536 MiB | 2.894 tok/s | 3.268 (+13%) | **4.089 (+41%)** |
+| A100 20000 MiB | 3.740 | 4.016 (+7%) | **4.516 (+21%)** |
+| L4 1536 MiB | 3.271 | 3.808 (+16%) | **4.795 (+47%)** (3 スレッド) |
+| L4 8000 MiB | 4.109 | 4.559 (+11%) | **5.287 (+29%)** (3 スレッド) |
+
+ステージング帯域は 3.6〜3.9 → 14〜17 GiB/s。stage 以外の約 210 ms/token が
+新しい床になる (旧経路の wall は「stage + 210 ms」でほぼ説明できる)。
+
+### 36.4 parity
+
+最終コードで **64/64** を確認した本数: **A100 42 本 / L4 38 本** (容量 1536 / 8000 / 20000、
+スレッド 1/2/3/4、pageable / pread / willneed、既定 ON/OFF)。
+中間版に「スライス間の隙間を無視した分割で最終スライスを切り詰める」バグがあり、
+その版は A100/L4 の全ケースで matched_prefix=0 になった (A/B ごとの parity 確認が検出)。

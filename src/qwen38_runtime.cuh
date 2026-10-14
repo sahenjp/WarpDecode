@@ -200,16 +200,22 @@ inline Qwen38Runtime load_qwen38_runtime(
 
     if (rt.layers.empty()) throw std::runtime_error("Qwen3.8 has no trunk layers");
     const auto & sample = rt.layers.front().routed;
+    ExpertCacheOptions cache_options;
+    cache_options.stats = rt.tuning.expert_stats;
+    cache_options.copy_stream = rt.tuning.expert_copy_stream;
+    cache_options.layer_evict = rt.tuning.expert_layer_evict;
+    cache_options.layer_count = rt.layout.trunk_layers;
+    cache_options.shadow_slots = rt.tuning.expert_shadow_slots;
     if (rt.fused_experts) {
         rt.fused_expert_cache.initialize(
             static_cast<size_t>(rt.tuning.expert_cache_mib),
-            *sample.gate_up, *sample.down);
+            *sample.gate_up, *sample.down, cache_options);
         rt.expert_cache_slots = rt.fused_expert_cache.slot_count();
     } else {
         rt.expert_cache.initialize(
             static_cast<size_t>(rt.tuning.expert_cache_mib),
             *sample.gate, *sample.up, *sample.down,
-            max_gate_bytes, max_up_bytes, max_down_bytes);
+            max_gate_bytes, max_up_bytes, max_down_bytes, cache_options);
         rt.expert_cache_slots = rt.expert_cache.slot_count();
     }
 

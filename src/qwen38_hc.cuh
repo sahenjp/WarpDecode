@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -853,12 +854,285 @@ __global__ void q38_hc_copy_half_to_f32_kernel(
     if (i < n) output[i] = __half2float(input[i]);
 }
 
+// ---------------------------------------------------------------------------
+// Task J: HC mix kernel-level attribution.
+//
+// Task F measured hc_mix_attn + hc_mix_ffn at ~40 ms each (80 ms = 30% of an
+// A100 decode token) with CUDA events around the *whole* region. That number
+// cannot say whether the GPU is executing the HC kernels or idling between
+// them, so this profiler brackets every kernel launch inside the HC mix with
+// its own event pair and reports the summed GPU-timeline duration per site.
+//
+// The distinction matters: sum(kernel) ~= region means the kernels themselves
+// are expensive; sum(kernel) << region means the region is dominated by a
+// host-side stall (launch gap / blocking transfer) and the fix is different.
+//
+// Enabled by WARODECODE_HC_PROFILE=1. With the switch off the class is empty
+// and every hook is one predictable branch, so the default decode path is
+// unchanged bit for bit.
+// ---------------------------------------------------------------------------
+enum Q38HcSite : int {
+    kQ38HcSiteAttnF16Norm = 0,
+    kQ38HcSiteAttnF16Down,
+    kQ38HcSiteAttnF16Silu,
+    kQ38HcSiteAttnF16Up,
+    kQ38HcSiteAttnF16Mix,
+    kQ38HcSiteAttnF16Inject,
+    kQ38HcSiteAttnQ8Gamma,
+    kQ38HcSiteAttnQ8Norm,
+    kQ38HcSiteAttnQ8QuantNorm,
+    kQ38HcSiteAttnQ8Down,
+    kQ38HcSiteAttnQ8DownCopy,
+    kQ38HcSiteAttnQ8Silu,
+    kQ38HcSiteAttnQ8QuantLow,
+    kQ38HcSiteAttnQ8Up,
+    kQ38HcSiteAttnQ8Mix,
+    kQ38HcSiteAttnQ8Inject,
+    kQ38HcSiteAttnOutCopy,
+    kQ38HcSiteAttnInjectCopy,
+    kQ38HcSiteAttnRegion,
+    kQ38HcSiteFfnF16Norm,
+    kQ38HcSiteFfnF16Down,
+    kQ38HcSiteFfnF16Silu,
+    kQ38HcSiteFfnF16Up,
+    kQ38HcSiteFfnF16Mix,
+    kQ38HcSiteFfnF16Inject,
+    kQ38HcSiteFfnQ8Gamma,
+    kQ38HcSiteFfnQ8Norm,
+    kQ38HcSiteFfnQ8QuantNorm,
+    kQ38HcSiteFfnQ8Down,
+    kQ38HcSiteFfnQ8DownCopy,
+    kQ38HcSiteFfnQ8Silu,
+    kQ38HcSiteFfnQ8QuantLow,
+    kQ38HcSiteFfnQ8Up,
+    kQ38HcSiteFfnQ8Mix,
+    kQ38HcSiteFfnQ8Inject,
+    kQ38HcSiteFfnOutCopy,
+    kQ38HcSiteFfnInjectCopy,
+    kQ38HcSiteFfnRegion,
+    kQ38HcSiteCombineAttn,
+    kQ38HcSiteCombineFfn,
+    kQ38HcSiteHeadMix,
+    kQ38HcSiteCount
+};
+
+// Site offsets used by the shared mix bodies, relative to the bank base.
+enum Q38HcMixSlot : int {
+    kQ38HcMixF16Norm = 0,
+    kQ38HcMixF16Down = 1,
+    kQ38HcMixF16Silu = 2,
+    kQ38HcMixF16Up = 3,
+    kQ38HcMixF16Mix = 4,
+    kQ38HcMixF16Inject = 5,
+    kQ38HcMixQ8Gamma = 6,
+    kQ38HcMixQ8Norm = 7,
+    kQ38HcMixQ8QuantNorm = 8,
+    kQ38HcMixQ8Down = 9,
+    kQ38HcMixQ8DownCopy = 10,
+    kQ38HcMixQ8Silu = 11,
+    kQ38HcMixQ8QuantLow = 12,
+    kQ38HcMixQ8Up = 13,
+    kQ38HcMixQ8Mix = 14,
+    kQ38HcMixQ8Inject = 15,
+    kQ38HcMixOutCopy = 16,
+    kQ38HcMixInjectCopy = 17,
+    kQ38HcMixRegion = 18
+};
+
+inline const char * q38_hc_site_name(int site) {
+    switch (site) {
+        case kQ38HcSiteAttnF16Norm: return "attn.f16_norm";
+        case kQ38HcSiteAttnF16Down: return "attn.f16_down";
+        case kQ38HcSiteAttnF16Silu: return "attn.f16_silu";
+        case kQ38HcSiteAttnF16Up: return "attn.f16_up";
+        case kQ38HcSiteAttnF16Mix: return "attn.f16_mix";
+        case kQ38HcSiteAttnF16Inject: return "attn.f16_inject";
+        case kQ38HcSiteAttnQ8Gamma: return "attn.q8_gamma_h2d";
+        case kQ38HcSiteAttnQ8Norm: return "attn.q8_norm";
+        case kQ38HcSiteAttnQ8QuantNorm: return "attn.q8_quant_norm";
+        case kQ38HcSiteAttnQ8Down: return "attn.q8_down";
+        case kQ38HcSiteAttnQ8DownCopy: return "attn.q8_down_copy";
+        case kQ38HcSiteAttnQ8Silu: return "attn.q8_silu";
+        case kQ38HcSiteAttnQ8QuantLow: return "attn.q8_quant_low";
+        case kQ38HcSiteAttnQ8Up: return "attn.q8_up";
+        case kQ38HcSiteAttnQ8Mix: return "attn.q8_mix";
+        case kQ38HcSiteAttnQ8Inject: return "attn.q8_inject";
+        case kQ38HcSiteAttnOutCopy: return "attn.out_copy";
+        case kQ38HcSiteAttnInjectCopy: return "attn.inject_copy";
+        case kQ38HcSiteAttnRegion: return "attn.region_total";
+        case kQ38HcSiteFfnF16Norm: return "ffn.f16_norm";
+        case kQ38HcSiteFfnF16Down: return "ffn.f16_down";
+        case kQ38HcSiteFfnF16Silu: return "ffn.f16_silu";
+        case kQ38HcSiteFfnF16Up: return "ffn.f16_up";
+        case kQ38HcSiteFfnF16Mix: return "ffn.f16_mix";
+        case kQ38HcSiteFfnF16Inject: return "ffn.f16_inject";
+        case kQ38HcSiteFfnQ8Gamma: return "ffn.q8_gamma_h2d";
+        case kQ38HcSiteFfnQ8Norm: return "ffn.q8_norm";
+        case kQ38HcSiteFfnQ8QuantNorm: return "ffn.q8_quant_norm";
+        case kQ38HcSiteFfnQ8Down: return "ffn.q8_down";
+        case kQ38HcSiteFfnQ8DownCopy: return "ffn.q8_down_copy";
+        case kQ38HcSiteFfnQ8Silu: return "ffn.q8_silu";
+        case kQ38HcSiteFfnQ8QuantLow: return "ffn.q8_quant_low";
+        case kQ38HcSiteFfnQ8Up: return "ffn.q8_up";
+        case kQ38HcSiteFfnQ8Mix: return "ffn.q8_mix";
+        case kQ38HcSiteFfnQ8Inject: return "ffn.q8_inject";
+        case kQ38HcSiteFfnOutCopy: return "ffn.out_copy";
+        case kQ38HcSiteFfnInjectCopy: return "ffn.inject_copy";
+        case kQ38HcSiteFfnRegion: return "ffn.region_total";
+        case kQ38HcSiteCombineAttn: return "attn.combine";
+        case kQ38HcSiteCombineFfn: return "ffn.combine";
+        case kQ38HcSiteHeadMix: return "head.mix";
+        default: return "unknown";
+    }
+}
+
+struct Q38HcSiteStat {
+    unsigned long long calls = 0;
+    double total_ms = 0.0;
+};
+
+class Q38HcKernelProfiler {
+public:
+    static constexpr int kCap = 96;
+
+    static Q38HcKernelProfiler & instance() {
+        static Q38HcKernelProfiler profiler;
+        return profiler;
+    }
+
+    bool enabled() const { return enabled_; }
+
+    void mark_begin(int base_site, int offset, cudaStream_t stream) {
+        if (!enabled_) return;
+        const int site = base_site + offset;
+        if (site < 0 || site >= kQ38HcSiteCount) return;
+        // Nested brackets (a wrapper around a helper that also brackets) stay
+        // one interval: only the outermost pair records.
+        if (depth_[site]++ != 0) return;
+        pending_start_[site] = start_[index(site, 0)];
+        if (cudaEventRecord(pending_start_[site], stream) != cudaSuccess) {
+            pending_start_[site] = nullptr;
+        }
+    }
+
+    void mark_end(int base_site, int offset, cudaStream_t stream) {
+        if (!enabled_) return;
+        const int site = base_site + offset;
+        if (site < 0 || site >= kQ38HcSiteCount) return;
+        if (depth_[site] <= 0) return;
+        if (--depth_[site] != 0) return;
+        const int slot = written_[site];
+        if (slot >= kCap || pending_start_[site] == nullptr) {
+            ++overflow_[site];
+            pending_start_[site] = nullptr;
+            return;
+        }
+        if (cudaEventRecord(stop_[index(site, slot)], stream) != cudaSuccess) {
+            ++overflow_[site];
+            pending_start_[site] = nullptr;
+            return;
+        }
+        start_[index(site, slot)] = pending_start_[site];
+        pending_start_[site] = nullptr;
+        ++written_[site];
+    }
+
+    // Called once per decode token, after the stream synchronise: every recorded
+    // event is complete there, so cudaEventElapsedTime() cannot return
+    // cudaErrorNotReady.
+    void flush_token() {
+        if (!enabled_) return;
+        for (int s = 0; s < kQ38HcSiteCount; ++s) {
+            Q38HcSiteStat & stat = stats_[s];
+            for (int i = 0; i < written_[s]; ++i) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, start_[index(s, i)], stop_[index(s, i)]) == cudaSuccess) {
+                    stat.total_ms += static_cast<double>(ms);
+                    ++stat.calls;
+                }
+            }
+            written_[s] = 0;
+            depth_[s] = 0;
+            pending_start_[s] = nullptr;
+        }
+        ++tokens_;
+    }
+
+    void print_summary() const {
+        if (!enabled_ || tokens_ == 0) return;
+        const double div = static_cast<double>(tokens_);
+        std::fprintf(stderr, "[hc-profile] tokens=%llu unit=ms_per_token\n",
+                     static_cast<unsigned long long>(tokens_));
+        for (int s = 0; s < kQ38HcSiteCount; ++s) {
+            const Q38HcSiteStat & stat = stats_[s];
+            if (stat.calls == 0) continue;
+            std::fprintf(stderr, "[hc-profile] %-22s %9.4f  calls/token=%.2f\n",
+                         q38_hc_site_name(s), stat.total_ms / div,
+                         static_cast<double>(stat.calls) / div);
+        }
+    }
+
+private:
+    Q38HcKernelProfiler() {
+        const char * v = std::getenv("WARODECODE_HC_PROFILE");
+        enabled_ = v != nullptr && v[0] != '\0' && v[0] != '0';
+        if (!enabled_) return;
+        for (size_t i = 0; i < start_.size(); ++i) {
+            if (cudaEventCreate(&start_[i]) != cudaSuccess ||
+                cudaEventCreate(&stop_[i]) != cudaSuccess) {
+                enabled_ = false;
+                return;
+            }
+        }
+    }
+
+    ~Q38HcKernelProfiler() { print_summary(); }
+
+    Q38HcKernelProfiler(const Q38HcKernelProfiler &) = delete;
+    Q38HcKernelProfiler & operator=(const Q38HcKernelProfiler &) = delete;
+
+    static size_t index(int site, int slot) {
+        return static_cast<size_t>(site) * static_cast<size_t>(kCap) + static_cast<size_t>(slot);
+    }
+
+    bool enabled_ = false;
+    unsigned long long tokens_ = 0;
+    std::array<cudaEvent_t, static_cast<size_t>(kQ38HcSiteCount) * kCap> start_{};
+    std::array<cudaEvent_t, static_cast<size_t>(kQ38HcSiteCount) * kCap> stop_{};
+    int written_[kQ38HcSiteCount] = {};
+    int overflow_[kQ38HcSiteCount] = {};
+    int depth_[kQ38HcSiteCount] = {};
+    cudaEvent_t pending_start_[kQ38HcSiteCount] = {};
+    Q38HcSiteStat stats_[kQ38HcSiteCount] = {};
+};
+
+// RAII bracket for one kernel launch inside the HC mix. base_site selects the
+// attn or ffn site bank so the shared mix bodies report into the right slots.
+class Q38HcKernelScope {
+public:
+    Q38HcKernelScope(int base_site, int offset, cudaStream_t stream)
+        : base_site_(base_site), offset_(offset), stream_(stream) {
+        Q38HcKernelProfiler::instance().mark_begin(base_site_, offset_, stream_);
+    }
+    ~Q38HcKernelScope() {
+        Q38HcKernelProfiler::instance().mark_end(base_site_, offset_, stream_);
+    }
+    Q38HcKernelScope(const Q38HcKernelScope &) = delete;
+    Q38HcKernelScope & operator=(const Q38HcKernelScope &) = delete;
+
+private:
+    int base_site_;
+    int offset_;
+    cudaStream_t stream_;
+};
+
 inline void run_qwen38_hc_f32_mix_from_residual(
         const float * residual,
         const Qwen38HcWeights & w,
         Qwen38HcF32DebugScratch & scratch,
         float eps,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int base_site = kQ38HcSiteAttnF16Norm) {
     const int hidden = scratch.hidden();
     const int hc = scratch.hc();
     const int hc_dim = hidden * hc;
@@ -869,28 +1143,51 @@ inline void run_qwen38_hc_f32_mix_from_residual(
         w.up.cols != scratch.low_rank() || w.up.rows != hc_dim) {
         throw std::runtime_error("layer-0 HC F32 mix geometry/type mismatch");
     }
-    cudaError_t e = cudaMemcpyAsync(
-        scratch.gamma(), w.debug_norm_f32.data(), static_cast<size_t>(hc_dim) * sizeof(float),
-        cudaMemcpyHostToDevice, stream);
+    cudaError_t e = cudaSuccess;
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Gamma, stream);
+        e = cudaMemcpyAsync(
+            scratch.gamma(), w.debug_norm_f32.data(), static_cast<size_t>(hc_dim) * sizeof(float),
+            cudaMemcpyHostToDevice, stream);
+    }
     if (e != cudaSuccess) throw std::runtime_error("copy layer-0 HC F32 norm failed");
 
     constexpr int threads = 256;
-    q38_hc_group_rmsnorm_f32_kernel<<<hc, threads, 0, stream>>>(
-        residual, scratch.gamma(), scratch.norm(), hidden, hc, eps);
-    launch_q8_0_gemv_q8_1_f32(w.down.low, scratch.norm(), scratch.low_raw(), scratch.q8_1(), stream);
-    e = cudaMemcpyAsync(
-        scratch.low(), scratch.low_raw(), static_cast<size_t>(scratch.low_rank()) * sizeof(float),
-        cudaMemcpyDeviceToDevice, stream);
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Norm, stream);
+        q38_hc_group_rmsnorm_f32_kernel<<<hc, threads, 0, stream>>>(
+            residual, scratch.gamma(), scratch.norm(), hidden, hc, eps);
+    }
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Down, stream);
+        launch_q8_0_gemv_q8_1_f32(w.down.low, scratch.norm(), scratch.low_raw(), scratch.q8_1(), stream);
+    }
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8DownCopy, stream);
+        e = cudaMemcpyAsync(
+            scratch.low(), scratch.low_raw(), static_cast<size_t>(scratch.low_rank()) * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream);
+    }
     if (e != cudaSuccess) throw std::runtime_error("copy layer-0 HC F32 low projection failed");
-    q38_hc_silu_scale_f32_kernel<<<(scratch.low_rank() + threads - 1) / threads, threads, 0, stream>>>(
-        scratch.low(), scratch.low_rank(), 1.0f / static_cast<float>(hc));
-    launch_q8_0_gemv_q8_1_f32(w.up.low, scratch.low(), scratch.gate(), scratch.q8_1(), stream);
-    q38_hc_mix_f32_kernel<<<(hidden + threads - 1) / threads, threads, 0, stream>>>(
-        scratch.norm(), scratch.gate(), scratch.mixed(), hidden, hc);
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Silu, stream);
+        q38_hc_silu_scale_f32_kernel<<<(scratch.low_rank() + threads - 1) / threads, threads, 0, stream>>>(
+            scratch.low(), scratch.low_rank(), 1.0f / static_cast<float>(hc));
+    }
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Up, stream);
+        launch_q8_0_gemv_q8_1_f32(w.up.low, scratch.low(), scratch.gate(), scratch.q8_1(), stream);
+    }
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Mix, stream);
+        q38_hc_mix_f32_kernel<<<(hidden + threads - 1) / threads, threads, 0, stream>>>(
+            scratch.norm(), scratch.gate(), scratch.mixed(), hidden, hc);
+    }
     if (!w.debug_inject_f32.empty()) {
         if (w.debug_inject_f32.size() != static_cast<size_t>(hc_dim * hc)) {
             throw std::runtime_error("layer-0 HC F32 inject geometry mismatch");
         }
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Inject, stream);
         e = cudaMemcpyAsync(scratch.inject_weights(), w.debug_inject_f32.data(),
                             w.debug_inject_f32.size() * sizeof(float), cudaMemcpyHostToDevice, stream);
         if (e != cudaSuccess) throw std::runtime_error("copy layer-0 HC F32 inject weights failed");
@@ -904,7 +1201,8 @@ inline void run_qwen38_hc_q8_0_f32_mix_from_residual(
         const Qwen38HcWeights & w,
         Qwen38HcF32DebugScratch & scratch,
         float eps,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int base_site = kQ38HcSiteAttnF16Norm) {
     const int hidden = scratch.hidden();
     const int hc = scratch.hc();
     const int hc_dim = hidden * hc;
@@ -917,40 +1215,67 @@ inline void run_qwen38_hc_q8_0_f32_mix_from_residual(
         throw std::runtime_error("exact Q8_0 HC replay weight geometry/type mismatch");
     }
 
-    cudaError_t e = cudaMemcpyAsync(
-        scratch.gamma(), w.debug_norm_f32.data(), static_cast<size_t>(hc_dim) * sizeof(float),
-        cudaMemcpyHostToDevice, stream);
+    cudaError_t e = cudaSuccess;
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Gamma, stream);
+        e = cudaMemcpyAsync(
+            scratch.gamma(), w.debug_norm_f32.data(), static_cast<size_t>(hc_dim) * sizeof(float),
+            cudaMemcpyHostToDevice, stream);
+    }
     if (e != cudaSuccess) throw std::runtime_error("copy exact Q8_0 HC norm weights failed");
-    q38_hc_group_rmsnorm_f32_kernel<<<hc, 256, 0, stream>>>(
-        residual, scratch.gamma(), scratch.norm(), hidden, hc, eps);
-
     constexpr int q8_threads = 256;
     constexpr int warps = q8_threads / 32;
     const int down_blocks = hc_dim / 32;
-    q38_hc_q8_0_quantize_f32_exact_kernel<<<(down_blocks + warps - 1) / warps,
-                                              q8_threads, 0, stream>>>(
-        scratch.norm(), hc_dim, scratch.q8_0_values(), scratch.q8_0_scales());
-    q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(low_rank + warps - 1) / warps,
-                                               q8_threads, 0, stream>>>(
-        w.down.low.data, scratch.q8_0_values(), scratch.q8_0_scales(),
-        scratch.low_raw(), low_rank, hc_dim);
-    e = cudaMemcpyAsync(scratch.low(), scratch.low_raw(),
-                        static_cast<size_t>(low_rank) * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Norm, stream);
+        q38_hc_group_rmsnorm_f32_kernel<<<hc, 256, 0, stream>>>(
+            residual, scratch.gamma(), scratch.norm(), hidden, hc, eps);
+    }
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8QuantNorm, stream);
+        q38_hc_q8_0_quantize_f32_exact_kernel<<<(down_blocks + warps - 1) / warps,
+                                                  q8_threads, 0, stream>>>(
+            scratch.norm(), hc_dim, scratch.q8_0_values(), scratch.q8_0_scales());
+    }
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Down, stream);
+        q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(low_rank + warps - 1) / warps,
+                                                   q8_threads, 0, stream>>>(
+            w.down.low.data, scratch.q8_0_values(), scratch.q8_0_scales(),
+            scratch.low_raw(), low_rank, hc_dim);
+    }
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8DownCopy, stream);
+        e = cudaMemcpyAsync(scratch.low(), scratch.low_raw(),
+                            static_cast<size_t>(low_rank) * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+    }
     if (e != cudaSuccess) throw std::runtime_error("copy exact Q8_0 HC down projection failed");
-    q38_hc_silu_scale_ggml_f32_kernel<<<(low_rank + 255) / 256, 256, 0, stream>>>(
-        scratch.low(), low_rank, 1.0f / static_cast<float>(hc));
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Silu, stream);
+        q38_hc_silu_scale_ggml_f32_kernel<<<(low_rank + 255) / 256, 256, 0, stream>>>(
+            scratch.low(), low_rank, 1.0f / static_cast<float>(hc));
+    }
 
     const int low_blocks = low_rank / 32;
-    q38_hc_q8_0_quantize_f32_exact_kernel<<<(low_blocks + warps - 1) / warps,
-                                              q8_threads, 0, stream>>>(
-        scratch.low(), low_rank, scratch.q8_0_values(), scratch.q8_0_scales());
-    q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(hc_dim + warps - 1) / warps,
-                                               q8_threads, 0, stream>>>(
-        w.up.low.data, scratch.q8_0_values(), scratch.q8_0_scales(),
-        scratch.gate(), hc_dim, low_rank);
-    q38_hc_mix_f32_cpu_order_kernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
-        scratch.norm(), scratch.gate(), scratch.mixed(), hidden, hc);
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8QuantLow, stream);
+        q38_hc_q8_0_quantize_f32_exact_kernel<<<(low_blocks + warps - 1) / warps,
+                                                  q8_threads, 0, stream>>>(
+            scratch.low(), low_rank, scratch.q8_0_values(), scratch.q8_0_scales());
+    }
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Up, stream);
+        q38_hc_q8_0_q8_0_exact_gemv_f32_kernel<<<(hc_dim + warps - 1) / warps,
+                                                   q8_threads, 0, stream>>>(
+            w.up.low.data, scratch.q8_0_values(), scratch.q8_0_scales(),
+            scratch.gate(), hc_dim, low_rank);
+    }
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixQ8Mix, stream);
+        q38_hc_mix_f32_cpu_order_kernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
+            scratch.norm(), scratch.gate(), scratch.mixed(), hidden, hc);
+    }
 }
 
 // Exact Q8_0 HC mix for the F32 inject path. The grouped RMSNorm, the Q8_0
@@ -967,7 +1292,8 @@ inline void run_qwen38_hc_q8_0_f32_mix_with_inject_from_residual(
         const Qwen38HcWeights & w,
         Qwen38HcF32DebugScratch & scratch,
         float eps,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int base_site = kQ38HcSiteAttnF16Norm) {
     const int hc = scratch.hc();
     const int hc_dim = scratch.hidden() * hc;
     if (!qwen38_hc_f32_inject_ready(w)) {
@@ -976,12 +1302,13 @@ inline void run_qwen38_hc_q8_0_f32_mix_with_inject_from_residual(
     if (w.inject_f32.size != static_cast<size_t>(hc_dim) * static_cast<size_t>(hc)) {
         throw std::runtime_error("HC F32 inject weight geometry mismatch");
     }
-    run_qwen38_hc_q8_0_f32_mix_from_residual(residual, w, scratch, eps, stream);
+    run_qwen38_hc_q8_0_f32_mix_from_residual(residual, w, scratch, eps, stream, base_site);
 
     // Same dense F32 GEMV the legacy dense path uses, but reading the F32
     // weights and the F32 norm, writing the unrounded [hc] result, and - with
     // WARODECODE_HC_INJECT_F32_AVX2 (default ON) - in the ggml_vec_dot_f32 order
     // the CPU oracle uses for the F32 inject weight.
+    Q38HcKernelScope scope(base_site, kQ38HcMixQ8Inject, stream);
     q38_hc_launch_dense_gemv_f32(
         w.inject_f32.data, scratch.norm(), scratch.inject(), hc, hc_dim, stream);
 }
@@ -1266,7 +1593,8 @@ inline __half * run_qwen38_hc_mix(
         float * trace_down_f32 = nullptr,
         float * trace_low_pre_activation = nullptr,
         float * trace_gate_f32 = nullptr,
-        const float * norm_override_f32 = nullptr) {
+        const float * norm_override_f32 = nullptr,
+        int base_site = kQ38HcSiteAttnF16Norm) {
     const int hidden = scratch.hidden();
     const int hc = scratch.hc();
     const int hc_dim = hidden * hc;
@@ -1277,35 +1605,51 @@ inline __half * run_qwen38_hc_mix(
         throw std::runtime_error("HC weight geometry mismatch");
     }
 
-    if (norm_override_f32) {
-        q38_hc_copy_f32_to_half_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
-            norm_override_f32, scratch.xn(), hc_dim);
-    } else {
-        q38_hc_group_rmsnorm_f32in_kernel<<<hc, 256, 0, stream>>>(
-            residual, w.norm.data, scratch.xn(), hidden, hc, rms_eps);
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixF16Norm, stream);
+        if (norm_override_f32) {
+            q38_hc_copy_f32_to_half_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                norm_override_f32, scratch.xn(), hc_dim);
+        } else {
+            q38_hc_group_rmsnorm_f32in_kernel<<<hc, 256, 0, stream>>>(
+                residual, w.norm.data, scratch.xn(), hidden, hc, rms_eps);
+        }
     }
-    launch_matrix_gemv_half(w.down, scratch.xn(), scratch.lo(), stream);
-    if (trace_down_f32) launch_matrix_gemv_float(w.down, scratch.xn(), trace_down_f32, stream);
-    if (trace_low_pre_activation) {
-        q38_hc_copy_half_to_f32_kernel<<<(scratch.low_rank() + 255) / 256, 256, 0, stream>>>(
-            scratch.lo(), trace_low_pre_activation, scratch.low_rank());
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixF16Down, stream);
+        launch_matrix_gemv_half(w.down, scratch.xn(), scratch.lo(), stream);
+        if (trace_down_f32) launch_matrix_gemv_float(w.down, scratch.xn(), trace_down_f32, stream);
+        if (trace_low_pre_activation) {
+            q38_hc_copy_half_to_f32_kernel<<<(scratch.low_rank() + 255) / 256, 256, 0, stream>>>(
+                scratch.lo(), trace_low_pre_activation, scratch.low_rank());
+        }
     }
 
     const int lo_blocks = (scratch.low_rank() + 255) / 256;
-    q38_hc_silu_scale_kernel<<<lo_blocks, 256, 0, stream>>>(
-        scratch.lo(), scratch.low_rank(), 1.0f / static_cast<float>(hc));
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixF16Silu, stream);
+        q38_hc_silu_scale_kernel<<<lo_blocks, 256, 0, stream>>>(
+            scratch.lo(), scratch.low_rank(), 1.0f / static_cast<float>(hc));
+    }
 
-    launch_matrix_gemv_half(w.up, scratch.lo(), scratch.gate(), stream);
-    if (trace_gate_f32) launch_matrix_gemv_float(w.up, scratch.lo(), trace_gate_f32, stream);
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixF16Up, stream);
+        launch_matrix_gemv_half(w.up, scratch.lo(), scratch.gate(), stream);
+        if (trace_gate_f32) launch_matrix_gemv_float(w.up, scratch.lo(), trace_gate_f32, stream);
+    }
 
     const int hidden_blocks = (hidden + 255) / 256;
-    q38_hc_mix_kernel<<<hidden_blocks, 256, 0, stream>>>(
-        scratch.xn(), scratch.gate(), scratch.mixed(), hidden, hc);
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixF16Mix, stream);
+        q38_hc_mix_kernel<<<hidden_blocks, 256, 0, stream>>>(
+            scratch.xn(), scratch.gate(), scratch.mixed(), hidden, hc);
+    }
 
     if (w.has_inject) {
         if (w.inject.cols != hc_dim || w.inject.rows != hc) {
             throw std::runtime_error("HC inject geometry mismatch");
         }
+        Q38HcKernelScope scope(base_site, kQ38HcMixF16Inject, stream);
         launch_matrix_gemv_half(w.inject, scratch.xn(), scratch.inject(), stream);
     }
     return scratch.mixed();
@@ -1322,7 +1666,8 @@ inline __half * run_qwen38_hc_mix_f32(
         Qwen38HcF32DebugScratch & f32,
         Qwen38HcScratch & scratch,
         float rms_eps,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int base_site = kQ38HcSiteAttnF16Norm) {
     const int hidden = scratch.hidden();
     const int hc = scratch.hc();
     const int hc_dim = hidden * hc;
@@ -1333,14 +1678,18 @@ inline __half * run_qwen38_hc_mix_f32(
         w.up.cols != scratch.low_rank() || w.up.rows != hc_dim) {
         return nullptr;
     }
-    run_qwen38_hc_f32_mix_from_residual(residual, w, f32, rms_eps, stream);
-    q38_hc_copy_f32_to_half_kernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
-        f32.mixed(), scratch.mixed(), hidden);
+    run_qwen38_hc_f32_mix_from_residual(residual, w, f32, rms_eps, stream, base_site);
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixOutCopy, stream);
+        q38_hc_copy_f32_to_half_kernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
+            f32.mixed(), scratch.mixed(), hidden);
+    }
     if (w.has_inject) {
         if (w.inject.lowbit) {
             return nullptr;
         }
         launch_matrix_gemv_f32_input(w.inject, f32.norm(), f32.inject(), stream);
+        Q38HcKernelScope scope(base_site, kQ38HcMixInjectCopy, stream);
         q38_hc_copy_f32_to_half_kernel<<<(hc + 255) / 256, 256, 0, stream>>>(
             f32.inject(), scratch.inject(), hc);
     }
@@ -1359,7 +1708,8 @@ inline __half * run_qwen38_hc_mix_f32_with_inject(
         Qwen38HcF32DebugScratch & f32,
         Qwen38HcScratch & scratch,
         float rms_eps,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int base_site = kQ38HcSiteAttnF16Norm) {
     const int hidden = scratch.hidden();
     const int hc = scratch.hc();
     const int hc_dim = hidden * hc;
@@ -1374,14 +1724,20 @@ inline __half * run_qwen38_hc_mix_f32_with_inject(
         !qwen38_hc_f32_inject_enabled(w)) {
         return nullptr;
     }
-    run_qwen38_hc_q8_0_f32_mix_with_inject_from_residual(residual, w, f32, rms_eps, stream);
-    q38_hc_copy_f32_to_half_kernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
-        f32.mixed(), scratch.mixed(), hidden);
+    run_qwen38_hc_q8_0_f32_mix_with_inject_from_residual(residual, w, f32, rms_eps, stream, base_site);
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixOutCopy, stream);
+        q38_hc_copy_f32_to_half_kernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
+            f32.mixed(), scratch.mixed(), hidden);
+    }
     // Keep the legacy half-typed inject buffer consistent too (traces and any
     // leftover half-inject combine read it); the F32 result above is the one
     // run_qwen38_hc_combine_f32_inject() must use.
-    q38_hc_copy_f32_to_half_kernel<<<(hc + 255) / 256, 256, 0, stream>>>(
-        f32.inject(), scratch.inject(), hc);
+    {
+        Q38HcKernelScope scope(base_site, kQ38HcMixInjectCopy, stream);
+        q38_hc_copy_f32_to_half_kernel<<<(hc + 255) / 256, 256, 0, stream>>>(
+            f32.inject(), scratch.inject(), hc);
+    }
     return scratch.mixed();
 }
 

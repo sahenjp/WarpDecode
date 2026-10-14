@@ -2,10 +2,35 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace wd {
+
+inline bool qwen38_tuning_env_flag(const char * name, bool default_on) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return default_on;
+    return v[0] != '0';
+}
+
+inline std::vector<size_t> qwen38_tuning_env_slots(const char * name) {
+    std::vector<size_t> out;
+    const char * v = std::getenv(name);
+    if (v == nullptr) return out;
+    const char * p = v;
+    while (*p != '\0') {
+        char * end = nullptr;
+        const long long n = std::strtoll(p, &end, 10);
+        if (end == p) break;
+        if (n > 0) out.push_back(static_cast<size_t>(n));
+        p = end;
+        while (*p == ',' || *p == ' ') ++p;
+    }
+    return out;
+}
 
 struct Qwen38Tuning {
     int qsa_block_budget = 512;
@@ -20,6 +45,15 @@ struct Qwen38Tuning {
     int expert_cache_mib = 0;
     int expert_prefetch_depth = 1;
     bool expert_frequency_prefetch = true;
+
+    // Task C: expert cache / host->device transfer switches. These mirror the
+    // ExpertCacheOptions fields of src/expert_cache.cuh (which is the consumer);
+    // qwen38_tuning_for_gpu() reads the environment and the runtime hands the
+    // result to both expert caches.
+    bool expert_stats = false;          // WARODECODE_EXPERT_STATS=1
+    bool expert_copy_stream = true;     // WARODECODE_EXPERT_COPY_STREAM=0 disables
+    bool expert_layer_evict = false;    // WARODECODE_EXPERT_EVICT=layer
+    std::vector<size_t> expert_shadow_slots;  // WARODECODE_EXPERT_SHADOW=a,b,..
 
     std::array<int, 3> mtp_draft_candidates{2, 3, 4};
     double mtp_reward_ewma = 0.25;
@@ -62,6 +96,14 @@ inline Qwen38Tuning qwen38_tuning_for_gpu(int sm, int memory_mib) {
         const int mib = std::atoi(v);
         if (mib > 0) t.expert_cache_mib = mib;
     }
+
+    // Task C switches (see src/expert_cache.cuh for the transfer path).
+    t.expert_stats = qwen38_tuning_env_flag("WARODECODE_EXPERT_STATS", false);
+    t.expert_copy_stream = qwen38_tuning_env_flag("WARODECODE_EXPERT_COPY_STREAM", true);
+    if (const char * v = std::getenv("WARODECODE_EXPERT_EVICT")) {
+        t.expert_layer_evict = std::string(v) == "layer";
+    }
+    t.expert_shadow_slots = qwen38_tuning_env_slots("WARODECODE_EXPERT_SHADOW");
 
     if (sm >= 90) t.ple_prefetch_rows = 64;
     else if (sm >= 80) t.ple_prefetch_rows = 48;

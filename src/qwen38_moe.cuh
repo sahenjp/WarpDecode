@@ -104,6 +104,31 @@ inline bool q38_moe_f32_mid_enabled() {
     return enabled;
 }
 
+// WARODECODE_MOE_FUSED_GRID (default OFF).
+//
+// The routed experts of one layer run as one expert-batched grid instead of one
+// launch per expert and projection (the per-expert loop issues seven launches
+// per expert: gate GEMV, up GEMV, SiLU, Q8_0 activation quantisation, down GEMV,
+// optional trace copy and the weighted accumulation). With this switch a layer
+// costs five launches:
+//
+//   gate+up GEMV   grid.y = 2k (separate gate/up) or k (fused gate_up tensor)
+//   SiLU(gate)*up  grid.y = k
+//   Q8_0 quantise  grid.y = k
+//   down GEMV      grid.y = k
+//   weighted sum   ordered loop over the k experts, one launch
+//
+// Every kernel still decodes one row or one 32-value block with the same
+// arithmetic the single-expert kernels use (the DP4A row routines are shared by
+// construction, the SiLU/quantiser/accumulation bodies are literal copies of
+// the originals), so the values are bit-identical - only the launch geometry and
+// the launch count change. The weight pointers of the layer travel in one small
+// pinned H2D copy (Q38MoeExpertPtrTable).
+inline bool q38_moe_fused_grid_enabled() {
+    static const bool enabled = q38_moe_env_flag("WARODECODE_MOE_FUSED_GRID", false);
+    return enabled;
+}
+
 struct Qwen38MoeLayerTensors {
     const TensorInfo * router = nullptr;
     const TensorInfo * gate_up = nullptr;
@@ -539,6 +564,319 @@ __global__ void q38_silu_mul_f32_kernel(
     out[i] = __fmul_rn(gate[i], up[i]);
 }
 
+// ---------------------------------------------------------------------------
+// Task G: expert-batched MoE stages used by WARODECODE_MOE_FUSED_GRID.
+//
+// Every kernel below runs the same per-item arithmetic as the single-expert
+// kernel it twins; grid.y only selects which expert's slice of the batched
+// buffer is read and written. The buffers are laid out as
+//   gate_up[2k][ffn]   gate of expert j at 2j, up at 2j + 1
+//   act[k][ffn], q8_values[k][ffn], q8_scales[k][ffn / 32], down[k][hidden]
+// which is the same flattened order the separate and the fused expert layouts
+// produce.
+// ---------------------------------------------------------------------------
+
+// Fixed-size device table with the weight pointers of one batched MoE layer.
+// The gate/up half holds 2k entries for the separate layout (gate of expert j at
+// 2j, up at 2j + 1) and k entries for the fused layout, whose two ffn halves
+// already sit in gate_up order; both end up as [2k][ffn] in the same output
+// buffer. Kept in one struct so a layer needs a single small H2D copy.
+struct Q38MoeExpertPtrTable {
+    const uint8_t * gate_up[2 * kLowBitExpertBatchMax];
+    const uint8_t * down[kLowBitExpertBatchMax];
+};
+
+// ---------------------------------------------------------------------------
+// Task I: M-token batch MoE (WARODECODE_MTP_BATCH_VERIFY).
+//
+// A layer that runs M tokens through the routed MoE has one expert list per
+// token, and the same expert may be selected by several of them. The batch
+// workspace below flattens the M * k selections into "pairs", so a layer still
+// needs a handful of launches (five for the expert GEMMs plus M router
+// selections) no matter how many tokens are folded in: the per-launch cost that
+// dominates a batch=1 MoE is paid once instead of M times.
+//
+// Bit-identity to the serial per-token path is structural, not best-effort:
+// every pair goes through the same per-row weight decode routine the
+// single-expert kernel uses (the Task G contract), the down projection consumes
+// the same SiLU(gate) * up product quantised the same way, and each token's
+// weighted sum walks its own top-k list in top-k order, exactly the order the
+// serial loop of q38_weighted_accum_f32_kernel launches produces.
+// ---------------------------------------------------------------------------
+
+// One expert's weight pointers inside the batch: the gate/up pair follows the
+// separate layout (gate of the layer's own expert list, up next to it) and the
+// down pointer is taken from the token the pair belongs to. "base" is the budget
+// 2-byte alignment: the IQ4_NL decoder reads packed nibbles with 16-bit loads.
+struct Q38MoeBatchPtrEntry {
+    const uint8_t * gate_up[2 * kLowBitExpertBatchMax];
+    const uint8_t * down[kLowBitExpertBatchMax];
+    uintptr_t base[kLowBitExpertBatchMax];
+};
+
+// Host-side description of one (token, expert) pair, copied to the device with
+// the pointer table in the same small H2D transfer.
+struct Q38MoeBatchPairDesc {
+    int activation_pair;   // pair owning the Q8_K/Q8_0 activation, -1 to disable
+    int expert;            // expert index inside the pointer-table entry
+};
+
+// Per-token view of one batch pass: where the router selects into, where the
+// per-token hidden output lands and which pair range belongs to the token.
+struct Q38MoeBatchTokenDesc {
+    int * ids;
+    float * weights;
+    float * logits;
+    float * out;
+    int first_pair;
+    int pair_count;
+};
+
+// One H2D copy per batch pass carries the whole description; the arrays are
+// capped by the largest batch the workspace ever saw (M <= kLowBitExpertBatchMax
+// tokens, k <= kLowBitExpertBatchMax experts).
+struct Q38MoeBatchPassDesc {
+    int tokens;
+    int k;
+    int hidden;
+    int expert_ffn;
+    int n_experts;
+    float expert_scale;
+    int _pad[3];
+    Q38MoeBatchTokenDesc token[kLowBitExpertBatchMax];
+    Q38MoeBatchPairDesc pair[static_cast<int>(kLowBitExpertBatchMax) * static_cast<int>(kLowBitExpertBatchMax)];
+};
+
+// SiLU(gate) * up per expert: q38_hc_silu_scale_ggml_f32_kernel(x, n, inv_hc)
+// followed by q38_silu_mul_f32_kernel(). The SiLU output keeps the rounded F32
+// value the in-place kernel writes, so the product is bit-identical.
+__global__ void q38_moe_silu_scale_mul_experts_kernel(
+        const float * __restrict__ gate_up,
+        float * __restrict__ act,
+        int ffn,
+        float inv_hc) {
+    const float * gate =
+        gate_up + static_cast<size_t>(2) * blockIdx.y * static_cast<size_t>(ffn);
+    const float * up = gate + ffn;
+    float * out = act + static_cast<size_t>(blockIdx.y) * static_cast<size_t>(ffn);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < ffn; i += gridDim.x * blockDim.x) {
+        const float v = __fmul_rn(gate[i], inv_hc);
+        const float exp_neg = q38_hc_ggml_avx2_exp_f32(-v);
+        out[i] = __fmul_rn(__fdiv_rn(v, __fadd_rn(1.0f, exp_neg)), up[i]);
+    }
+}
+
+// Q8_0 activation quantisation per expert, copied from
+// q38_hc_q8_0_quantize_f32_exact_kernel with grid.y selecting the expert.
+__global__ void q38_moe_q8_0_quantize_experts_kernel(
+        const float * __restrict__ input,
+        int8_t * __restrict__ quantized,
+        __half * __restrict__ scales,
+        int ffn) {
+    const int lane = threadIdx.x & 31;
+    const int block = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int blocks_per_expert = ffn / 32;
+    if (block >= blocks_per_expert) return;
+
+    const int i = block * 32 + lane;
+    const float value = input[static_cast<size_t>(blockIdx.y) * ffn + i];
+    float amax = fabsf(value);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, offset));
+    }
+    amax = __shfl_sync(0xffffffffu, amax, 0);
+    const float d = __fdiv_rn(amax, 127.0f);
+    const float inverse = amax == 0.0f ? 0.0f : __fdiv_rn(127.0f, amax);
+    const int q = amax == 0.0f ? 0 : __float2int_rn(__fmul_rn(value, inverse));
+    quantized[static_cast<size_t>(blockIdx.y) * ffn + i] =
+        static_cast<int8_t>(max(-128, min(127, q)));
+    if (lane == 0) {
+        scales[static_cast<size_t>(blockIdx.y) * blocks_per_expert + block] =
+            __float2half_rn(d);
+    }
+}
+
+// Weighted sum of every batched expert output. The serial path launches
+// q38_weighted_accum_f32_kernel once per expert in top-k order, so the loop
+// below reproduces exactly that sequence of rounded product/add pairs per
+// element.
+__global__ void q38_moe_weighted_accum_experts_f32_kernel(
+        const float * __restrict__ experts,
+        const float * __restrict__ weights,
+        float * __restrict__ accum,
+        int n,
+        int k) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float a = accum[i];
+    for (int j = 0; j < k; ++j) {
+        a = q38_add_rn(a, q38_mul_rn(experts[static_cast<size_t>(j) * n + i], weights[j]));
+    }
+    accum[i] = a;
+}
+
+// ---------------------------------------------------------------------------
+// Task I: M-token batch kernels. Each one walks "pairs" where the Task G kernels
+// walked "experts"; the pair -> (token, expert, activation) mapping comes from
+// the pass description, and the arithmetic per pair is the same rounded sequence
+// the single-expert kernel runs.
+// ---------------------------------------------------------------------------
+
+// gate/up for every pair. blocks/grid.y are indexed by pair exactly like the
+// Task G expert-batched kernels index by expert; a pair selects the token's Q8_K
+// activation slice instead of a per-expert one.
+template <bool USE_SMEM>
+__global__ void iq2_s_q8_k_gemv_pairs_dp4a_kernel(
+        const uint8_t * const * __restrict__ w_pairs,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        const int * __restrict__ activation_pair,
+        float * __restrict__ y,
+        int pairs,
+        int rows,
+        int cols) {
+    __shared__ uint64_t grid_table[1024];
+    if constexpr (USE_SMEM) {
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x) {
+            grid_table[i] = k_iq2s_grid[i];
+        }
+        __syncthreads();
+    }
+
+    const int pair = blockIdx.y;
+    if (pair >= pairs) return;
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+
+    const int activation = activation_pair[pair];
+    const int8_t * pair_qs = x_qs + static_cast<size_t>(activation) * static_cast<size_t>(cols);
+    const float * pair_d = x_d + static_cast<size_t>(activation) * static_cast<size_t>(cols >> 8);
+    const float value = iq2_s_q8_k_row_dp4a<USE_SMEM>(
+        w_pairs[pair], pair_qs, pair_d, row, cols, grid_table);
+    if ((threadIdx.x & 31) != 0) return;
+    y[static_cast<size_t>(pair) * static_cast<size_t>(rows) + row] = 0.125f * value;
+}
+
+template <bool USE_SMEM>
+__global__ void iq3_s_q8_k_gemv_pairs_dp4a_kernel(
+        const uint8_t * const * __restrict__ w_pairs,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        const int * __restrict__ activation_pair,
+        float * __restrict__ y,
+        int pairs,
+        int rows,
+        int cols) {
+    __shared__ uint32_t grid_table[512];
+    if constexpr (USE_SMEM) {
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+            grid_table[i] = k_iq3s_grid[i];
+        }
+        __syncthreads();
+    }
+
+    const int pair = blockIdx.y;
+    if (pair >= pairs) return;
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+
+    const int activation = activation_pair[pair];
+    const int8_t * pair_qs = x_qs + static_cast<size_t>(activation) * static_cast<size_t>(cols);
+    const float * pair_d = x_d + static_cast<size_t>(activation) * static_cast<size_t>(cols >> 8);
+    const float value = iq3_s_q8_k_row_dp4a<USE_SMEM>(
+        w_pairs[pair], pair_qs, pair_d, row, cols, grid_table);
+    if ((threadIdx.x & 31) != 0) return;
+    y[static_cast<size_t>(pair) * static_cast<size_t>(rows) + row] = value;
+}
+
+// IQ4_NL down projection for every pair, one token activation per pair. Same
+// row routine and row-to-warp mapping as the single-expert kernel, so the rows
+// are bit-identical; only grid.y (pair) replaces the expert selection.
+__global__ void iq4_nl_q8_0_act_gemv_pairs_dp4a_kernel(
+        const uint8_t * const * __restrict__ w_pairs,
+        const int8_t * __restrict__ x_qs,
+        const __half * __restrict__ x_scales,
+        const int * __restrict__ activation_pair,
+        float * __restrict__ y,
+        int pairs,
+        int rows,
+        int cols) {
+    const int pair = blockIdx.y;
+    if (pair >= pairs) return;
+
+    const int lane = threadIdx.x & 31;
+    const int row_in_warp = lane >> 4;
+
+    const int output_row =
+        (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 2 + row_in_warp;
+    const int row = min(output_row, rows - 1);
+
+    const int activation = activation_pair[pair];
+    const int8_t * pair_x_qs =
+        x_qs + static_cast<size_t>(activation) * static_cast<size_t>(cols);
+    const __half * pair_x_scales =
+        x_scales + static_cast<size_t>(activation) * static_cast<size_t>(cols / 32);
+
+    const float value = iq4_nl_q8_0_act_row_dp4a(
+        w_pairs[pair], pair_x_qs, pair_x_scales, row, cols);
+    if ((lane & 15) != 0 || output_row >= rows) return;
+    y[static_cast<size_t>(pair) * static_cast<size_t>(rows) + output_row] = value;
+}
+
+// Routed weighted sum per token. Element i of token t walks the token's own
+// top-k list in order and folds in the pair output of each selected expert -
+// exactly the sequence of rounded multiply/adds M single-expert accumulation
+// launches would produce.
+__global__ void q38_moe_batch_accum_kernel(
+        const float * __restrict__ experts,
+        const float * __restrict__ pair_weights,
+        const float * __restrict__ accum_in,
+        float * __restrict__ out,
+        const Q38MoeBatchPassDesc * __restrict__ pass) {
+    const int t = blockIdx.y;
+    if (t >= pass->tokens) return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pass->hidden) return;
+
+    const Q38MoeBatchTokenDesc & token = pass->token[t];
+    float a = accum_in[static_cast<size_t>(t) * pass->hidden + i];
+    for (int j = 0; j < token.pair_count; ++j) {
+        const int pair = token.first_pair + j;
+        a = q38_add_rn(a, q38_mul_rn(
+            experts[static_cast<size_t>(pair) * pass->hidden + i], pair_weights[pair]));
+    }
+    out[static_cast<size_t>(t) * pass->hidden + i] = a;
+}
+
+// F16 copy of the M-token routed sum, the batch twin of q38_finish_moe()'s
+// q38_float_to_half_kernel: the same __float2half of the same unrounded sum,
+// once per token instead of once per token step.
+__global__ void q38_moe_batch_to_half_kernel(
+        const float * __restrict__ input,
+        __half * __restrict__ output,
+        int tokens,
+        int hidden) {
+    const int t = blockIdx.y;
+    if (t >= tokens) return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden) return;
+    output[static_cast<size_t>(t) * hidden + i] =
+        __float2half(input[static_cast<size_t>(t) * hidden + i]);
+}
+
+// F16 copy of every batched expert output for the debug traces, matching
+// q38_moe_capture_expert_output() on the F32-mid path.
+__global__ void q38_moe_capture_experts_kernel(
+        const float * __restrict__ experts,
+        __half * __restrict__ destination,
+        int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t index = static_cast<size_t>(blockIdx.y) * n + i;
+    destination[index] = __float2half(experts[index]);
+}
+
 // Q8_0 activation quantisation in the exact ggml order (amax/127 with
 // round-to-nearest-even division, q = round(value * 127/amax)). Byte-identical
 // to ggml's quantize_row_q8_0 for elements that are a multiple of 32.
@@ -834,6 +1172,160 @@ public:
     float * rx_down_f32() const { return d_rx_down_f32_; }
     int8_t * rx_q8_0_values() const { return d_rx_q8_0_values_; }
     __half * rx_q8_0_scales() const { return d_rx_q8_0_scales_; }
+
+    // Task G: expert-batched MoE workspaces (WARODECODE_MOE_FUSED_GRID). Lazily
+    // allocated like moe_out_f32() so sessions that never take the batched path
+    // do not grow.
+    float * rx_batch_gate_up() {
+        if (!d_rx_batch_gate_up_) {
+            alloc(reinterpret_cast<void **>(&d_rx_batch_gate_up_),
+                  static_cast<size_t>(2) * static_cast<size_t>(k_) *
+                      static_cast<size_t>(expert_ffn_) * sizeof(float));
+        }
+        return d_rx_batch_gate_up_;
+    }
+    float * rx_batch_act() {
+        if (!d_rx_batch_act_) {
+            alloc(reinterpret_cast<void **>(&d_rx_batch_act_),
+                  static_cast<size_t>(k_) * static_cast<size_t>(expert_ffn_) * sizeof(float));
+        }
+        return d_rx_batch_act_;
+    }
+    int8_t * rx_batch_q8_0_values() {
+        if (!d_rx_batch_q8_0_values_) {
+            alloc(reinterpret_cast<void **>(&d_rx_batch_q8_0_values_),
+                  static_cast<size_t>(k_) * static_cast<size_t>(expert_ffn_) * sizeof(int8_t));
+        }
+        return d_rx_batch_q8_0_values_;
+    }
+    __half * rx_batch_q8_0_scales() {
+        if (!d_rx_batch_q8_0_scales_) {
+            alloc(reinterpret_cast<void **>(&d_rx_batch_q8_0_scales_),
+                  static_cast<size_t>(k_) * static_cast<size_t>(expert_ffn_ / 32) * sizeof(__half));
+        }
+        return d_rx_batch_q8_0_scales_;
+    }
+    float * rx_batch_down() {
+        if (!d_rx_batch_down_) {
+            alloc(reinterpret_cast<void **>(&d_rx_batch_down_),
+                  static_cast<size_t>(k_) * static_cast<size_t>(hidden_) * sizeof(float));
+        }
+        return d_rx_batch_down_;
+    }
+    // -----------------------------------------------------------------------
+    // Task I: M-token batch workspaces (WARODECODE_MTP_BATCH_VERIFY).
+    //
+    // One "pair" is a (token, expert) selection, so a layer that M tokens route
+    // through holds tokens * k pairs at most. The buffers are indexed by pair and
+    // hold tokens * k slots; a smaller batch simply leaves the tail unused. They
+    // are sized on first use and grow when a later layer needs more, exactly like
+    // the Task G workspaces above.
+    // -----------------------------------------------------------------------
+    enum class BatchBuffer {
+        GateUp,       // [2 * pairs][ffn]    gate at pair p * 2, up at pair p * 2 + 1
+        Act,          // [pairs][ffn]        SiLU(gate) * up
+        Q8Values,     // [pairs][ffn]        Q8_0 activation of Act
+        Q8Scales,     // [pairs][ffn / 32]
+        Down,         // [pairs][hidden]     expert output before the weighted sum
+        Accum,        // [tokens][hidden]    routed weighted sum
+        PtrTable,     // [pairs] weight pointers, one device table entry each
+        Chart,        // [pairs] pass description, activation map and pair weights
+        Logits,       // [tokens][n_experts]
+        Ids,          // [tokens][k]      router top-k expert ids
+        Weights,      // [tokens][k]      router top-k weights
+    };
+
+    static size_t batch_buffer_bytes(BatchBuffer which, int tokens, int hidden, int expert_ffn, int k, int n_experts) {
+        const size_t pairs = static_cast<size_t>(tokens) * static_cast<size_t>(k);
+        const size_t n = static_cast<size_t>(hidden);
+        const size_t ffn = static_cast<size_t>(expert_ffn);
+        const size_t t = static_cast<size_t>(tokens);
+        switch (which) {
+            case BatchBuffer::GateUp: return 2u * pairs * ffn * sizeof(float);
+            case BatchBuffer::Act: return pairs * ffn * sizeof(float);
+            case BatchBuffer::Q8Values: return pairs * ffn * sizeof(int8_t);
+            case BatchBuffer::Q8Scales: return pairs * (ffn / 32u) * sizeof(__half);
+            case BatchBuffer::Down: return pairs * n * sizeof(float);
+            case BatchBuffer::Accum: return t * n * sizeof(float);
+            case BatchBuffer::PtrTable: return pairs * sizeof(Q38MoeBatchPtrEntry);
+            case BatchBuffer::Chart: return sizeof(Q38MoeBatchPassDesc) + pairs * (sizeof(Q38MoeBatchPairDesc) + sizeof(int) + sizeof(float));
+            case BatchBuffer::Logits: return t * static_cast<size_t>(n_experts) * sizeof(float);
+            case BatchBuffer::Ids: return pairs * sizeof(int);
+            case BatchBuffer::Weights: return pairs * sizeof(float);
+        }
+        return 0;
+    }
+
+    static int batch_capacity_slots(BatchBuffer which, size_t bytes, int hidden, int expert_ffn, int k, int n_experts) {
+        const size_t ffn = static_cast<size_t>(expert_ffn);
+        const size_t n = static_cast<size_t>(hidden);
+        const size_t kk = static_cast<size_t>(k);
+        switch (which) {
+            case BatchBuffer::GateUp: return static_cast<int>(bytes / (2u * kk * ffn * sizeof(float)));
+            case BatchBuffer::Act: return static_cast<int>(bytes / (kk * ffn * sizeof(float)));
+            case BatchBuffer::Q8Values: return static_cast<int>(bytes / (kk * ffn * sizeof(int8_t)));
+            case BatchBuffer::Q8Scales: return static_cast<int>(bytes / (kk * (ffn / 32u) * sizeof(__half)));
+            case BatchBuffer::Down: return static_cast<int>(bytes / (kk * n * sizeof(float)));
+            case BatchBuffer::Accum: return static_cast<int>(bytes / (kk * n * sizeof(float)));
+            case BatchBuffer::PtrTable: return static_cast<int>(bytes / (kk * sizeof(Q38MoeBatchPtrEntry)));
+            case BatchBuffer::Chart:
+                return static_cast<int>(bytes / (kk * (sizeof(Q38MoeBatchPairDesc) + sizeof(int) + sizeof(float))));
+            case BatchBuffer::Logits:
+                return n_experts > 0 ? static_cast<int>(bytes / (kk * static_cast<size_t>(n_experts) * sizeof(float))) : 0;
+            case BatchBuffer::Ids: return static_cast<int>(bytes / (kk * sizeof(int)));
+            case BatchBuffer::Weights: return static_cast<int>(bytes / (kk * sizeof(float)));
+        }
+        return 0;
+    }
+
+    void * batch_buffer(BatchBuffer which, int tokens) {
+        if (tokens <= 0) throw std::runtime_error("MoE batch buffer needs at least one token");
+        void ** slot = batch_slot(which);
+        const size_t needed = batch_buffer_bytes(which, tokens, hidden_, expert_ffn_, k_, n_experts_);
+        if (*slot == nullptr) {
+            alloc(slot, needed);
+            batch_capacity_[batch_slot_index(which)] = tokens;
+            return *slot;
+        }
+        if (batch_capacity_[batch_slot_index(which)] < tokens) {
+            cudaFree(*slot);
+            *slot = nullptr;
+            alloc(slot, needed);
+            batch_capacity_[batch_slot_index(which)] = tokens;
+        }
+        return *slot;
+    }
+
+    Q38MoeBatchPtrEntry * host_batch_ptrs(int entries) {
+        if (entries <= 0) throw std::runtime_error("MoE batch pointer table needs at least one entry");
+        if (h_batch_ptrs_ == nullptr) {
+            host_alloc(reinterpret_cast<void **>(&h_batch_ptrs_), static_cast<size_t>(entries) * sizeof(Q38MoeBatchPtrEntry));
+            h_batch_ptr_entries_ = entries;
+        } else if (h_batch_ptr_entries_ < entries) {
+            cudaFreeHost(h_batch_ptrs_);
+            h_batch_ptrs_ = nullptr;
+            host_alloc(reinterpret_cast<void **>(&h_batch_ptrs_), static_cast<size_t>(entries) * sizeof(Q38MoeBatchPtrEntry));
+            h_batch_ptr_entries_ = entries;
+        }
+        return h_batch_ptrs_;
+    }
+
+    int batch_capacity(BatchBuffer which) const { return batch_capacity_[batch_slot_index(which)]; }
+
+    // Weight-pointer table of one batched layer: filled in pinned host memory
+    // and copied to the device once per layer.
+    Q38MoeExpertPtrTable * host_expert_ptr_table() {
+        if (!h_expert_ptr_table_) {
+            host_alloc(reinterpret_cast<void **>(&h_expert_ptr_table_), sizeof(Q38MoeExpertPtrTable));
+        }
+        return h_expert_ptr_table_;
+    }
+    Q38MoeExpertPtrTable * expert_ptr_table() {
+        if (!d_expert_ptr_table_) {
+            alloc(reinterpret_cast<void **>(&d_expert_ptr_table_), sizeof(Q38MoeExpertPtrTable));
+        }
+        return d_expert_ptr_table_;
+    }
     int * h_ids() const { return h_ids_; }
     float * h_weights() const { return h_weights_; }
 
@@ -847,6 +1339,28 @@ private:
         const cudaError_t e = cudaMallocHost(p, n);
         if (e != cudaSuccess) throw std::runtime_error(std::string("cudaMallocHost MoE scratch failed: ") + cudaGetErrorString(e));
     }
+
+    // Index of a Task I batch workspace in d_batch_[] / batch_capacity_[].
+    static int batch_slot_index(BatchBuffer which) {
+        switch (which) {
+            case BatchBuffer::GateUp: return 0;
+            case BatchBuffer::Act: return 1;
+            case BatchBuffer::Q8Values: return 2;
+            case BatchBuffer::Q8Scales: return 3;
+            case BatchBuffer::Down: return 4;
+            case BatchBuffer::Accum: return 5;
+            case BatchBuffer::PtrTable: return 6;
+            case BatchBuffer::Chart: return 7;
+            case BatchBuffer::Logits: return 8;
+            case BatchBuffer::Ids: return 9;
+            case BatchBuffer::Weights: return 10;
+        }
+        return 0;
+    }
+
+    static constexpr int kBatchBufferCount = 11;
+
+    void ** batch_slot(BatchBuffer which) { return &d_batch_[batch_slot_index(which)]; }
 
     void reset() {
         if (d_logits_) cudaFree(d_logits_);
@@ -876,6 +1390,21 @@ private:
         if (d_rx_down_f32_) cudaFree(d_rx_down_f32_);
         if (d_rx_q8_0_values_) cudaFree(d_rx_q8_0_values_);
         if (d_rx_q8_0_scales_) cudaFree(d_rx_q8_0_scales_);
+        if (d_rx_batch_gate_up_) cudaFree(d_rx_batch_gate_up_);
+        if (d_rx_batch_act_) cudaFree(d_rx_batch_act_);
+        if (d_rx_batch_q8_0_values_) cudaFree(d_rx_batch_q8_0_values_);
+        if (d_rx_batch_q8_0_scales_) cudaFree(d_rx_batch_q8_0_scales_);
+        if (d_rx_batch_down_) cudaFree(d_rx_batch_down_);
+        if (d_expert_ptr_table_) cudaFree(d_expert_ptr_table_);
+        if (h_expert_ptr_table_) cudaFreeHost(h_expert_ptr_table_);
+        for (int i = 0; i < kBatchBufferCount; ++i) {
+            if (d_batch_[i]) cudaFree(d_batch_[i]);
+            d_batch_[i] = nullptr;
+            batch_capacity_[i] = 0;
+        }
+        if (h_batch_ptrs_) cudaFreeHost(h_batch_ptrs_);
+        h_batch_ptrs_ = nullptr;
+        h_batch_ptr_entries_ = 0;
         if (d_selected_output_trace_) cudaFree(d_selected_output_trace_);
         if (d_moe_out_f32_) cudaFree(d_moe_out_f32_);
         if (d_half_activation_) cudaFree(d_half_activation_);
@@ -890,6 +1419,12 @@ private:
         d_act_f32_ = d_gate_f32_ = d_up_f32_ = d_down_f32_ = nullptr;
         d_q8_0_values_ = nullptr;
         d_q8_0_scales_ = nullptr;
+        d_rx_batch_gate_up_ = d_rx_batch_act_ = nullptr;
+        d_rx_batch_q8_0_values_ = nullptr;
+        d_rx_batch_q8_0_scales_ = nullptr;
+        d_rx_batch_down_ = nullptr;
+        d_expert_ptr_table_ = nullptr;
+        h_expert_ptr_table_ = nullptr;
         d_selected_output_trace_ = nullptr;
         d_moe_out_f32_ = nullptr;
         d_half_activation_ = nullptr;
@@ -929,6 +1464,18 @@ private:
     float * d_rx_down_f32_ = nullptr;
     int8_t * d_rx_q8_0_values_ = nullptr;
     __half * d_rx_q8_0_scales_ = nullptr;
+    float * d_rx_batch_gate_up_ = nullptr;
+    float * d_rx_batch_act_ = nullptr;
+    int8_t * d_rx_batch_q8_0_values_ = nullptr;
+    __half * d_rx_batch_q8_0_scales_ = nullptr;
+    float * d_rx_batch_down_ = nullptr;
+    Q38MoeExpertPtrTable * d_expert_ptr_table_ = nullptr;
+    Q38MoeExpertPtrTable * h_expert_ptr_table_ = nullptr;
+    // Task I: M-token batch workspaces, indexed by batch_slot_index().
+    void * d_batch_[kBatchBufferCount] = {};
+    int batch_capacity_[kBatchBufferCount] = {};
+    Q38MoeBatchPtrEntry * h_batch_ptrs_ = nullptr;
+    int h_batch_ptr_entries_ = 0;
     __half * d_selected_output_trace_ = nullptr;
     float * d_moe_out_f32_ = nullptr;
     __half * d_half_activation_ = nullptr;
@@ -1465,6 +2012,731 @@ inline void q38_moe_run_routed_experts_q8_act_fused(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Task I: M-token batch MoE (WARODECODE_MTP_BATCH_VERIFY).
+// ---------------------------------------------------------------------------
+
+// Longest token batch one pass folds together. The description copy is fixed
+// size, and the practical call site (MTP verify) never exceeds k + 1 tokens.
+constexpr int kMoeBatchTokenMax = kLowBitExpertBatchMax;
+
+// Expert batch cap for the M-token path, a separate knob from the Task G value
+// so either path can be measured with the other one off.
+inline int q38_moe_batch_k() {
+    const char * v = std::getenv("WARODECODE_MOE_BATCH_K");
+    int k = 4;
+    if (v != nullptr && v[0] != '\0') {
+        const int parsed = std::atoi(v);
+        if (parsed > 0) k = parsed;
+    }
+    if (k < 1) k = 1;
+    if (k > kLowBitExpertBatchMax) k = kLowBitExpertBatchMax;
+    return k;
+}
+
+// M-token batch MoE (WARODECODE_MTP_BATCH_VERIFY).
+//
+// The batch is a flat list of "pairs": one (token, expert, activation) triple
+// per selected expert. Every pair runs the same per-row weight decode the
+// single-expert kernels run, and each token's weighted sum walks its own top-k
+// list in order, so a batched pass over M tokens is bit-identical to M serial
+// passes - the same property Task G's expert-batched grid established for the
+// k experts of one token, extended over tokens.
+//
+// Layout of one batch pass, all staged in one device allocation:
+//   gate_up_ptrs[pairs]   per-pair gate and up pointers, interleaved [g,u,g,u..]
+//   down_ptrs[pairs]      per-pair down projection pointers
+//   activation[pairs]     pair -> activation slice (token) index
+//   weights[pairs]        pair -> router weight of the selection
+//   ptr_entries[pairs]    Q38MoeBatchPtrEntry, the layout set_pair_weights fills
+//   desc                  Q38MoeBatchPassDesc, per-token views of the pass
+class Qwen38MoeTokenBatch {
+public:
+    Qwen38MoeTokenBatch() = default;
+    Qwen38MoeTokenBatch(const Qwen38MoeTokenBatch &) = delete;
+    Qwen38MoeTokenBatch & operator=(const Qwen38MoeTokenBatch &) = delete;
+
+    ~Qwen38MoeTokenBatch() {
+        if (host_) cudaFreeHost(host_);
+        if (device_) cudaFree(device_);
+    }
+
+    int batch_k() const { return batch_k_; }
+
+    // A batch pass is possible only for the ggml-exact F32-mid routed MoE the
+    // model actually runs: IQ2_S/IQ3_S gate/up feeding an IQ4_NL down
+    // projection, with the DP4A pair kernels (they have no reference fallback).
+    //
+    // The slot bound is 8 slots per top-k selection: one batch holds at most
+    // tokens * k <= k * k pairs, and the acquire loop never holds more than
+    // 2 * k of them at once (each pair's down view is dropped before the next
+    // pair is acquired), so 8 * k leaves a factor of four of headroom. The
+    // caller still verifies after the acquire loop that every pair's slot is
+    // still the one it acquired - the bound is what makes the check pass, the
+    // check is what makes it safe (see Qwen38MoeTokenBatch::note_pair_slot).
+    bool compatible(
+            const GpuExpertCache & cache,
+            const Qwen38MoeScratch & scratch,
+            const TensorInfo & gate_exps,
+            const TensorInfo & up_exps,
+            const TensorInfo & down_exps,
+            int tokens) const {
+        if (tokens < 1 || tokens > kMoeBatchTokenMax) return false;
+        if (scratch.k() < 1 || scratch.k() > batch_k_) return false;
+        if (!q38_moe_gate_up_q8_k_type(gate_exps.type) || !q38_moe_gate_up_q8_k_type(up_exps.type)) return false;
+        if (down_exps.type != GgmlType::IQ4_NL) return false;
+        if (!q38_moe_expert_q8_act_geometry(scratch.hidden(), scratch.expert_ffn())) return false;
+        if (gate_exps.dims.size() != 3 || up_exps.dims.size() != 3 || down_exps.dims.size() != 3) return false;
+        if (static_cast<int>(gate_exps.dims[0]) != scratch.hidden() ||
+            static_cast<int>(gate_exps.dims[1]) != scratch.expert_ffn() ||
+            static_cast<int>(up_exps.dims[0]) != scratch.hidden() ||
+            static_cast<int>(up_exps.dims[1]) != scratch.expert_ffn() ||
+            static_cast<int>(down_exps.dims[0]) != scratch.expert_ffn() ||
+            static_cast<int>(down_exps.dims[1]) != scratch.hidden()) {
+            return false;
+        }
+        if (!lowbit_dp4a_available()) return false;
+        return cache.slot_count() >= 8u * static_cast<size_t>(scratch.k());
+    }
+
+    // Phase 1: select the experts of every token. The router GEMVs and the
+    // top-k kernels are enqueued token by token (each one writes the shared MoE
+    // scratch, so they cannot overlap), but the ids and weights are read back
+    // with a single synchronise instead of the per-token cudaStreamSynchronize()
+    // the serial selection performs. preselected mirrors the serial call site:
+    // the caller already ran the router for the activations it hands in.
+    void open_all(
+            Qwen38MoeScratch & scratch,
+            const GpuMatrix & router,
+            const std::vector<const float *> & activations,
+            float expert_scale,
+            cudaStream_t stream,
+            bool preselected) {
+        tokens_ = static_cast<int>(activations.size());
+        if (tokens_ < 1 || tokens_ > kMoeBatchTokenMax) {
+            throw std::runtime_error("MoE token batch holds one to the batch bound of tokens");
+        }
+        if (!(expert_scale > 0.0f)) {
+            throw std::runtime_error("MoE token batch needs a positive expert scale");
+        }
+        for (int t = 0; t < tokens_; ++t) {
+            if (activations[static_cast<size_t>(t)] == nullptr) {
+                throw std::runtime_error("MoE token batch got a null activation");
+            }
+        }
+
+        const int k = scratch.k();
+        const int hidden = scratch.hidden();
+        const size_t pairs = static_cast<size_t>(tokens_) * static_cast<size_t>(k);
+        k_ = k;
+
+        activations_ = activations;
+        ids_ = static_cast<int *>(scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::Ids, tokens_));
+        weights_ = static_cast<float *>(scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::Weights, tokens_));
+        float * logits = static_cast<float *>(scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::Logits, tokens_));
+
+        if (!preselected) {
+            if (router.rows != scratch.n_experts() || router.cols != hidden) {
+                throw std::runtime_error("Qwen3.8 router matrix geometry mismatch");
+            }
+            cudaError_t cuda_error = cudaSuccess;
+            for (int t = 0; t < tokens_ && cuda_error == cudaSuccess; ++t) {
+                const float * x = activations[static_cast<size_t>(t)];
+                if (q38_moe_router_q8_0_enabled() && q38_moe_router_q8_0_compatible(router, scratch)) {
+                    q38_moe_quantize_activation_q8_0(
+                        x, hidden, scratch.q8_0_values(), scratch.q8_0_scales(), stream);
+                    q38_moe_gemv_q8_0_exact(
+                        router.low, scratch.q8_0_values(), scratch.q8_0_scales(), scratch.d_logits(), stream);
+                } else if (q38_moe_router_f32_enabled() && matrix_has_f32_weights(router)) {
+                    launch_matrix_gemv_f32_weights(router, x, scratch.d_logits(), stream);
+                } else {
+                    launch_matrix_gemv_f32_input(router, x, scratch.d_logits(), stream);
+                }
+                q38_topk_softmax_kernel<<<1, 1, 0, stream>>>(
+                    scratch.d_logits(), scratch.n_experts(), k, expert_scale,
+                    scratch.d_ids(), scratch.d_weights());
+                cuda_error = cudaMemcpyAsync(
+                    logits + static_cast<size_t>(t) * static_cast<size_t>(scratch.n_experts()),
+                    scratch.d_logits(), static_cast<size_t>(scratch.n_experts()) * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream);
+                if (cuda_error == cudaSuccess) {
+                    cuda_error = cudaMemcpyAsync(
+                        ids_ + static_cast<size_t>(t) * static_cast<size_t>(k),
+                        scratch.d_ids(), static_cast<size_t>(k) * sizeof(int),
+                        cudaMemcpyDeviceToHost, stream);
+                }
+                if (cuda_error == cudaSuccess) {
+                    cuda_error = cudaMemcpyAsync(
+                        weights_ + static_cast<size_t>(t) * static_cast<size_t>(k),
+                        scratch.d_weights(), static_cast<size_t>(k) * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+                }
+            }
+            if (cuda_error == cudaSuccess) cuda_error = cudaStreamSynchronize(stream);
+            if (cuda_error != cudaSuccess) {
+                throw std::runtime_error(std::string("MoE token batch selection failed: ") +
+                                         cudaGetErrorString(cuda_error));
+            }
+        }
+
+        Q38MoeBatchPassDesc * host = static_cast<Q38MoeBatchPassDesc *>(host_staging());
+        host->tokens = tokens_;
+        host->k = k;
+        host->hidden = hidden;
+        host->expert_ffn = scratch.expert_ffn();
+        host->n_experts = scratch.n_experts();
+        host->expert_scale = expert_scale;
+        for (int t = 0; t < tokens_; ++t) {
+            host->token[t].ids = ids_ + static_cast<size_t>(t) * static_cast<size_t>(k);
+            host->token[t].weights = weights_ + static_cast<size_t>(t) * static_cast<size_t>(k);
+            host->token[t].logits = logits + static_cast<size_t>(t) * static_cast<size_t>(scratch.n_experts());
+            host->token[t].out = nullptr;
+            host->token[t].first_pair = t * k;
+            host->token[t].pair_count = k;
+        }
+        (void)pairs;
+    }
+
+    // Phase 2: resolve one pair's weights. gate/up follow the separate layout;
+    // every base is checked for the 2-byte alignment the IQ4_NL decoder needs
+    // and for the type the dispatcher was built for, so run() can re-check the
+    // whole batch and fall back to the serial loop on any mismatch.
+    // One pair's weight pointers. Whether the batch is still runnable after the
+    // acquire loop is decided by resolved(true), which uses these pointers.
+    void set_pair_weights(
+            int pair,
+            const LowBitMatrix & gate,
+            const LowBitMatrix & up,
+            const LowBitMatrix & down) {
+        if (pair < 0 || pair >= kMoeBatchTokenMax * kLowBitExpertBatchMax) {
+            throw std::runtime_error("MoE token batch pair index out of range");
+        }
+        Q38MoeBatchPtrEntry & entry = ptr_entries()[pair];
+        entry.gate_up[0] = gate.data;
+        entry.gate_up[1] = up.data;
+        entry.down[0] = down.data;
+        entry.base[0] = reinterpret_cast<uintptr_t>(gate.data) |
+            reinterpret_cast<uintptr_t>(up.data) | reinterpret_cast<uintptr_t>(down.data);
+        if (pair == 0) gate_type_ = gate.type;
+    }
+
+    // True when every pair staged by set_pair_weights() is runnable: the right
+    // weight types, the 2-byte bases the IQ4_NL decoder needs, and - when the
+    // caller reports the slots it acquired - a slot that is still live.
+    //
+    // The slot check is the eviction proof. A cache slot is one (layer, expert)
+    // residue, so two pairs of the same batch that resolved to *different*
+    // experts must not share a slot base: if they do, a later acquire recycled
+    // an earlier pair and the batch must fall back to the serial loop. Pairs
+    // that share an expert are expected to share the base.
+    bool resolved(bool check_slots = false) {
+        if (gate_type_ != GgmlType::IQ2_S && gate_type_ != GgmlType::IQ3_S) return false;
+        const int pairs = tokens_ * k_;
+        for (int p = 0; p < pairs; ++p) {
+            const Q38MoeBatchPtrEntry & entry = ptr_entries()[p];
+            if ((entry.base[0] & 1u) != 0) return false;
+            if (entry.gate_up[0] == nullptr || entry.gate_up[1] == nullptr || entry.down[0] == nullptr) return false;
+        }
+        if (!check_slots || ids_ == nullptr) return true;
+        for (int a = 0; a < pairs; ++a) {
+            for (int b = a + 1; b < pairs; ++b) {
+                if (ptr_entries()[b].gate_up[0] != ptr_entries()[a].gate_up[0]) continue;
+                if (ptr_entries()[b].down[0] != ptr_entries()[a].down[0]) continue;
+                if (ids_[a] != ids_[b]) return false;
+            }
+        }
+        return true;
+    }
+
+    // Phase 3: one staged batch pass. The description and the pointer arrays go
+    // to the device in four small H2D copies; the five imports after that are
+    // the whole routed expert computation of the layer.
+    void run(
+            Qwen38MoeScratch & scratch,
+            const TensorInfo & gate_exps,
+            const TensorInfo & up_exps,
+            const TensorInfo & down_exps,
+            cudaStream_t stream) {
+        (void)gate_exps;
+        (void)up_exps;
+        (void)down_exps;
+
+        const int k = scratch.k();
+        const int pairs = tokens_ * k;
+        const int hidden = scratch.hidden();
+        const int ffn = scratch.expert_ffn();
+        if (tokens_ < 1 || k < 1 || pairs <= 0 || pairs > kMoeBatchTokenMax * kLowBitExpertBatchMax) {
+            throw std::runtime_error("MoE token batch pass is not staged");
+        }
+
+        float * gate_up = static_cast<float *>(scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::GateUp, tokens_));
+        float * act = static_cast<float *>(scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::Act, tokens_));
+        int8_t * q8_values = static_cast<int8_t *>(scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::Q8Values, tokens_));
+        __half * q8_scales = static_cast<__half *>(scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::Q8Scales, tokens_));
+        float * down = static_cast<float *>(scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::Down, tokens_));
+        float * accum = static_cast<float *>(scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::Accum, tokens_));
+
+        uint8_t * device = device_staging();
+        const size_t ptr_entries_bytes = static_cast<size_t>(pairs) * sizeof(Q38MoeBatchPtrEntry);
+        const size_t gate_ptr_bytes = static_cast<size_t>(pairs) * sizeof(uint8_t *);
+        uint8_t * offsets = device;
+        Q38MoeBatchPtrEntry * device_entries = reinterpret_cast<Q38MoeBatchPtrEntry *>(offsets);
+        offsets += ptr_entries_bytes;
+        uint8_t ** device_gate_up = reinterpret_cast<uint8_t **>(offsets);
+        offsets += gate_ptr_bytes;
+        uint8_t ** device_down = reinterpret_cast<uint8_t **>(offsets);
+        offsets += gate_ptr_bytes;
+        Q38MoeBatchPassDesc * device_pass = reinterpret_cast<Q38MoeBatchPassDesc *>(offsets);
+        offsets += sizeof(Q38MoeBatchPassDesc);
+        int * device_activation = reinterpret_cast<int *>(offsets);
+        offsets += static_cast<size_t>(pairs) * sizeof(int);
+        float * device_weights = reinterpret_cast<float *>(offsets);
+
+        // Host staging: flat arrays the kernels index by pair. The pointer table
+        // stays the Q38MoeBatchPtrEntry shape set_pair_weights() fills, the GEMV
+        // kernels get the two flat arrays built from it.
+        uint8_t ** gate_up_host = flat_gate_up();
+        uint8_t ** down_host = flat_down();
+        const Q38MoeBatchPtrEntry * entries = ptr_entries();
+        Q38MoeBatchPassDesc * pass = static_cast<Q38MoeBatchPassDesc *>(host_staging());
+        for (int p = 0; p < pairs; ++p) {
+            gate_up_host[2 * p] = const_cast<uint8_t *>(entries[p].gate_up[0]);
+            gate_up_host[2 * p + 1] = const_cast<uint8_t *>(entries[p].gate_up[1]);
+            down_host[p] = const_cast<uint8_t *>(entries[p].down[0]);
+        }
+
+        Q38MoeBatchPairDesc * pair_desc = pair_descriptors();
+        int * activation_host = activation_map();
+        float * weights_host = pair_weight_map();
+        for (int t = 0; t < tokens_; ++t) {
+            for (int j = 0; j < k; ++j) {
+                const int pair = t * k + j;
+                pair_desc[pair].activation_pair = t;
+                pair_desc[pair].expert = j;
+                activation_host[pair] = t;
+                weights_host[pair] = weights_[pair];
+            }
+        }
+
+        cudaError_t cuda_error = cudaMemcpyAsync(
+            device_entries, entries, ptr_entries_bytes, cudaMemcpyHostToDevice, stream);
+        if (cuda_error == cudaSuccess) {
+            cuda_error = cudaMemcpyAsync(
+                device_gate_up, gate_up_host, gate_ptr_bytes, cudaMemcpyHostToDevice, stream);
+        }
+        if (cuda_error == cudaSuccess) {
+            cuda_error = cudaMemcpyAsync(
+                device_down, down_host, gate_ptr_bytes, cudaMemcpyHostToDevice, stream);
+        }
+        if (cuda_error == cudaSuccess) {
+            cuda_error = cudaMemcpyAsync(
+                device_pass, pass, sizeof(Q38MoeBatchPassDesc), cudaMemcpyHostToDevice, stream);
+        }
+        if (cuda_error == cudaSuccess) {
+            cuda_error = cudaMemcpyAsync(
+                device_activation, activation_host, static_cast<size_t>(pairs) * sizeof(int),
+                cudaMemcpyHostToDevice, stream);
+        }
+        if (cuda_error == cudaSuccess) {
+            cuda_error = cudaMemcpyAsync(
+                device_weights, weights_host, static_cast<size_t>(pairs) * sizeof(float),
+                cudaMemcpyHostToDevice, stream);
+        }
+        if (cuda_error != cudaSuccess) {
+            throw std::runtime_error(std::string("MoE token batch upload failed: ") +
+                                     cudaGetErrorString(cuda_error));
+        }
+
+        constexpr int threads = 256;
+        const int warps = threads / 32;
+        const int gate_up_blocks = (ffn + warps - 1) / warps;
+        const bool smem = lowbit_dp4a_smem_enabled();
+        if (gate_type_ == GgmlType::IQ2_S) {
+            if (smem) {
+                iq2_s_q8_k_gemv_pairs_dp4a_kernel<true><<<dim3(gate_up_blocks, pairs), threads, 0, stream>>>(
+                    const_cast<const uint8_t * const *>(device_gate_up), q8_values, nullptr,
+                    device_activation, gate_up, pairs, ffn, hidden);
+            } else {
+                iq2_s_q8_k_gemv_pairs_dp4a_kernel<false><<<dim3(gate_up_blocks, pairs), threads, 0, stream>>>(
+                    const_cast<const uint8_t * const *>(device_gate_up), q8_values, nullptr,
+                    device_activation, gate_up, pairs, ffn, hidden);
+            }
+        } else {
+            if (smem) {
+                iq3_s_q8_k_gemv_pairs_dp4a_kernel<true><<<dim3(gate_up_blocks, pairs), threads, 0, stream>>>(
+                    const_cast<const uint8_t * const *>(device_gate_up), q8_values, nullptr,
+                    device_activation, gate_up, pairs, ffn, hidden);
+            } else {
+                iq3_s_q8_k_gemv_pairs_dp4a_kernel<false><<<dim3(gate_up_blocks, pairs), threads, 0, stream>>>(
+                    const_cast<const uint8_t * const *>(device_gate_up), q8_values, nullptr,
+                    device_activation, gate_up, pairs, ffn, hidden);
+            }
+        }
+
+        const int ffn_blocks = (ffn + threads - 1) / threads;
+        q38_moe_silu_scale_mul_experts_kernel<<<dim3(ffn_blocks, pairs), threads, 0, stream>>>(
+            gate_up, act, ffn, 1.0f);
+
+        const int q8_blocks = (ffn / 32 + (threads / 32) - 1) / (threads / 32);
+        q38_moe_q8_0_quantize_experts_kernel<<<dim3(q8_blocks, pairs), threads, 0, stream>>>(
+            act, q8_values, q8_scales, ffn);
+
+        constexpr int rows_per_warp = 2;
+        const int down_blocks = (hidden + warps * rows_per_warp - 1) / (warps * rows_per_warp);
+        iq4_nl_q8_0_act_gemv_pairs_dp4a_kernel<<<dim3(down_blocks, pairs), threads, 0, stream>>>(
+            const_cast<const uint8_t * const *>(device_down), q8_values, q8_scales,
+            device_activation, down, pairs, hidden, ffn);
+
+        const int hidden_blocks = (hidden + threads - 1) / threads;
+        q38_moe_batch_accum_kernel<<<dim3(hidden_blocks, tokens_), threads, 0, stream>>>(
+            down, device_weights, nullptr, accum, device_pass);
+    }
+
+    // The batch's routed weighted sum is READY in scratch.d_batch Accum; the
+    // caller turns it into the per-token MoE output with a finish kernel.
+    float * accumulated(Qwen38MoeScratch & scratch) {
+        return static_cast<float *>(scratch.batch_buffer(Qwen38MoeScratch::BatchBuffer::Accum, tokens_));
+    }
+
+    int tokens() const { return tokens_; }
+
+    // Writes the routed sums of every token into one contiguous output and
+    // returns its dimensions. out_f32 keeps the unrounded F32 values.
+    void write_output(
+            Qwen38MoeScratch & scratch,
+            float * out_f32_or_null,
+            __half * out_half_or_null,
+            cudaStream_t stream) {
+        const int hidden = scratch.hidden();
+        const float * accum = accumulated(scratch);
+        const int hidden_blocks = (hidden + 255) / 256;
+        cudaError_t cuda_error = cudaSuccess;
+        if (out_half_or_null != nullptr) {
+            // The unrounded sum is rounded exactly once, in the same
+            // __float2half the serial q38_finish_moe() would have applied.
+            q38_moe_batch_to_half_kernel<<<dim3(hidden_blocks, tokens_), 256, 0, stream>>>(
+                accum, out_half_or_null, tokens_, hidden);
+        } else {
+            const cudaError_t copy_error = cudaMemcpyAsync(
+                out_f32_or_null, accum, static_cast<size_t>(hidden) * tokens_ * sizeof(float),
+                cudaMemcpyDeviceToDevice, stream);
+            cuda_error = copy_error;
+        }
+        if (cuda_error != cudaSuccess) {
+            throw std::runtime_error(std::string("MoE token batch output failed: ") +
+                                     cudaGetErrorString(cuda_error));
+        }
+    }
+
+private:
+    // Pointer arrays (host) ...
+    uint8_t ** flat_gate_up() {
+        ensure_host();
+        return reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(host_) + ptr_entries_bytes());
+    }
+    uint8_t ** flat_down() {
+        ensure_host();
+        return reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(host_) + ptr_entries_bytes() + gate_ptr_bytes());
+    }
+    Q38MoeBatchPtrEntry * ptr_entries() {
+        ensure_host();
+        return reinterpret_cast<Q38MoeBatchPtrEntry *>(host_);
+    }
+    Q38MoeBatchPassDesc * host_staging() {
+        ensure_host();
+        return reinterpret_cast<Q38MoeBatchPassDesc *>(
+            static_cast<uint8_t *>(host_) + ptr_entries_bytes() + 2 * gate_ptr_bytes());
+    }
+    Q38MoeBatchPairDesc * pair_descriptors() {
+        ensure_host();
+        return reinterpret_cast<Q38MoeBatchPairDesc *>(
+            reinterpret_cast<uint8_t *>(host_staging()) + sizeof(Q38MoeBatchPassDesc));
+    }
+    int * activation_map() {
+        ensure_host();
+        return reinterpret_cast<int *>(
+            reinterpret_cast<uint8_t *>(pair_descriptors()) + pair_desc_bytes());
+    }
+    float * pair_weight_map() {
+        ensure_host();
+        return reinterpret_cast<float *>(
+            reinterpret_cast<uint8_t *>(activation_map()) + activation_bytes());
+    }
+
+    size_t ptr_entries_bytes() const { return pair_capacity() * sizeof(Q38MoeBatchPtrEntry); }
+    size_t gate_ptr_bytes() const { return pair_capacity() * sizeof(uint8_t *); }
+    size_t pair_desc_bytes() const { return pair_capacity() * sizeof(Q38MoeBatchPairDesc); }
+    size_t activation_bytes() const { return pair_capacity() * sizeof(int); }
+    size_t pair_weight_bytes() const { return pair_capacity() * sizeof(float); }
+    size_t pass_offset_bytes() const { return ptr_entries_bytes() + 2 * gate_ptr_bytes(); }
+
+    // Pairs a pass can ever hold: the largest token batch times this session's
+    // expert batch cap.
+    size_t pair_capacity() const {
+        return static_cast<size_t>(kMoeBatchTokenMax) * static_cast<size_t>(batch_k_);
+    }
+
+    size_t host_bytes() const {
+        return pass_offset_bytes() + sizeof(Q38MoeBatchPassDesc) + pair_desc_bytes() +
+            activation_bytes() + pair_weight_bytes();
+    }
+
+    // The device staging mirrors the host one, minus the elements no kernel
+    // reads: pair descriptors stay host-only, so only the two pointer arrays,
+    // the pass description, the activation map and the pair weights are copied.
+    size_t device_bytes() const {
+        return ptr_entries_bytes() + 2 * gate_ptr_bytes() + sizeof(Q38MoeBatchPassDesc) +
+            activation_bytes() + pair_weight_bytes();
+    }
+
+    void ensure_host() {
+        if (host_ == nullptr) {
+            const cudaError_t e = cudaMallocHost(&host_, host_bytes());
+            if (e != cudaSuccess) {
+                throw std::runtime_error(std::string("cudaMallocHost MoE token batch failed: ") +
+                                         cudaGetErrorString(e));
+            }
+        }
+    }
+
+    uint8_t * device_staging() {
+        if (device_ == nullptr) {
+            const cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&device_), device_bytes());
+            if (e != cudaSuccess) {
+                throw std::runtime_error(std::string("cudaMalloc MoE token batch staging failed: ") +
+                                         cudaGetErrorString(e));
+            }
+        }
+        return device_;
+    }
+
+    int batch_k_ = q38_moe_batch_k();
+    int tokens_ = 0;
+    GgmlType gate_type_ = GgmlType::F32;
+    int k_ = 0;
+    void * host_ = nullptr;
+    uint8_t * device_ = nullptr;
+    std::vector<const float *> activations_;
+    int * ids_ = nullptr;
+    float * weights_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// Task G: expert-batched layer execution (WARODECODE_MOE_FUSED_GRID).
+// ---------------------------------------------------------------------------
+
+// True when the batched path may be attempted. The path acquires all k expert
+// slots of a layer before it launches anything, so a later acquire of the same
+// layer must not be able to evict one of its predecessors. choose_slot() evicts
+// the least recently used slot, which keeps the k slots this layer just took
+// untouched as long as the cache holds at least k slots *per layer*; 64 per
+// layer is a conservative bound for the 49-layer model. The batched GEMV has no
+// reference fallback, so the DP4A kernels have to be available, and the legacy
+// F16-mid path (which accumulates through d_down()) stays on its own loop.
+inline bool q38_moe_fused_grid_candidate(
+        const Qwen38MoeScratch & scratch,
+        size_t cache_slots,
+        bool f32_mid) {
+    if (!q38_moe_fused_grid_enabled()) return false;
+    const int k = scratch.k();
+    const char * blocker = nullptr;
+    if (!lowbit_dp4a_available()) blocker = "the DP4A GEMV kernels are unavailable";
+    else if (!f32_mid) blocker = "the legacy F16-mid path is active";
+    else if (k <= 0 || k > kLowBitExpertBatchMax) blocker = "top-k is outside the batch bound";
+    else if (cache_slots < 64u * static_cast<size_t>(k)) blocker = "the expert cache holds too few slots";
+    if (blocker != nullptr) {
+        // One line per process: which of the switches decided against the
+        // batched path, so an A/B run can tell "no effect" from "never taken".
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                         "warodecode: MoE expert-batched grid not taken (%s; WARODECODE_MOE_FUSED_GRID=1)\n",
+                         blocker);
+        }
+        return false;
+    }
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        std::fprintf(stderr,
+                     "warodecode: MoE expert-batched grid taken (top-k=%d, cache slots=%zu, 5 launches/layer)\n",
+                     k, cache_slots);
+    }
+    return true;
+}
+
+// One small H2D copy carries the weight pointers of the whole layer. It is
+// enqueued after every acquire() and before the batched kernels that read it,
+// so the stream order is the acquire -> copy -> kernels order the serial loop
+// would have had per expert.
+inline void q38_moe_upload_expert_ptr_table(
+        const Q38MoeExpertPtrTable & table,
+        Qwen38MoeScratch & scratch,
+        cudaStream_t stream) {
+    Q38MoeExpertPtrTable * host = scratch.host_expert_ptr_table();
+    *host = table;
+    const cudaError_t e = cudaMemcpyAsync(
+        scratch.expert_ptr_table(), host, sizeof(Q38MoeExpertPtrTable),
+        cudaMemcpyHostToDevice, stream);
+    if (e != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("copy MoE expert pointer table failed: ") + cudaGetErrorString(e));
+    }
+}
+
+// The five launches that replace the per-expert loop. gate_up_experts /
+// gate_up_rows describe the pointer table: 2k rows of ffn for the separate
+// gate/up layout (gate of expert j at 2j, up at 2j + 1), or k rows of 2 * ffn
+// for a fused gate_up tensor. Both fill the same [2k][ffn] gate/up buffer.
+// device_table must be scratch.expert_ptr_table(): the kernels read
+// w_experts[blockIdx.y] from device memory, so handing them the host struct the
+// upload was filled from would dereference host addresses on the device.
+template <bool CaptureSelectedOutput>
+inline void q38_moe_run_batched_experts(
+        const Q38MoeExpertPtrTable * device_table,
+        GgmlType gate_up_type,
+        int gate_up_experts,
+        int gate_up_rows,
+        int k,
+        __half * selected_output_trace,
+        Qwen38MoeScratch & scratch,
+        cudaStream_t stream) {
+    const int hidden = scratch.hidden();
+    const int ffn = scratch.expert_ffn();
+    constexpr int threads = 256;
+
+    bool launched = false;
+    if (gate_up_type == GgmlType::IQ2_S) {
+        launched = launch_iq2_s_gemv_q8_k_experts_f32(
+            device_table->gate_up, gate_up_experts, gate_up_rows, hidden,
+            scratch.rx_q8k_values(), scratch.rx_q8k_scales(),
+            scratch.rx_batch_gate_up(), stream, threads);
+    } else {
+        launched = launch_iq3_s_gemv_q8_k_experts_f32(
+            device_table->gate_up, gate_up_experts, gate_up_rows, hidden,
+            scratch.rx_q8k_values(), scratch.rx_q8k_scales(),
+            scratch.rx_batch_gate_up(), stream, threads);
+    }
+    if (!launched) {
+        throw std::runtime_error("expert-batched gate/up GEMV needs the DP4A kernels");
+    }
+
+    // SiLU(gate) * up for every expert. The routed call site applies SiLU with
+    // inv_hc = 1.0f, so that is the factor the batched kernel gets.
+    const int ffn_blocks = (ffn + threads - 1) / threads;
+    q38_moe_silu_scale_mul_experts_kernel<<<dim3(ffn_blocks, k), threads, 0, stream>>>(
+        scratch.rx_batch_gate_up(), scratch.rx_batch_act(), ffn, 1.0f);
+
+    const int q8_blocks_per_expert = ffn / 32;
+    const int q8_blocks = (q8_blocks_per_expert + (threads / 32) - 1) / (threads / 32);
+    q38_moe_q8_0_quantize_experts_kernel<<<dim3(q8_blocks, k), threads, 0, stream>>>(
+        scratch.rx_batch_act(), scratch.rx_batch_q8_0_values(),
+        scratch.rx_batch_q8_0_scales(), ffn);
+
+    launched = launch_iq4_nl_gemv_q8_0_experts_f32(
+        device_table->down, k, hidden, ffn, scratch.rx_batch_q8_0_values(),
+        scratch.rx_batch_q8_0_scales(), scratch.rx_batch_down(), stream, threads);
+    if (!launched) {
+        throw std::runtime_error("expert-batched down GEMV needs the DP4A kernels");
+    }
+
+    const int hidden_blocks = (hidden + threads - 1) / threads;
+    if constexpr (CaptureSelectedOutput) {
+        q38_moe_capture_experts_kernel<<<dim3(hidden_blocks, k), threads, 0, stream>>>(
+            scratch.rx_batch_down(), selected_output_trace, hidden);
+    }
+    q38_moe_weighted_accum_experts_f32_kernel<<<hidden_blocks, threads, 0, stream>>>(
+        scratch.rx_batch_down(), scratch.d_weights(), scratch.d_accum(), hidden, k);
+}
+
+// Batched twin of q38_moe_run_routed_experts_q8_act_separate(). Returns false
+// without launching anything when an expert base is odd (the IQ4_NL DP4A kernel
+// needs 16-bit aligned nibble reads); the caller's per-expert loop then
+// re-acquires the same slots as cache hits.
+template <bool CaptureSelectedOutput, typename XT = __half>
+inline bool q38_moe_try_run_routed_experts_q8_act_separate_batched(
+        int layer,
+        const XT * x,
+        const TensorInfo & gate_exps,
+        const TensorInfo & up_exps,
+        const TensorInfo & down_exps,
+        GpuExpertCache & cache,
+        Qwen38MoeScratch & scratch,
+        __half * selected_output_trace,
+        cudaStream_t stream) {
+    const int k = scratch.k();
+
+    Q38MoeExpertPtrTable table{};
+    GgmlType gate_up_type = GgmlType::F32;
+    for (int j = 0; j < k; ++j) {
+        const int expert = scratch.h_ids()[j];
+        auto w = cache.acquire(layer, expert, gate_exps, up_exps, down_exps, stream);
+        if (!q38_moe_gate_up_q8_k_type(w.gate.type) ||
+            !q38_moe_gate_up_q8_k_type(w.up.type) ||
+            w.down.type != GgmlType::IQ4_NL) {
+            throw std::runtime_error("Qwen3.8 routed expert low-bit type changed inside a layer");
+        }
+        // The batched kernels are dispatched once per layer, so the per-expert
+        // type checks above become one type check for the whole batch.
+        if (j == 0) {
+            gate_up_type = w.gate.type;
+        } else if (w.gate.type != gate_up_type || w.up.type != gate_up_type) {
+            throw std::runtime_error("Qwen3.8 routed expert types differ inside a layer");
+        }
+        if ((reinterpret_cast<uintptr_t>(w.down.data) & 1u) != 0) return false;
+        table.gate_up[2 * j] = w.gate.data;
+        table.gate_up[2 * j + 1] = w.up.data;
+        table.down[j] = w.down.data;
+    }
+
+    q38_moe_quantize_routed_x(x, scratch, stream);
+    q38_moe_upload_expert_ptr_table(table, scratch, stream);
+    q38_moe_run_batched_experts<CaptureSelectedOutput>(
+        scratch.expert_ptr_table(), gate_up_type, 2 * k, scratch.expert_ffn(), k,
+        selected_output_trace, scratch, stream);
+    return true;
+}
+
+// Batched twin of q38_moe_run_routed_experts_q8_act_fused().
+template <bool CaptureSelectedOutput, typename XT = __half>
+inline bool q38_moe_try_run_routed_experts_q8_act_fused_batched(
+        int layer,
+        const XT * x,
+        const TensorInfo & gate_up_exps,
+        const TensorInfo & down_exps,
+        GpuFusedExpertCache & cache,
+        Qwen38MoeScratch & scratch,
+        __half * selected_output_trace,
+        cudaStream_t stream) {
+    const int k = scratch.k();
+
+    Q38MoeExpertPtrTable table{};
+    GgmlType gate_up_type = GgmlType::F32;
+    for (int j = 0; j < k; ++j) {
+        const int expert = scratch.h_ids()[j];
+        auto w = cache.acquire(layer, expert, gate_up_exps, down_exps, stream);
+        if (!q38_moe_gate_up_q8_k_type(w.gate_up.type) || w.down.type != GgmlType::IQ4_NL) {
+            throw std::runtime_error("Qwen3.8 fused expert low-bit type changed inside a layer");
+        }
+        if (j == 0) {
+            gate_up_type = w.gate_up.type;
+        } else if (w.gate_up.type != gate_up_type) {
+            throw std::runtime_error("Qwen3.8 fused expert types differ inside a layer");
+        }
+        if ((reinterpret_cast<uintptr_t>(w.down.data) & 1u) != 0) return false;
+        table.gate_up[j] = w.gate_up.data;
+        table.down[j] = w.down.data;
+    }
+
+    q38_moe_quantize_routed_x(x, scratch, stream);
+    q38_moe_upload_expert_ptr_table(table, scratch, stream);
+    q38_moe_run_batched_experts<CaptureSelectedOutput>(
+        scratch.expert_ptr_table(), gate_up_type, k, 2 * scratch.expert_ffn(), k,
+        selected_output_trace, scratch, stream);
+    return true;
+}
+
 // MoE runner for one layer. OutT is the routed-output element type: the legacy
 // call sites pass a __half * (WARODECODE_MOE_F32_MID then only removes the F16
 // roundings *inside* the layer and keeps the single final round), while the F32
@@ -1502,6 +2774,15 @@ inline void run_qwen38_routed_moe_fused(
 
     const bool f32_mid = q38_moe_f32_mid_enabled();
     if (q38_moe_fused_experts_q8_act_compatible(gate_up_exps, down_exps, scratch)) {
+        // WARODECODE_MOE_FUSED_GRID: one expert-batched grid per layer instead
+        // of seven launches per expert.
+        if (q38_moe_fused_grid_candidate(scratch, cache.slot_count(), f32_mid) &&
+            q38_moe_try_run_routed_experts_q8_act_fused_batched<CaptureSelectedOutput, XT>(
+                layer, x, gate_up_exps, down_exps, cache, scratch,
+                selected_output_trace, stream)) {
+            q38_finish_moe(scratch, out, stream);
+            return;
+        }
         q38_moe_run_routed_experts_q8_act_fused<CaptureSelectedOutput, XT>(
             layer, x, gate_up_exps, down_exps, cache, scratch, f32_mid, selected_output_trace, stream);
         q38_finish_moe(scratch, out, stream);
@@ -1609,6 +2890,15 @@ inline void run_qwen38_routed_moe_separate(
 
     const bool f32_mid = q38_moe_f32_mid_enabled();
     if (q38_moe_separate_experts_q8_act_compatible(gate_exps, up_exps, down_exps, scratch)) {
+        // WARODECODE_MOE_FUSED_GRID: one expert-batched grid per layer instead
+        // of seven launches per expert.
+        if (q38_moe_fused_grid_candidate(scratch, cache.slot_count(), f32_mid) &&
+            q38_moe_try_run_routed_experts_q8_act_separate_batched<CaptureSelectedOutput, XT>(
+                layer, x, gate_exps, up_exps, down_exps, cache, scratch,
+                selected_output_trace, stream)) {
+            q38_finish_moe(scratch, out, stream);
+            return;
+        }
         q38_moe_run_routed_experts_q8_act_separate<CaptureSelectedOutput, XT>(
             layer, x, gate_exps, up_exps, down_exps, cache, scratch, f32_mid,
             selected_output_trace, stream);

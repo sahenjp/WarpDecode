@@ -6,6 +6,7 @@
 #include "qwen38_gdn.cuh"
 #include "qwen38_forward.cuh"
 #include "qwen38_moe.cuh"
+#include "qwen38_mtp.cuh"
 #include "qwen38_runtime.cuh"
 #include "qwen38_state.cuh"
 #include "qwen38_tuning.hpp"
@@ -22,6 +23,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -144,6 +146,11 @@ struct Args {
     std::string extended_parity_trace;
     std::string state_trace_path;
     std::vector<int> forced_input_tokens;
+    std::vector<int> prefill_tokens;
+    std::string prefill_tokens_file;
+    int bench_repeat = 1;
+    bool mtp = false;
+    int mtp_draft = 0;
     std::vector<int> debug_moe_ids;
     std::vector<float> debug_moe_weights;
     std::string debug_moe_routes_file;
@@ -172,6 +179,30 @@ static std::vector<int> parse_token_ids(const std::string & value) {
         if (consumed != part.size() || id < 0) throw std::runtime_error("invalid forced input token list");
         ids.push_back(id);
     }
+    return ids;
+}
+
+// Prompt token IDs for the prefill/decode phase benchmark. Commas, whitespace
+// and newlines are all accepted, so a tokenizer dump can be fed in as-is.
+static std::vector<int> read_token_ids_file(const std::string & path) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("cannot open token ID file: " + path);
+    std::string text(
+        (std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    for (char & c : text) {
+        if (c == ',' || c == ';' || c == '\n' || c == '\r' || c == '\t') c = ' ';
+    }
+    std::istringstream stream(text);
+    std::vector<int> ids;
+    long long value = 0;
+    while (stream >> value) {
+        if (value < 0 || value > std::numeric_limits<int>::max()) {
+            throw std::runtime_error("token ID out of range in " + path);
+        }
+        ids.push_back(static_cast<int>(value));
+    }
+    if (!stream.eof()) throw std::runtime_error("token ID file has a non-numeric field: " + path);
+    if (ids.empty()) throw std::runtime_error("token ID file is empty: " + path);
     return ids;
 }
 
@@ -359,13 +390,23 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--extended-parity-trace") a.extended_parity_trace = need(i, "--extended-parity-trace");
         else if (s == "--state-trace") a.state_trace_path = need(i, "--state-trace");
         else if (s == "--forced-input-tokens") a.forced_input_tokens = parse_token_ids(need(i, "--forced-input-tokens"));
+        else if (s == "--prefill-tokens") a.prefill_tokens = parse_token_ids(need(i, "--prefill-tokens"));
+        else if (s == "--prefill-tokens-file") a.prefill_tokens_file = need(i, "--prefill-tokens-file");
+        else if (s == "--bench-repeat") a.bench_repeat = std::stoi(need(i, "--bench-repeat"));
+        else if (s == "--mtp") a.mtp = true;
+        else if (s == "--mtp-draft") a.mtp_draft = std::stoi(need(i, "--mtp-draft"));
         else if (s == "--state-trace-position") a.state_trace_position = std::stoi(need(i, "--state-trace-position"));
         else if (s == "-h" || s == "--help") {
-            std::cout << "warodecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--debug-f32-hc-layer0] [--debug-f32-hc-attn-0-8] [--debug-f32-hc-ffn-0-8] [--debug-hc-q8_1-attn-from-layer N --debug-hc-q8_1-attn-through-layer N] [--debug-hc-q8_1-ffn-from-layer N --debug-hc-q8_1-ffn-through-layer N] [--debug-f32-hc-ffn-layer8] [--debug-hc-norm-f32-layer N --debug-hc-norm-f32-file path | --debug-layer0-hc-gate-f32-store | --debug-layer0-hc-gate-f32-sigmoid | --debug-hc-gate-q8_0-layer N | --debug-hc-attn-q8_0-full-layer N | --debug-qsa-q8_0-layer N | --debug-qsa-v-q8_0-layer N] [--debug-attention-input-f32-layer N --debug-attention-input-f32-file path] [--debug-qsa-context-f32-layer N --debug-qsa-context-f32-file path] [--debug-qsa-pregate-f32-layer N --debug-qsa-pregate-f32-file path] [--debug-qsa-query-f32-layer N --debug-qsa-query-f32-file path] [--debug-attention-output-f32-layer N --debug-attention-output-f32-file path] [--debug-hc-attn-combine-layer N --debug-hc-attn-combine-f32-file path] [--debug-hc-inject-f32-layer N --debug-hc-inject-f32-file path] [--debug-layer-input-residual-layer N --debug-layer-input-residual-f32-file path] [--debug-router-cpu-activation-f32-file path] [--debug-moe-ids ids [--debug-moe-weights weights] | --debug-moe-routes-file path] [--debug-routed-moe-output-f32-file path | --debug-routed-moe-output-all-positions-f32-file path] [--debug-layer8-after-attn-residual-f32-file path] [--debug-layer8-hc-ffn-mix-f32-file path | --debug-layer8-output-layer N --debug-layer8-output-f32-file path | --debug-layer-output-all-positions-f32-file path] [--debug-ffn-output-layer N --debug-ffn-output values] [--debug-final-residual-f32-file path | --debug-layer9-gdn-state-layer N --debug-layer9-gdn-state-f32-file path | --debug-layer9-gdn-conv-state-layer N --debug-layer9-gdn-conv-state-f32-file path | --debug-layer14-gdn-core-f32-file path | --debug-layer14-gdn-norm-output-f32-file] [--extended-parity-trace path] [--state-trace path --forced-input-tokens 1,271,2 [--state-trace-position N]] [--no-graph] [--no-autotune] [--load-only]\n";
+            std::cout << "warodecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--debug-f32-hc-layer0] [--debug-f32-hc-attn-0-8] [--debug-f32-hc-ffn-0-8] [--debug-hc-q8_1-attn-from-layer N --debug-hc-q8_1-attn-through-layer N] [--debug-hc-q8_1-ffn-from-layer N --debug-hc-q8_1-ffn-through-layer N] [--debug-f32-hc-ffn-layer8] [--debug-hc-norm-f32-layer N --debug-hc-norm-f32-file path | --debug-layer0-hc-gate-f32-store | --debug-layer0-hc-gate-f32-sigmoid | --debug-hc-gate-q8_0-layer N | --debug-hc-attn-q8_0-full-layer N | --debug-qsa-q8_0-layer N | --debug-qsa-v-q8_0-layer N] [--debug-attention-input-f32-layer N --debug-attention-input-f32-file path] [--debug-qsa-context-f32-layer N --debug-qsa-context-f32-file path] [--debug-qsa-pregate-f32-layer N --debug-qsa-pregate-f32-file path] [--debug-qsa-query-f32-layer N --debug-qsa-query-f32-file path] [--debug-attention-output-f32-layer N --debug-attention-output-f32-file path] [--debug-hc-attn-combine-layer N --debug-hc-attn-combine-f32-file path] [--debug-hc-inject-f32-layer N --debug-hc-inject-f32-file path] [--debug-layer-input-residual-layer N --debug-layer-input-residual-f32-file path] [--debug-router-cpu-activation-f32-file path] [--debug-moe-ids ids [--debug-moe-weights weights] | --debug-moe-routes-file path] [--debug-routed-moe-output-f32-file path | --debug-routed-moe-output-all-positions-f32-file path] [--debug-layer8-after-attn-residual-f32-file path] [--debug-layer8-hc-ffn-mix-f32-file path | --debug-layer8-output-layer N --debug-layer8-output-f32-file path | --debug-layer-output-all-positions-f32-file path] [--debug-ffn-output-layer N --debug-ffn-output values] [--debug-final-residual-f32-file path | --debug-layer9-gdn-state-layer N --debug-layer9-gdn-state-f32-file path | --debug-layer9-gdn-conv-state-layer N --debug-layer9-gdn-conv-state-f32-file path | --debug-layer14-gdn-core-f32-file path | --debug-layer14-gdn-norm-output-f32-file] [--extended-parity-trace path] [--state-trace path --forced-input-tokens 1,271,2 [--state-trace-position N]] [--prefill-tokens ids | --prefill-tokens-file path] [--bench-repeat N] [--no-graph] [--no-autotune] [--load-only]\n";
             std::cout << "[--debug-qsa-key-store-f32-layer N --debug-qsa-key-store-f32-file path] [--debug-qsa-value-store-f32-layer N --debug-qsa-value-store-f32-file path] [--debug-qsa-key-cache-prefix-f32-layer N --debug-qsa-key-cache-prefix-f32-file path] [--debug-qsa-value-cache-prefix-f32-layer N --debug-qsa-value-cache-prefix-f32-file path]\n";
             std::exit(0);
         } else throw std::runtime_error("不明な引数: " + s);
     }
+    // MTP (speculative decode) defaults come from the environment so the
+    // Colab runner can switch it without new CLI plumbing. --mtp / --mtp-draft
+    // still win when given explicitly.
+    if (!a.mtp && wd::q38_mtp_enabled()) a.mtp = true;
+    if (a.mtp_draft <= 0) a.mtp_draft = wd::q38_mtp_draft_len();
     if (a.debug_f32_hc_layer0 && a.top_k == 0) a.top_k = 10;
     if (a.debug_f32_hc_layer0 && a.generate != 1 && a.state_trace_path.empty()) {
         throw std::runtime_error("--debug-f32-hc-layer0 requires --generate 1");
@@ -810,6 +851,7 @@ static Args parse_args(int argc, char** argv) {
     if (a.ctx < 16 || a.generate < 1 || a.start_token < 0 || a.top_k < 0 || a.top_k > 256) {
         throw std::runtime_error("引数範囲が不正です");
     }
+    if (a.bench_repeat < 1) throw std::runtime_error("--bench-repeat は1以上にしてください");
     return a;
 }
 
@@ -1509,6 +1551,15 @@ struct Runtime {
 int main(int argc, char** argv) {
     try {
         wd::Args args = wd::parse_args(argc, argv);
+        if (!args.prefill_tokens_file.empty()) {
+            if (!args.prefill_tokens.empty()) {
+                throw std::runtime_error("--prefill-tokens と --prefill-tokens-file は同時に指定できません");
+            }
+            args.prefill_tokens = wd::read_token_ids_file(args.prefill_tokens_file);
+        }
+        if (!args.prefill_tokens.empty() && !args.forced_input_tokens.empty()) {
+            throw std::runtime_error("--prefill-tokens と --forced-input-tokens は同時に指定できません");
+        }
         int count = 0; WD_CUDA(cudaGetDeviceCount(&count));
         if (args.device < 0 || args.device >= count) throw std::runtime_error("指定GPUがありません");
         WD_CUDA(cudaSetDevice(args.device));
@@ -1516,6 +1567,9 @@ int main(int argc, char** argv) {
         const int cc = prop.major * 10 + prop.minor;
         if (cc < 50) throw std::runtime_error("warodecodeはSM50以上のNVIDIA GPUを対象にします");
         if (args.ctx <= args.generate + 2) throw std::runtime_error("--ctx は --generate より十分大きくしてください");
+        if (static_cast<int>(args.prefill_tokens.size()) + args.generate > args.ctx) {
+            throw std::runtime_error("--ctx は prefillトークン数 + --generate 以上にしてください");
+        }
 
         const auto kernel_plan = wd::kernel_plan_for_sm(cc);
         std::cerr << "GPU: " << prop.name << " sm_" << prop.major << prop.minor << " family=" << kernel_plan.family << "\n";
@@ -1718,11 +1772,65 @@ int main(int argc, char** argv) {
             trace.extended_parity = !args.extended_parity_trace.empty();
             trace.state_trace = !args.state_trace_path.empty();
             trace.state_trace_position = args.state_trace_position;
-            const double sec = decoder.run(
-                args.start_token, args.generate, &generated,
-                args.top_k > 0 ? &top_logits : nullptr, args.top_k,
-                args.top_k > 0 || trace.state_trace ? &trace : nullptr,
-                args.forced_input_tokens.empty() ? nullptr : &args.forced_input_tokens);
+            const std::vector<int> * forced_tokens_ptr =
+                args.forced_input_tokens.empty() ? nullptr : &args.forced_input_tokens;
+            const std::vector<int> * prefill_tokens_ptr =
+                args.prefill_tokens.empty() ? nullptr : &args.prefill_tokens;
+            wd::Qwen38Trace * const trace_ptr =
+                args.top_k > 0 || trace.state_trace ? &trace : nullptr;
+            // --bench-repeat>=2 repeats the whole prefill+decode run against the
+            // same loaded model (expert cache stays warm) and reports the fastest
+            // repetition. Only the first repetition fills the caller's outputs, so
+            // tokens, top logits and traces are unaffected by the extra runs.
+            //
+            // MTP (speculative draft/verify) path. It drives step() itself, so
+            // the tracing entry points and prefill token batches are excluded.
+            const bool mtp_active =
+                args.mtp && trace_ptr == nullptr && prefill_tokens_ptr == nullptr;
+            if (args.mtp && !mtp_active) {
+                std::cerr << "[mtp] disabled: tracing / prefill batches are not supported in MTP mode\n";
+            }
+            wd::Qwen38Mtp mtp_engine;
+            if (mtp_active) {
+                mtp_engine.initialize(gguf, qrt, qstate.max_ctx());
+                mtp_engine.set_draft_len(args.mtp_draft);
+                std::cerr << "[mtp] draft block blk." << mtp_engine.layer()
+                          << " ratio=" << mtp_engine.ratio()
+                          << " k=" << mtp_engine.draft_len()
+                          << " expert_slots=" << mtp_engine.expert_cache_slots() << "\n";
+            }
+            std::vector<int> repeat_tokens;
+            wd::Qwen38MtpStats mtp_stats;
+            wd::Qwen38RunTiming timing;
+            double sec = 0.0;
+            for (int repeat = 0; repeat < args.bench_repeat; ++repeat) {
+                const bool collect = repeat == 0;
+                if (mtp_active) {
+                    const wd::Qwen38MtpStats round = wd::qwen38_run_speculative(
+                        decoder, mtp_engine, args.start_token, args.generate,
+                        collect ? &generated : &repeat_tokens);
+                    if (collect || round.seconds < sec) {
+                        sec = round.seconds;
+                        mtp_stats = round;
+                        timing = wd::Qwen38RunTiming{};
+                        timing.decode_seconds = round.seconds;
+                        timing.decode_tokens = args.generate;
+                    }
+                    continue;
+                }
+                wd::Qwen38RunTiming run_timing;
+                const double run_seconds = decoder.run(
+                    args.start_token, args.generate,
+                    collect ? &generated : nullptr,
+                    collect && args.top_k > 0 ? &top_logits : nullptr,
+                    args.top_k,
+                    collect ? trace_ptr : nullptr,
+                    forced_tokens_ptr, prefill_tokens_ptr, &run_timing);
+                if (collect || run_seconds < sec) {
+                    sec = run_seconds;
+                    timing = run_timing;
+                }
+            }
             std::vector<wd::Qwen38TraceStats> extended_trace_stats;
             if (trace.extended_parity || trace.state_trace) {
                 wd::write_qwen38_trace_binary(
@@ -1740,18 +1848,40 @@ int main(int argc, char** argv) {
                       << "\",\"arch\":\"qwen4exp\""
                       << ",\"tokens\":" << args.generate
                       << ",\"seconds\":" << std::fixed << std::setprecision(6) << sec
+                      << ",\"prefill_seconds\":" << std::setprecision(6) << timing.prefill_seconds
+                      << ",\"prefill_tokens\":" << timing.prefill_tokens
+                      << ",\"decode_seconds\":" << std::setprecision(6) << timing.decode_seconds
+                      << ",\"decode_tokens\":" << timing.decode_tokens
+                      << ",\"bench_repeats\":" << args.bench_repeat
                       << ",\"tok_s\":" << std::setprecision(3) << tps
                       << ",\"first_token\":" << (generated.empty() ? -1 : generated.front())
                       << ",\"last_token\":" << (generated.empty() ? -1 : generated.back())
                       << ",\"token_hash\":\"0x" << std::hex << token_hash << std::dec << "\""
                       << ",\"ctx\":" << qstate.max_ctx()
                       << ",\"ple\":" << (qrt.ple_table ? "true" : "false")
-                      << ",\"mtp\":false"
+                      << ",\"mtp\":" << (mtp_active ? "true" : "false")
+                      << ",\"mtp_draft\":" << mtp_stats.draft_len
+                      << ",\"mtp_calls\":" << mtp_stats.draft_steps
+                      << ",\"mtp_draft_tokens\":" << mtp_stats.draft_tokens
+                      << ",\"mtp_accepts\":" << mtp_stats.accepts
+                      << ",\"mtp_full_rounds\":" << mtp_stats.full_rounds
+                      << ",\"mtp_rounds\":" << mtp_stats.rounds
+                      << ",\"mtp_accept_rate\":" << std::setprecision(4) << mtp_stats.accept_rate()
+                      << ",\"mtp_draft_seconds\":" << std::setprecision(6) << mtp_stats.draft_seconds
+                      << ",\"mtp_draft_ms\":" << std::setprecision(4) << mtp_stats.draft_ms_per_step()
+                      << ",\"mtp_stage_norm_s\":" << std::setprecision(6) << mtp_stats.stage_norm_seconds
+                      << ",\"mtp_stage_attn_s\":" << std::setprecision(6) << mtp_stats.stage_attn_seconds
+                      << ",\"mtp_stage_moe_s\":" << std::setprecision(6) << mtp_stats.stage_moe_seconds
+                      << ",\"mtp_stage_head_s\":" << std::setprecision(6) << mtp_stats.stage_head_seconds
                       << ",\"debug_f32_hc_layer0\":" << (args.debug_f32_hc_layer0 ? "true" : "false")
                       << ",\"cuda_graph\":false"
                       << ",\"head_q8_k\":" << (head_q8_k ? "true" : "false")
                       << ",\"head_q8_k_calls\":" << wd::lowbit_head_q8_k_launch_count()
                       << ",\"kernel_family\":\"" << kernel_plan.family << "\""
+                      // Task F: per-stage CUDA-event breakdown of one decode token.
+                      // {"enabled":false} unless WARODECODE_PROFILE is set.
+                      << ",\"profile\":" << decoder.profile_json()
+                      << ",\"profile_detail\":" << decoder.profile_detail_json()
                       << ",\"token_ids\":[";
             for (size_t i = 0; i < generated.size(); ++i) {
                 if (i != 0) std::cout << ',';
@@ -1916,6 +2046,9 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (!args.prefill_tokens.empty()) {
+            throw std::runtime_error("--prefill-tokens は qwen4exp (Qwen3.8-Flash-Next) 専用です");
+        }
         wd::Model model = wd::load_model(gguf);
         if (args.autotune) wd::autotune_q4(model);
         std::cerr << "arch=" << model.arch << " layers=" << model.layers << " hidden=" << model.hidden

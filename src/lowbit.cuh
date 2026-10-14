@@ -7,8 +7,10 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -134,6 +136,116 @@ __device__ __forceinline__ float iq4_nl_value(uint8_t q) {
            1,   13,  25,  38,  53,  69,  89, 113,
     };
     return static_cast<float>(lut[q & 0x0f]);
+}
+
+// ---------------------------------------------------------------------------
+// DP4A helpers (Task D).
+//
+// Every quantised GEMV below reproduces ggml's integer dot product by reducing
+// each four-value chunk of a 32-value block with three shfl_down adds and by
+// multiplying the four per-value products with the block scale one by one. Both
+// halves of that reduction are exact integer arithmetic - the codebook
+// magnitudes are bounded by 127 and the activations are 7-bit - so one __dp4a()
+// over the four (weight, activation) byte pairs yields exactly the same int32 as
+// the shuffle reduction, and multiplying that chunk sum by the block scale
+// yields exactly the same product: integer addition and multiplication are
+// associative and exact, and no product can overflow int32 (the worst case,
+// IQ2_S with |q| <= 43 and a 15x group scale, stays below 2^22 per superblock).
+//
+// The float side is untouched. The DP4A kernels assign one chunk per lane and
+// decode four rows per warp (lanes 0-7 own chunks 0-7 of row 0, lanes 8-15 of
+// row 1, ...), which is what lets 32 lanes cover four 32-value blocks per step.
+// Every float operation - the per-superblock fmaf, the IQ4_NL even/odd block
+// accumulators and the closing hsum_float_8 tree - still runs on the same values
+// in the same order as the reference kernel, so the results are bit-identical.
+// ---------------------------------------------------------------------------
+
+// __dp4a needs sm_61; the DP4A kernels are selected from sm_80 up (L4 = sm_89,
+// A100 = sm_80) and fall back to this scalar equivalent everywhere else,
+// including the host pass of the nvcc-free syntax check. The fallback adds the
+// same four byte products, so it is also bit-identical - only slower.
+__device__ __forceinline__ int lowbit_dp4a(int a, int b, int c) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    return __dp4a(a, b, c);
+#else
+    int sum = c;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        sum += static_cast<int>(static_cast<int8_t>(a >> (8 * i))) *
+               static_cast<int>(static_cast<int8_t>(b >> (8 * i)));
+    }
+    return sum;
+#endif
+}
+
+// Byte j of the result is 0xff exactly when sign bit j of "bits" (low four bits
+// are read) is set. The four bits are moved eight apart first so that a single
+// multiply by 0xff expands them into four independent byte masks.
+__device__ __forceinline__ unsigned lowbit_sign_mask4(unsigned bits) {
+    const unsigned spaced = (bits & 1u) | ((bits & 2u) << 7) |
+                            ((bits & 4u) << 14) | ((bits & 8u) << 21);
+    return spaced * 0xffu;
+}
+
+// Negates byte j of "quad" when sign bit j of "bits" is set. ggml's IQ2_S/IQ3_S
+// sign tables negate the magnitude, not the activation, and ~v + 1 == -v in
+// two's complement. The addition cannot carry into the next byte because every
+// IQ2_S/IQ3_S codebook magnitude is in [1, 127] and therefore never 0.
+__device__ __forceinline__ unsigned lowbit_sign_i8x4(unsigned quad, unsigned bits) {
+    const unsigned mask = lowbit_sign_mask4(bits);
+    return (quad ^ mask) + (mask & 0x01010101u);
+}
+
+inline bool lowbit_env_flag(const char * name, bool default_on);
+
+// WARODECODE_DP4A (default ON): route the quantised GEMVs through the __dp4a
+// kernels below. WARODECODE_DP4A=0 restores the reference kernels for A/B runs.
+inline bool lowbit_dp4a_enabled() {
+    static const bool enabled = lowbit_env_flag("WARODECODE_DP4A", true);
+    return enabled;
+}
+
+// WARODECODE_DP4A_SMEM (default ON): stage the IQ2_S/IQ3_S grid codebooks in
+// shared memory instead of reading them from __constant__. Every lane of a warp
+// looks up a different grid entry, and the constant cache serializes those
+// divergent reads; the shared memory unit serves them in a couple of cycles.
+inline bool lowbit_dp4a_smem_enabled() {
+    static const bool enabled = lowbit_env_flag("WARODECODE_DP4A_SMEM", true);
+    return enabled;
+}
+
+inline int lowbit_current_device_sm() {
+    static const int sm = [] {
+        int device = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) return 0;
+        int major = 0;
+        int minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) {
+            return 0;
+        }
+        if (cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+            return 0;
+        }
+        return major * 10 + minor;
+    }();
+    return sm;
+}
+
+// The DP4A kernels are only selected on sm_80+ where __dp4a is a single
+// instruction and both target GPUs (L4, A100) live. Older targets keep the
+// reference kernels even when the flag is on. The one-time stderr line makes an
+// on-device A/B run state which path it took ("tok_s" alone cannot, because both
+// paths are required to be bit-identical).
+inline bool lowbit_dp4a_available() {
+    static const bool available = [] {
+        const int sm = lowbit_current_device_sm();
+        const bool requested = lowbit_dp4a_enabled();
+        const bool selected = requested && sm >= 80;
+        std::fprintf(stderr, "warodecode: DP4A GEMV %s (WARODECODE_DP4A=%d, sm_%d)\n",
+                     selected ? "selected" : "not selected", requested ? 1 : 0, sm);
+        return selected;
+    }();
+    return available;
 }
 
 class Q8_1Buffer {
@@ -870,6 +982,202 @@ __global__ void iq2_s_q8_k_gemv_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Task G: expert-batched DP4A GEMV.
+//
+// One routed-MoE layer decodes the same activation against top-k expert
+// matrices, and the current path launches one kernel per expert and projection.
+// The kernels below take a whole layer in a single launch instead: grid.y
+// selects the expert through a small device array of weight pointers, and every
+// expert's rows are decoded by exactly the same per-row routine the
+// single-expert kernels use. Only the launch geometry changes, so every output
+// value stays bit-identical.
+// ---------------------------------------------------------------------------
+// Longest expert batch one launch addresses: the pointer array has a fixed size
+// so one small struct copy per layer can carry every weight pointer.
+constexpr int kLowBitExpertBatchMax = 32;
+
+// IQ2_S x Q8_K with one __dp4a per four values, one row per warp.
+//
+// Chunk c of a 32-value block covers columns 4c..4c+3, which sit in grid group
+// g = c >> 1 at grid positions lane8 = 4*(c & 1) .. +3. Both chunks of a group
+// therefore live in that group's single 64-bit grid entry: c even reads its low
+// half, c odd its high half. The sign byte holds one bit per grid position, and
+// the group's 4-bit scale belongs to groups 0/1 for lanes 0-7 and to groups 2/3
+// for lanes 8-15, so "ls" depends only on the chunk index, exactly as before.
+//
+// The warp keeps the reference geometry - all 32 lanes on the same row, 8 warps
+// per block, one warp per row - because a 640-row expert projection is only 640
+// warps of work: decoding four rows per warp quarters that and leaves most SMs
+// idle. Instead the 32 lanes are the 8 chunks times four phases, where phase q
+// owns the 32-value blocks q and q+4. The integer partials of the four phases
+// are then summed with two shuffles, which is exact (the phases own disjoint
+// blocks) and gives every lane the same int32 the reference's three-lane
+// shuffle produces before the per-superblock scale.
+// Per-row decode shared by the single-expert kernel below and its
+// expert-batched twin. Both callers run exactly the same arithmetic, so their
+// rows are bit-identical; only lane 0 of the warp carries a meaningful return
+// value (the closing tree reduces the eight chunk accumulators onto lane 0).
+template <bool USE_SMEM>
+__device__ __forceinline__ float iq2_s_q8_k_row_dp4a(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        int row,
+        int cols,
+        const uint64_t * grid_table) {
+    const int lane = threadIdx.x & 31;
+
+    const int chunk = lane & 7;        // 4-value chunk of a 32-value block
+    const int phase = lane >> 3;       // which pair of 32-value blocks
+    const int group = chunk >> 1;      // 8-value IQ2_S grid group
+    const int grid_half = chunk & 1;   // low or high half of the grid entry
+
+    const int superblocks_per_row = cols >> 8; // 256 values per IQ2_S block
+    const size_t row_stride = static_cast<size_t>(superblocks_per_row) * 82u;
+    const uint8_t * row_ptr = w + static_cast<size_t>(row) * row_stride;
+    const bool scale_low_nibble = chunk < 4;
+
+    float accumulator = 0.0f;
+    for (int sb = 0; sb < superblocks_per_row; ++sb) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(sb) * 82u;
+        const float d_w = lowbit_half(blk);
+        const uint8_t * qs = blk + 2;
+        const uint8_t * qh = qs + 64;
+        const uint8_t * scales = qh + 8;
+        const uint8_t * signs = qs + 32;
+        const int8_t * a = x_qs + (sb << 8);
+
+        int partial = 0;
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int ib32 = phase + 4 * p;
+            const uint8_t scale_byte = scales[ib32];
+            const int ls = scale_low_nibble
+                ? 1 + 2 * static_cast<int>(scale_byte & 0x0f)
+                : 1 + 2 * static_cast<int>(scale_byte >> 4);
+
+            const uint16_t grid_index = static_cast<uint16_t>(
+                static_cast<uint16_t>(qs[ib32 * 4 + group]) |
+                static_cast<uint16_t>(
+                    (static_cast<uint16_t>(qh[ib32]) << (8 - 2 * group)) & 0x300u));
+            const unsigned quad = static_cast<unsigned>(
+                (USE_SMEM ? grid_table[grid_index] : k_iq2s_grid[grid_index]) >>
+                (32 * grid_half));
+            const unsigned sign_bits = static_cast<unsigned>(
+                signs[ib32 * 4 + group] >> (4 * grid_half));
+            const unsigned weights4 = lowbit_sign_i8x4(quad, sign_bits);
+            const unsigned activation4 = *reinterpret_cast<const unsigned *>(
+                a + static_cast<size_t>(ib32) * 32u + static_cast<size_t>(chunk) * 4u);
+            partial += lowbit_dp4a(
+                static_cast<int>(activation4), static_cast<int>(weights4), 0) * ls;
+        }
+
+        // Phases 0-3 of a chunk own disjoint 32-value blocks, so the integer
+        // partials combine exactly, and lanes 0-7 end up with the chunk sums.
+        partial += __shfl_down_sync(0xffffffffu, partial, 8);
+        partial += __shfl_down_sync(0xffffffffu, partial, 16);
+        if (lane < 8) {
+            accumulator = fmaf(d_w * x_d[sb], static_cast<float>(partial), accumulator);
+        }
+    }
+
+    // Chunk accumulators live in lanes 0-7; the closing hsum_float_8 pairing is
+    // (v0+v4, v1+v5, v2+v6, v3+v7), then (s0+s2) + (s1+s3).
+    const float r = __fadd_rn(accumulator, __shfl_down_sync(0xffffffffu, accumulator, 4));
+    const float s = __fadd_rn(r, __shfl_down_sync(0xffffffffu, r, 2));
+    return __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, 1));
+}
+
+template <bool OUT_F32, bool USE_SMEM>
+__global__ void iq2_s_q8_k_gemv_dp4a_kernel(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        void * __restrict__ y,
+        int rows,
+        int cols) {
+    // One warp reads 16 distinct grid entries per unrolled block, so the
+    // constant cache serializes them. A shared copy is filled once per block
+    // (before the early return, so every thread reaches the barrier).
+    __shared__ uint64_t grid_table[1024];
+    if constexpr (USE_SMEM) {
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x) {
+            grid_table[i] = k_iq2s_grid[i];
+        }
+        __syncthreads();
+    }
+
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+
+    const float value = iq2_s_q8_k_row_dp4a<USE_SMEM>(w, x_qs, x_d, row, cols, grid_table);
+    if ((threadIdx.x & 31) != 0) return;
+    // ggml applies 0.125 for IQ2_S only (IQ3_S has no closing factor).
+    const float scaled = 0.125f * value;
+    if constexpr (OUT_F32) {
+        static_cast<float *>(y)[row] = scaled;
+    } else {
+        static_cast<__half *>(y)[row] = __float2half(scaled);
+    }
+}
+
+// Expert-batched twin of the kernel above: one launch covers every matrix in
+// w_experts, grid.y selects the expert, and expert e writes
+// y[e * rows .. e * rows + rows). Every row still goes through
+// iq2_s_q8_k_row_dp4a(), so the output matches the per-expert launches bit for
+// bit.
+template <bool USE_SMEM>
+__global__ void iq2_s_q8_k_gemv_experts_dp4a_kernel(
+        const uint8_t * const * __restrict__ w_experts,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    __shared__ uint64_t grid_table[1024];
+    if constexpr (USE_SMEM) {
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x) {
+            grid_table[i] = k_iq2s_grid[i];
+        }
+        __syncthreads();
+    }
+
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+
+    const float value = iq2_s_q8_k_row_dp4a<USE_SMEM>(
+        w_experts[blockIdx.y], x_qs, x_d, row, cols, grid_table);
+    if ((threadIdx.x & 31) != 0) return;
+    y[static_cast<size_t>(blockIdx.y) * static_cast<size_t>(rows) + row] = 0.125f * value;
+}
+
+// Chooses between the __dp4a and the reference warp kernel. Both decode one row
+// per warp, so the launch geometry is shared.
+template <bool OUT_F32>
+inline void launch_iq2_s_gemv_q8_k_dispatch(
+        const LowBitMatrix & weights,
+        const int8_t * activation,
+        const float * activation_scales,
+        void * output,
+        cudaStream_t stream,
+        int threads) {
+    const int warps = threads / 32;
+    const int blocks = (weights.rows + warps - 1) / warps;
+    if (lowbit_dp4a_available()) {
+        if (lowbit_dp4a_smem_enabled()) {
+            iq2_s_q8_k_gemv_dp4a_kernel<OUT_F32, true><<<blocks, threads, 0, stream>>>(
+                weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+        } else {
+            iq2_s_q8_k_gemv_dp4a_kernel<OUT_F32, false><<<blocks, threads, 0, stream>>>(
+                weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+        }
+        return;
+    }
+    iq2_s_q8_k_gemv_kernel<OUT_F32><<<blocks, threads, 0, stream>>>(
+        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+}
+
 inline void launch_iq2_s_gemv_q8_k_f32(
         const LowBitMatrix & weights,
         const int8_t * activation,
@@ -884,10 +1192,8 @@ inline void launch_iq2_s_gemv_q8_k_f32(
     if (threads < 32 || threads % 32 != 0) {
         throw std::runtime_error("IQ2_S x Q8_K GEMV threads must be a multiple of 32");
     }
-    const int warps = threads / 32;
-    const int blocks = (weights.rows + warps - 1) / warps;
-    iq2_s_q8_k_gemv_kernel<true><<<blocks, threads, 0, stream>>>(
-        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+    launch_iq2_s_gemv_q8_k_dispatch<true>(
+        weights, activation, activation_scales, output, stream, threads);
 }
 
 inline void launch_iq2_s_gemv_q8_k_half(
@@ -904,10 +1210,8 @@ inline void launch_iq2_s_gemv_q8_k_half(
     if (threads < 32 || threads % 32 != 0) {
         throw std::runtime_error("IQ2_S x Q8_K GEMV threads must be a multiple of 32");
     }
-    const int warps = threads / 32;
-    const int blocks = (weights.rows + warps - 1) / warps;
-    iq2_s_q8_k_gemv_kernel<false><<<blocks, threads, 0, stream>>>(
-        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+    launch_iq2_s_gemv_q8_k_dispatch<false>(
+        weights, activation, activation_scales, output, stream, threads);
 }
 
 // ggml ggml_vec_dot_iq3_s_q8_K in warp form, consuming the same ggml-exact Q8_K
@@ -1017,6 +1321,165 @@ __global__ void iq3_s_q8_k_gemv_kernel(
     }
 }
 
+// IQ3_S x Q8_K with one __dp4a per four values, one row per warp.
+//
+// The two 4-value halves of an 8-value grid group come from two different 9-bit
+// grid indices, so a chunk is exactly one 32-bit grid entry: the index is
+// qs32[2*group + half] plus the ninth bit taken from qh, and the whole word holds
+// the chunk's four magnitudes. The sign byte carries one bit per grid position,
+// and the group scale (1 + 2*scale4) is packed as two nibbles for the even and
+// odd 32-value blocks, so "ls" depends only on ib32 - and therefore only on the
+// phase below. The lane mapping, the phase reduction and the closing tree are the
+// same as iq2_s_q8_k_gemv_dp4a_kernel; ggml applies no closing factor here.
+// Per-row decode shared by the single-expert kernel below and its
+// expert-batched twin (see iq2_s_q8_k_row_dp4a for the contract): the rows are
+// produced by identical arithmetic, and only lane 0 receives the result.
+template <bool USE_SMEM>
+__device__ __forceinline__ float iq3_s_q8_k_row_dp4a(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        int row,
+        int cols,
+        const uint32_t * grid_table) {
+    const int lane = threadIdx.x & 31;
+
+    const int chunk = lane & 7;        // 4-value chunk of a 32-value block
+    const int phase = lane >> 3;       // which pair of 32-value blocks
+    const int group = chunk >> 1;      // 8-value IQ3_S grid group
+    const int grid_half = chunk & 1;   // low or high half of the group
+
+    const int superblocks_per_row = cols >> 8; // 256 values per IQ3_S block
+    const size_t row_stride = static_cast<size_t>(superblocks_per_row) * 110u;
+    const uint8_t * row_ptr = w + static_cast<size_t>(row) * row_stride;
+
+    float accumulator = 0.0f;
+    for (int sb = 0; sb < superblocks_per_row; ++sb) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(sb) * 110u;
+        const float d_w = lowbit_half(blk);
+        const uint8_t * qs = blk + 2;
+        const uint8_t * qh = qs + 64;
+        const uint8_t * signs = qh + 8;
+        const uint8_t * scales = signs + 32;
+        const int8_t * a = x_qs + (sb << 8);
+
+        int partial = 0;
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int ib32 = phase + 4 * p;
+            const uint8_t * qs32 = qs + ib32 * 8;
+            const uint8_t qh32 = qh[ib32];
+            const uint8_t scale_byte = scales[ib32 >> 1];
+            const int ls = (ib32 & 1)
+                ? 1 + 2 * static_cast<int>(scale_byte >> 4)
+                : 1 + 2 * static_cast<int>(scale_byte & 0x0f);
+
+            const uint16_t grid_index = static_cast<uint16_t>(
+                static_cast<uint16_t>(qs32[2 * group + grid_half]) |
+                static_cast<uint16_t>(
+                    (static_cast<uint16_t>(qh32)
+                     << (8 - 2 * group - grid_half)) & 0x100u));
+            const unsigned quad = USE_SMEM ? grid_table[grid_index] : k_iq3s_grid[grid_index];
+            const unsigned sign_bits = static_cast<unsigned>(
+                signs[ib32 * 4 + group] >> (4 * grid_half));
+            const unsigned weights4 = lowbit_sign_i8x4(quad, sign_bits);
+            const unsigned activation4 = *reinterpret_cast<const unsigned *>(
+                a + static_cast<size_t>(ib32) * 32u + static_cast<size_t>(chunk) * 4u);
+            partial += lowbit_dp4a(
+                static_cast<int>(activation4), static_cast<int>(weights4), 0) * ls;
+        }
+
+        partial += __shfl_down_sync(0xffffffffu, partial, 8);
+        partial += __shfl_down_sync(0xffffffffu, partial, 16);
+        if (lane < 8) {
+            accumulator = fmaf(d_w * x_d[sb], static_cast<float>(partial), accumulator);
+        }
+    }
+
+    const float r = __fadd_rn(accumulator, __shfl_down_sync(0xffffffffu, accumulator, 4));
+    const float s = __fadd_rn(r, __shfl_down_sync(0xffffffffu, r, 2));
+    return __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, 1));
+}
+
+template <bool OUT_F32, bool USE_SMEM>
+__global__ void iq3_s_q8_k_gemv_dp4a_kernel(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        void * __restrict__ y,
+        int rows,
+        int cols) {
+    __shared__ uint32_t grid_table[512];
+    if constexpr (USE_SMEM) {
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+            grid_table[i] = k_iq3s_grid[i];
+        }
+        __syncthreads();
+    }
+
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+
+    const float value = iq3_s_q8_k_row_dp4a<USE_SMEM>(w, x_qs, x_d, row, cols, grid_table);
+    if ((threadIdx.x & 31) != 0) return;
+    if constexpr (OUT_F32) {
+        static_cast<float *>(y)[row] = value;
+    } else {
+        static_cast<__half *>(y)[row] = __float2half(value);
+    }
+}
+
+// Expert-batched twin of the kernel above (see
+// iq2_s_q8_k_gemv_experts_dp4a_kernel for the grid contract).
+template <bool USE_SMEM>
+__global__ void iq3_s_q8_k_gemv_experts_dp4a_kernel(
+        const uint8_t * const * __restrict__ w_experts,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    __shared__ uint32_t grid_table[512];
+    if constexpr (USE_SMEM) {
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+            grid_table[i] = k_iq3s_grid[i];
+        }
+        __syncthreads();
+    }
+
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+
+    const float value = iq3_s_q8_k_row_dp4a<USE_SMEM>(
+        w_experts[blockIdx.y], x_qs, x_d, row, cols, grid_table);
+    if ((threadIdx.x & 31) != 0) return;
+    y[static_cast<size_t>(blockIdx.y) * static_cast<size_t>(rows) + row] = value;
+}
+
+template <bool OUT_F32>
+inline void launch_iq3_s_gemv_q8_k_dispatch(
+        const LowBitMatrix & weights,
+        const int8_t * activation,
+        const float * activation_scales,
+        void * output,
+        cudaStream_t stream,
+        int threads) {
+    const int warps = threads / 32;
+    const int blocks = (weights.rows + warps - 1) / warps;
+    if (lowbit_dp4a_available()) {
+        if (lowbit_dp4a_smem_enabled()) {
+            iq3_s_q8_k_gemv_dp4a_kernel<OUT_F32, true><<<blocks, threads, 0, stream>>>(
+                weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+        } else {
+            iq3_s_q8_k_gemv_dp4a_kernel<OUT_F32, false><<<blocks, threads, 0, stream>>>(
+                weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+        }
+        return;
+    }
+    iq3_s_q8_k_gemv_kernel<OUT_F32><<<blocks, threads, 0, stream>>>(
+        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+}
+
 inline void launch_iq3_s_gemv_q8_k_f32(
         const LowBitMatrix & weights,
         const int8_t * activation,
@@ -1031,10 +1494,8 @@ inline void launch_iq3_s_gemv_q8_k_f32(
     if (threads < 32 || threads % 32 != 0) {
         throw std::runtime_error("IQ3_S x Q8_K GEMV threads must be a multiple of 32");
     }
-    const int warps = threads / 32;
-    const int blocks = (weights.rows + warps - 1) / warps;
-    iq3_s_q8_k_gemv_kernel<true><<<blocks, threads, 0, stream>>>(
-        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+    launch_iq3_s_gemv_q8_k_dispatch<true>(
+        weights, activation, activation_scales, output, stream, threads);
 }
 
 inline void launch_iq3_s_gemv_q8_k_half(
@@ -1051,10 +1512,8 @@ inline void launch_iq3_s_gemv_q8_k_half(
     if (threads < 32 || threads % 32 != 0) {
         throw std::runtime_error("IQ3_S x Q8_K GEMV threads must be a multiple of 32");
     }
-    const int warps = threads / 32;
-    const int blocks = (weights.rows + warps - 1) / warps;
-    iq3_s_q8_k_gemv_kernel<false><<<blocks, threads, 0, stream>>>(
-        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+    launch_iq3_s_gemv_q8_k_dispatch<false>(
+        weights, activation, activation_scales, output, stream, threads);
 }
 
 // ggml kvalues_iq4nl as integers: ggml keeps the table as int8_t and negates the
@@ -1154,6 +1613,172 @@ __global__ void iq4_nl_q8_0_act_gemv_kernel(
     }
 }
 
+// Expands four packed IQ4_NL nibbles into the four signed bytes __dp4a consumes.
+// The codebook is the same one iq4_nl_value()/iq4_nl_lut_value() use; nibble j
+// becomes byte j, and the two's complement byte is what dp4a reads as int8.
+__device__ __forceinline__ unsigned lowbit_iq4_nl_pack4(unsigned nibbles) {
+    return static_cast<unsigned>(static_cast<uint8_t>(
+               iq4_nl_lut_value(static_cast<uint8_t>(nibbles)))) |
+           (static_cast<unsigned>(static_cast<uint8_t>(
+                iq4_nl_lut_value(static_cast<uint8_t>(nibbles >> 8)))) << 8) |
+           (static_cast<unsigned>(static_cast<uint8_t>(
+                iq4_nl_lut_value(static_cast<uint8_t>(nibbles >> 16)))) << 16) |
+           (static_cast<unsigned>(static_cast<uint8_t>(
+                iq4_nl_lut_value(static_cast<uint8_t>(nibbles >> 24)))) << 24);
+}
+
+// IQ4_NL x Q8_0 with one __dp4a per four values, two rows per warp.
+//
+// A 32-value block is 16 bytes of packed nibbles: values 0-15 take the low
+// nibble of byte i and values 16-31 its high nibble, so a 4-value chunk covers
+// four consecutive bytes of one nibble plane. Those four bytes are fetched with
+// two 16-bit loads (the 18-byte block stride keeps every row start even).
+//
+// Unlike IQ2_S/IQ3_S the scale is applied per block, so the blocks of a chunk
+// cannot be summed as integers before scaling: the float FMA chain has to stay in
+// block order. ggml already keeps two chains per chunk - even and odd blocks -
+// and adds them before hsum_float_8, so the warp splits those two chains over
+// lanes instead: 16 lanes per row are 8 chunks times the even/odd block parity.
+// Each lane then walks stride-2 blocks, and the two chains meet again with one
+// shuffle. That halves the warps per row (the down projection is 2560 rows, so
+// 1280 warps still fill an A100) instead of quartering them.
+// Per-row decode shared by the single-expert kernel below and its
+// expert-batched twin. "row" is already clamped into [0, rows); the result is
+// meaningful on the lanes with (lane & 15) == 0 that own the row.
+__device__ __forceinline__ float iq4_nl_q8_0_act_row_dp4a(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const __half * __restrict__ x_scales,
+        int row,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int lane_in_row = lane & 15;
+    const int chunk = lane_in_row & 7;    // 4-value chunk of a 32-value block
+    const int parity = lane_in_row >> 3;  // 0 = even blocks, 1 = odd blocks
+
+    const int blocks_per_row = cols >> 5;
+    const size_t row_stride = static_cast<size_t>(blocks_per_row) * 18u;
+    const uint8_t * row_ptr = w + static_cast<size_t>(row) * row_stride;
+    const int byte_base = (chunk & 3) * 4;
+    const bool high_nibble = chunk >= 4;
+
+    float accumulator = 0.0f;
+    for (int b = parity; b < blocks_per_row; b += 2) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(b) * 18u;
+        const float d = lowbit_half(blk) * __half2float(x_scales[b]);
+        const uint8_t * qs = blk + 2 + byte_base;
+        const unsigned packed =
+            static_cast<unsigned>(*reinterpret_cast<const uint16_t *>(qs)) |
+            (static_cast<unsigned>(*reinterpret_cast<const uint16_t *>(qs + 2)) << 16);
+        const unsigned nibbles = high_nibble
+            ? ((packed >> 4) & 0x0f0f0f0fu)
+            : (packed & 0x0f0f0f0fu);
+        const unsigned weights4 = lowbit_iq4_nl_pack4(nibbles);
+        const unsigned activation4 = *reinterpret_cast<const unsigned *>(
+            x_qs + static_cast<size_t>(b) * 32u + static_cast<size_t>(chunk) * 4u);
+        accumulator = fmaf(
+            d, static_cast<float>(lowbit_dp4a(
+                   static_cast<int>(activation4), static_cast<int>(weights4), 0)),
+            accumulator);
+    }
+
+    // Reunite the even and odd chains, exactly as ggml's
+    // "acc_even + acc_odd" before hsum_float_8, then run the closing tree on the
+    // eight chunk values in lanes row_in_warp*8 + 0..7.
+    const float combined =
+        __fadd_rn(accumulator, __shfl_xor_sync(0xffffffffu, accumulator, 8));
+    const float r = __fadd_rn(combined, __shfl_down_sync(0xffffffffu, combined, 4));
+    const float s = __fadd_rn(r, __shfl_down_sync(0xffffffffu, r, 2));
+    return __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, 1));
+}
+
+template <bool OUT_F32>
+__global__ void iq4_nl_q8_0_act_gemv_dp4a_kernel(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const __half * __restrict__ x_scales,
+        void * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int row_in_warp = lane >> 4;    // one of the two rows this warp decodes
+
+    const int output_row =
+        (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 2 + row_in_warp;
+    // Rows beyond "rows" are clamped so they stay in bounds; they are not stored.
+    const int row = min(output_row, rows - 1);
+
+    const float value = iq4_nl_q8_0_act_row_dp4a(w, x_qs, x_scales, row, cols);
+    if ((lane & 15) != 0 || output_row >= rows) return;
+    if constexpr (OUT_F32) {
+        static_cast<float *>(y)[output_row] = value;
+    } else {
+        static_cast<__half *>(y)[output_row] = __float2half(value);
+    }
+}
+
+// Expert-batched twin: grid.y selects the expert (via w_experts), expert e
+// writes y[e * rows .. e * rows + rows), and the rows go through the same
+// routine as the single-expert kernel. The nibble reads stay 16-bit aligned
+// because the caller passes the expert pointer array; the odd-base guard of the
+// dispatcher still applies to every entry (the staging pool is 2-byte aligned).
+//
+// Unlike the gate/up kernels, the down projection does NOT share one activation
+// across experts: every expert consumes its own SiLU(gate) * up product, so
+// blockIdx.y also selects a slice of the activation. x_qs is x_qs[e * cols] and
+// x_scales is x_scales[e * (cols / 32)], which is exactly the [k][...] layout
+// the batched Q8_0 quantisation kernel writes.
+__global__ void iq4_nl_q8_0_act_gemv_experts_dp4a_kernel(
+        const uint8_t * const * __restrict__ w_experts,
+        const int8_t * __restrict__ x_qs,
+        const __half * __restrict__ x_scales,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int row_in_warp = lane >> 4;
+
+    const int output_row =
+        (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 2 + row_in_warp;
+    const int row = min(output_row, rows - 1);
+
+    const int8_t * expert_x_qs =
+        x_qs + static_cast<size_t>(blockIdx.y) * static_cast<size_t>(cols);
+    const __half * expert_x_scales =
+        x_scales + static_cast<size_t>(blockIdx.y) * static_cast<size_t>(cols / 32);
+
+    const float value = iq4_nl_q8_0_act_row_dp4a(
+        w_experts[blockIdx.y], expert_x_qs, expert_x_scales, row, cols);
+    if ((lane & 15) != 0 || output_row >= rows) return;
+    y[static_cast<size_t>(blockIdx.y) * static_cast<size_t>(rows) + output_row] = value;
+}
+
+// The 16-bit nibble reads need a 2-byte aligned base. Every IQ4_NL block is 18
+// bytes and every expert cache slot stride is a multiple of that, so the base is
+// the only thing to check; anything odd keeps the reference kernel.
+template <bool OUT_F32>
+inline void launch_iq4_nl_gemv_q8_0_dispatch(
+        const LowBitMatrix & weights,
+        const int8_t * activation,
+        const __half * activation_scales,
+        void * output,
+        cudaStream_t stream,
+        int threads) {
+    const int warps = threads / 32;
+    if (lowbit_dp4a_available() &&
+        (reinterpret_cast<uintptr_t>(weights.data) & 1u) == 0) {
+        constexpr int rows_per_warp = 2;
+        const int blocks =
+            (weights.rows + warps * rows_per_warp - 1) / (warps * rows_per_warp);
+        iq4_nl_q8_0_act_gemv_dp4a_kernel<OUT_F32><<<blocks, threads, 0, stream>>>(
+            weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+        return;
+    }
+    const int blocks = (weights.rows + warps - 1) / warps;
+    iq4_nl_q8_0_act_gemv_kernel<OUT_F32><<<blocks, threads, 0, stream>>>(
+        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+}
+
 inline void launch_iq4_nl_gemv_q8_0_f32(
         const LowBitMatrix & weights,
         const int8_t * activation,
@@ -1168,10 +1793,113 @@ inline void launch_iq4_nl_gemv_q8_0_f32(
     if (threads < 32 || threads % 32 != 0) {
         throw std::runtime_error("IQ4_NL x Q8_0 GEMV threads must be a multiple of 32");
     }
+    launch_iq4_nl_gemv_q8_0_dispatch<true>(
+        weights, activation, activation_scales, output, stream, threads);
+}
+
+// ---------------------------------------------------------------------------
+// Task G: expert-batched launchers.
+//
+// Each one replaces "experts" single-expert launches with a single launch whose
+// grid.y selects the expert (see the *_experts_dp4a_kernel definitions above).
+// w_experts is a device array of "experts" weight pointers; the kernel reads its
+// block's entry only, and expert e writes output[e * rows .. e * rows + rows).
+// The launchers return false when the DP4A kernels are unavailable so the
+// caller can keep its per-expert loop. The rows themselves are produced by the
+// same per-row routines as the single-expert kernels, so the results are
+// bit-identical.
+// ---------------------------------------------------------------------------
+inline bool launch_iq2_s_gemv_q8_k_experts_f32(
+        const uint8_t * const * w_experts,
+        int experts,
+        int rows,
+        int cols,
+        const int8_t * activation,
+        const float * activation_scales,
+        float * output,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (!lowbit_dp4a_available()) return false;
+    if (experts <= 0 || experts > 65535 || rows <= 0 ||
+        cols <= 0 || cols % 256 != 0) {
+        throw std::runtime_error("IQ2_S x Q8_K expert-batched GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("IQ2_S x Q8_K expert-batched GEMV threads must be a multiple of 32");
+    }
     const int warps = threads / 32;
-    const int blocks = (weights.rows + warps - 1) / warps;
-    iq4_nl_q8_0_act_gemv_kernel<true><<<blocks, threads, 0, stream>>>(
-        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+    const dim3 grid((rows + warps - 1) / warps, experts);
+    if (lowbit_dp4a_smem_enabled()) {
+        iq2_s_q8_k_gemv_experts_dp4a_kernel<true><<<grid, threads, 0, stream>>>(
+            w_experts, activation, activation_scales, output, rows, cols);
+    } else {
+        iq2_s_q8_k_gemv_experts_dp4a_kernel<false><<<grid, threads, 0, stream>>>(
+            w_experts, activation, activation_scales, output, rows, cols);
+    }
+    return true;
+}
+
+inline bool launch_iq3_s_gemv_q8_k_experts_f32(
+        const uint8_t * const * w_experts,
+        int experts,
+        int rows,
+        int cols,
+        const int8_t * activation,
+        const float * activation_scales,
+        float * output,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (!lowbit_dp4a_available()) return false;
+    if (experts <= 0 || experts > 65535 || rows <= 0 ||
+        cols <= 0 || cols % 256 != 0) {
+        throw std::runtime_error("IQ3_S x Q8_K expert-batched GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("IQ3_S x Q8_K expert-batched GEMV threads must be a multiple of 32");
+    }
+    const int warps = threads / 32;
+    const dim3 grid((rows + warps - 1) / warps, experts);
+    if (lowbit_dp4a_smem_enabled()) {
+        iq3_s_q8_k_gemv_experts_dp4a_kernel<true><<<grid, threads, 0, stream>>>(
+            w_experts, activation, activation_scales, output, rows, cols);
+    } else {
+        iq3_s_q8_k_gemv_experts_dp4a_kernel<false><<<grid, threads, 0, stream>>>(
+            w_experts, activation, activation_scales, output, rows, cols);
+    }
+    return true;
+}
+
+// Every expert base must be 2-byte aligned (the kernel reads the packed nibbles
+// with 16-bit loads); the caller checks that on the host pointers it fills
+// w_experts with, because the DP4A path has no reference fallback here.
+//
+// activation/activation_scales are the batched buffers this kernel slices per
+// expert (k * cols int8 values and k * (cols / 32) halves), NOT a single shared
+// activation: each expert's down projection consumes its own activation.
+inline bool launch_iq4_nl_gemv_q8_0_experts_f32(
+        const uint8_t * const * w_experts,
+        int experts,
+        int rows,
+        int cols,
+        const int8_t * activation,
+        const __half * activation_scales,
+        float * output,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (!lowbit_dp4a_available()) return false;
+    if (experts <= 0 || experts > 65535 || rows <= 0 ||
+        cols <= 0 || cols % 64 != 0) {
+        throw std::runtime_error("IQ4_NL x Q8_0 expert-batched GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("IQ4_NL x Q8_0 expert-batched GEMV threads must be a multiple of 32");
+    }
+    constexpr int rows_per_warp = 2;
+    const int warps = threads / 32;
+    const dim3 grid((rows + warps * rows_per_warp - 1) / (warps * rows_per_warp), experts);
+    iq4_nl_q8_0_act_gemv_experts_dp4a_kernel<<<grid, threads, 0, stream>>>(
+        w_experts, activation, activation_scales, output, rows, cols);
+    return true;
 }
 
 inline void launch_iq4_nl_gemv_q8_0_half(
@@ -1188,10 +1916,8 @@ inline void launch_iq4_nl_gemv_q8_0_half(
     if (threads < 32 || threads % 32 != 0) {
         throw std::runtime_error("IQ4_NL x Q8_0 GEMV threads must be a multiple of 32");
     }
-    const int warps = threads / 32;
-    const int blocks = (weights.rows + warps - 1) / warps;
-    iq4_nl_q8_0_act_gemv_kernel<false><<<blocks, threads, 0, stream>>>(
-        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+    launch_iq4_nl_gemv_q8_0_dispatch<false>(
+        weights, activation, activation_scales, output, stream, threads);
 }
 
 // ---------------------------------------------------------------------------

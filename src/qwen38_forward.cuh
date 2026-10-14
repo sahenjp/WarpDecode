@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
@@ -99,6 +100,22 @@ inline bool q38_hc_q8_0_compatible(const Qwen38HcWeights & w) {
     return !w.debug_norm_f32.empty() &&
            w.down.lowbit && w.down.type == GgmlType::Q8_0 &&
            w.up.lowbit && w.up.type == GgmlType::Q8_0;
+}
+
+// Task J (WARODECODE_HC_SKIP_LEGACY, default ON).
+//
+// Both HC mix sites used to run the legacy F16 mirror first and the exact Q8_0
+// replay afterwards. The F16 pass is pure duplicate work when the Q8_0 path is
+// active: it writes st.hc_*.{xn,gate,lo,inject,mixed}, and every one of those
+// buffers is either overwritten by the exact pass (the F32 -> half copies) or
+// read only by the legacy combines that the exact pass makes unreachable
+// (run_qwen38_hc_combine_f32_inject / run_qwen38_hc_combine_moe_f32_inject use
+// the F32 scratch copy). The attn site already skipped it through
+// attn_f32_mix_active; this is the same guard for the ffn site.
+// =0 restores the previous behaviour for A/B runs.
+inline bool q38_hc_skip_legacy_enabled() {
+    static const bool enabled = q38_env_flag("WARODECODE_HC_SKIP_LEGACY", true);
+    return enabled;
 }
 
 __global__ void q38_repeat_embedding_kernel(
@@ -344,6 +361,221 @@ __global__ void q38_argmax_kernel(
     }
 }
 
+// Phase split of one Qwen38Decoder::run() call. The numbers come from CUDA
+// events recorded on the decode stream, so model load, autotune and host setup
+// stay outside them. prefill_tokens == 0 means "pure decode": decode_seconds
+// then covers every forward of the call.
+struct Qwen38RunTiming {
+    double prefill_seconds = 0.0;
+    int prefill_tokens = 0;
+    double decode_seconds = 0.0;
+    int decode_tokens = 0;
+};
+
+// Task F: per-stage CUDA-event profiler for one decode token.
+//
+// The stage ids, the accumulators and the JSON writer live in
+// qwen38_trace.hpp (which stays host-only so the plain g++ trace test keeps
+// compiling). This class is the CUDA side: it owns the cudaEvent_t pool and
+// records the pairs on the decode stream.
+//
+// Disabled by default: with WARODECODE_PROFILE unset (or "0") no event is ever
+// created, the pools stay empty and every hook is a single predictable branch
+// on enabled(), so the default decode path is unchanged.
+class Qwen38StageProfiler {
+public:
+    // Upper bound of one stage's repeats inside a single token. The longest
+    // stages repeat once per trunk layer, so this only has to beat the layer
+    // count of the model with room to spare.
+    static constexpr int kStageCap = 96;
+    static constexpr int kLayerCap = 128;
+
+    Qwen38StageProfiler() {
+        const char * v = std::getenv("WARODECODE_PROFILE");
+        enabled_ = v != nullptr && v[0] != '\0' && v[0] != '0';
+        if (!enabled_) return;
+        const size_t slots = static_cast<size_t>(kQwen38StageCount) * static_cast<size_t>(kStageCap);
+        start_.assign(slots, nullptr);
+        stop_.assign(slots, nullptr);
+        layer_start_.assign(kLayerCap, nullptr);
+        layer_stop_.assign(kLayerCap, nullptr);
+        for (size_t i = 0; i < slots; ++i) {
+            if (cudaEventCreate(&start_[i]) != cudaSuccess || cudaEventCreate(&stop_[i]) != cudaSuccess) {
+                enabled_ = false;
+                return;
+            }
+        }
+        for (int i = 0; i < kLayerCap; ++i) {
+            if (cudaEventCreate(&layer_start_[static_cast<size_t>(i)]) != cudaSuccess ||
+                cudaEventCreate(&layer_stop_[static_cast<size_t>(i)]) != cudaSuccess) {
+                enabled_ = false;
+                return;
+            }
+        }
+        totals_.layer_device_ms.assign(kLayerCap, 0.0);
+        totals_.layer_host_ms.assign(kLayerCap, 0.0);
+    }
+
+    Qwen38StageProfiler(const Qwen38StageProfiler &) = delete;
+    Qwen38StageProfiler & operator=(const Qwen38StageProfiler &) = delete;
+
+    ~Qwen38StageProfiler() {
+        for (cudaEvent_t e : start_) if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : stop_) if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : layer_start_) if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : layer_stop_) if (e) cudaEventDestroy(e);
+    }
+
+    bool enabled() const { return enabled_; }
+    const Qwen38ProfileTotals & totals() const { return totals_; }
+    std::string to_json() const { return qwen38_profile_json(totals_); }
+
+    static double host_now() {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void mark_begin(int stage, cudaStream_t stream) {
+        if (!enabled_) return;
+        host_begin_[static_cast<size_t>(stage)] = host_now();
+        if (pending_[stage]) {
+            // A previous begin never saw its end (aborted run). Drop it instead of
+            // pairing it with the wrong stop event.
+            ++unmatched_[stage];
+            pending_[stage] = false;
+        }
+        const int slot = written_[stage];
+        if (slot >= kStageCap) {
+            ++overflow_[stage];
+            return;
+        }
+        if (cudaEventRecord(start_[index(stage, slot)], stream) != cudaSuccess) {
+            ++overflow_[stage];
+            return;
+        }
+        pending_[stage] = true;
+    }
+
+    void mark_end(int stage, cudaStream_t stream) {
+        if (!enabled_) return;
+        totals_.stage[static_cast<size_t>(stage)].host_ms +=
+            host_now() - host_begin_[static_cast<size_t>(stage)];
+        if (!pending_[stage]) {
+            ++unmatched_[stage];
+            return;
+        }
+        pending_[stage] = false;
+        const int slot = written_[stage];
+        if (cudaEventRecord(stop_[index(stage, slot)], stream) != cudaSuccess) {
+            ++unmatched_[stage];
+            return;
+        }
+        ++written_[stage];
+    }
+
+    void layer_begin(int layer, cudaStream_t stream) {
+        if (!enabled_ || layer < 0 || layer >= kLayerCap) return;
+        layer_host_begin_[static_cast<size_t>(layer)] = host_now();
+        cudaEventRecord(layer_start_[static_cast<size_t>(layer)], stream);
+    }
+
+    void layer_end(int layer, cudaStream_t stream) {
+        if (!enabled_ || layer < 0 || layer >= kLayerCap) return;
+        totals_.layer_host_ms[static_cast<size_t>(layer)] +=
+            host_now() - layer_host_begin_[static_cast<size_t>(layer)];
+        cudaEventRecord(layer_stop_[static_cast<size_t>(layer)], stream);
+        if (layer + 1 > layer_count_) layer_count_ = layer + 1;
+    }
+
+    // Marks the profiled token as decode (true) or prefill (false). run() owns
+    // the phase, step() only reports its own wall time.
+    void set_decode_phase(bool decode) { decode_phase_ = decode; }
+
+    void note_token_host(double host_ms) {
+        if (!enabled_) return;
+        totals_.token_host_ms += host_ms;
+        ++totals_.tokens;
+        if (decode_phase_) ++totals_.phases;
+    }
+
+    // Reads the recorded event pairs back. Call only once the decode stream has
+    // been synchronised (step() already ends with a cudaStreamSynchronize): every
+    // recorded event is complete at that point, so cudaEventElapsedTime cannot
+    // return cudaErrorNotReady.
+    void flush_token() {
+        if (!enabled_) return;
+        const double flush_start = host_now();
+        for (int s = 0; s < kQwen38StageCount; ++s) {
+            Qwen38StageSample & sample = totals_.stage[static_cast<size_t>(s)];
+            for (int i = 0; i < written_[s]; ++i) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, start_[index(s, i)], stop_[index(s, i)]) == cudaSuccess) {
+                    sample.device_ms += static_cast<double>(ms);
+                    ++sample.calls;
+                }
+            }
+            sample.unmatched += unmatched_[s];
+            sample.overflow += overflow_[s];
+            written_[s] = 0;
+            pending_[s] = false;
+            unmatched_[s] = 0;
+            overflow_[s] = 0;
+        }
+        for (int i = 0; i < layer_count_; ++i) {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(
+                    &ms, layer_start_[static_cast<size_t>(i)], layer_stop_[static_cast<size_t>(i)]) == cudaSuccess) {
+                totals_.layer_device_ms[static_cast<size_t>(i)] += static_cast<double>(ms);
+                ++totals_.layer_calls;
+            }
+        }
+        layer_count_ = 0;
+        totals_.flush_host_ms += host_now() - flush_start;
+    }
+
+private:
+    static size_t index(int stage, int slot) {
+        return static_cast<size_t>(stage) * static_cast<size_t>(kStageCap) + static_cast<size_t>(slot);
+    }
+
+    bool enabled_ = false;
+    bool decode_phase_ = true;
+    std::vector<cudaEvent_t> start_;
+    std::vector<cudaEvent_t> stop_;
+    std::vector<cudaEvent_t> layer_start_;
+    std::vector<cudaEvent_t> layer_stop_;
+    int written_[kQwen38StageCount] = {};
+    int unmatched_[kQwen38StageCount] = {};
+    int overflow_[kQwen38StageCount] = {};
+    bool pending_[kQwen38StageCount] = {};
+    double host_begin_[kQwen38StageCount] = {};
+    double layer_host_begin_[kLayerCap] = {};
+    int layer_count_ = 0;
+    Qwen38ProfileTotals totals_;
+};
+
+// RAII form of one profiled region. Holds no CUDA handle itself, so it is safe
+// to declare inside the hot path; with the profiler off both calls inline to a
+// single branch. Regions that cannot be brace-delimited use mark_begin() /
+// mark_end() directly on the profiler.
+class Qwen38StageScope {
+public:
+    Qwen38StageScope(Qwen38StageProfiler * profiler, int stage, cudaStream_t stream)
+        : profiler_(profiler), stage_(stage), stream_(stream) {
+        if (profiler_ != nullptr) profiler_->mark_begin(stage_, stream_);
+    }
+    ~Qwen38StageScope() {
+        if (profiler_ != nullptr) profiler_->mark_end(stage_, stream_);
+    }
+    Qwen38StageScope(const Qwen38StageScope &) = delete;
+    Qwen38StageScope & operator=(const Qwen38StageScope &) = delete;
+
+private:
+    Qwen38StageProfiler * profiler_ = nullptr;
+    int stage_ = 0;
+    cudaStream_t stream_ = nullptr;
+};
+
 class Qwen38Decoder {
 public:
     Qwen38Decoder(Qwen38Runtime & rt, Qwen38DecodeState & state)
@@ -380,6 +612,27 @@ public:
         history_.clear();
     }
 
+    // MTP hook (src/qwen38_mtp.cuh): the speculative draft/verify loop drives
+    // step() itself and reads the decode state the decoder already owns. These
+    // accessors change no behaviour of step()/run().
+    Qwen38Runtime & runtime() { return rt_; }
+    Qwen38DecodeState & state() { return state_; }
+
+    // Task F: per-stage profile totals. All zeros unless WARODECODE_PROFILE is
+    // set, so the caller can always print the object.
+    const Qwen38ProfileTotals & profile_totals() const { return profile_.totals(); }
+    bool profile_enabled() const { return profile_.enabled(); }
+    // Always a complete JSON object so the caller can splice it unconditionally.
+    std::string profile_json() const {
+        return profile_.enabled() ? profile_.to_json() : std::string("{\"enabled\":0}");
+    }
+    // Host-side wall clock, interval counts and the per-layer arrays. Separate
+    // from profile_json() so "profile" holds per-token scalars only.
+    std::string profile_detail_json() const {
+        return profile_.enabled()
+            ? qwen38_profile_detail_json(profile_.totals()) : std::string("{}");
+    }
+
     int step(int token, int pos, Qwen38Trace * trace = nullptr,
              bool debug_f32_hc_attn_0_8 = false,
              bool debug_f32_hc_ffn_0_8 = false,
@@ -398,6 +651,11 @@ public:
         }
 
         cudaStream_t stream = state_.stream();
+        // Task F: one event pair spans the whole token body; the device->host token
+        // copy and the closing synchronise are measured as kQwen38StageSync.
+        const bool profile_on = profile_.enabled();
+        const double profile_token_start = profile_on ? Qwen38StageProfiler::host_now() : 0.0;
+        profile_.mark_begin(kQwen38StageToken, stream);
         Qwen38HcF32DebugScratch & hc_f32_scratch = hc_f32_scratch_;
         bool f32_layer0_router_preselected = false;
         if (trace && trace->state_trace) {
@@ -420,6 +678,7 @@ public:
             const char * v = std::getenv("WARODECODE_EMBED_F32");
             return v == nullptr || v[0] == '\0' || v[0] != '0';
         }();
+        profile_.mark_begin(kQwen38StageEmbed, stream);
         if (embed_f32 && state_.head_hidden_f32() != nullptr) {
             launch_q8_0_gather_row_f32(rt_.token_embd, token, state_.head_hidden_f32(), stream);
             q38_repeat_embedding_from_f32_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
@@ -431,6 +690,7 @@ public:
             q38_repeat_embedding_f32_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
                 state_.head_hidden(), state_.residual(), q.hidden, q.hc_count);
         }
+        profile_.mark_end(kQwen38StageEmbed, stream);
         if (legacy_trace) {
             if (trace->state_trace) trace_context_ = "position " + std::to_string(pos) + " F32 layer-0 parity";
             trace->hc_init = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
@@ -485,6 +745,7 @@ public:
         for (int il = 0; il < q.trunk_layers; ++il) {
             Qwen38RuntimeLayer & layer = rt_.layers[static_cast<size_t>(il)];
             Qwen38LayerState & st = state_.layer(il);
+            profile_.layer_begin(il, stream);
             if (trace && trace->state_trace) {
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " input residual";
             }
@@ -518,6 +779,9 @@ public:
             }
 
             if (q.is_ple(il)) {
+                // Covers the synchronous host-side row read (pread) and the H2D of
+                // the PLE rows: the device number shows the GPU waiting for it.
+                Qwen38StageScope ple_scope(&profile_, kQwen38StagePle, stream);
                 if (!rt_.ple_table || !layer.ple_w || !st.ple_state || !st.ple_scratch) {
                     throw std::runtime_error("Qwen3.8 PLE runtime state is incomplete");
                 }
@@ -616,12 +880,23 @@ public:
                     trace->debug_hc_norm_f32);
                 ++trace->debug_hc_norm_override_count;
             }
+            profile_.mark_begin(kQwen38StageHcMixAttn, stream);
+            Q38HcKernelScope hc_attn_region_scope(
+                kQ38HcSiteAttnF16Norm, kQ38HcMixRegion, stream);
+            // attn_f32_mix_active has to be known *before* the first mix call: when it
+            // is set, run_qwen38_hc_mix_f32_with_inject() below recomputes the very
+            // same row into the same scratch, so running the plain F32 mix first only
+            // buys duplicated work. Task F measured both HC mix sites at ~40 ms/token
+            // on A100 (272 ms total), i.e. ~15% of the token was being spent twice.
+            const bool attn_f32_mix_active = q38_hc_q8_0_enabled() && q38_hc_q8_0_attn_enabled() &&
+                q38_hc_q8_0_compatible(layer.hc_attn) &&
+                !(trace && trace->state_trace && trace->debug_hc_full_q8_0_layer == il);
             __half * cur = nullptr;
             bool attn_f32_inject = false;
-            if (q38_hc_f32_enabled()) {
+            if (!attn_f32_mix_active && q38_hc_f32_enabled()) {
                 cur = run_qwen38_hc_mix_f32(
                     state_.residual(), layer.hc_attn, hc_f32_scratch, st.hc_attn,
-                    q.rms_eps, stream);
+                    q.rms_eps, stream, kQ38HcSiteAttnF16Norm);
             }
             if (cur == nullptr) {
                 // The legacy F16 path still runs first: it fills the F16 inject
@@ -631,11 +906,8 @@ public:
                     trace_hc_attn_projection ? hc_f32_scratch.low_raw() : nullptr,
                     trace_hc_attn_projection ? hc_f32_scratch.low() : nullptr,
                     trace_hc_attn_projection ? hc_f32_scratch.gate() : nullptr,
-                    hc_norm_override_f32);
+                    hc_norm_override_f32, kQ38HcSiteAttnF16Norm);
             }
-            const bool attn_f32_mix_active = q38_hc_q8_0_enabled() && q38_hc_q8_0_attn_enabled() &&
-                q38_hc_q8_0_compatible(layer.hc_attn) &&
-                !(trace && trace->state_trace && trace->debug_hc_full_q8_0_layer == il);
             // The unrounded HC mix row is valid whenever one of the exact Q8_0 mix
             // entry points ran (with or without the F32 inject); the debug replay
             // branches recompute the mix through half kernels and invalidate it.
@@ -643,7 +915,8 @@ public:
                 !debug_hc_gate_q8_0 && !debug_layer0_hc_gate_replay;
             if (attn_f32_mix_active) {
                 __half * inject_cur = run_qwen38_hc_mix_f32_with_inject(
-                    state_.residual(), layer.hc_attn, hc_f32_scratch, st.hc_attn, q.rms_eps, stream);
+                    state_.residual(), layer.hc_attn, hc_f32_scratch, st.hc_attn, q.rms_eps, stream,
+                    kQ38HcSiteAttnF16Norm);
                 if (inject_cur != nullptr) {
                     // F32-inject variant: the unrounded inject stays in the F32
                     // scratch and run_qwen38_hc_combine_f32_inject consumes it.
@@ -651,7 +924,8 @@ public:
                     attn_f32_inject = true;
                 } else {
                     run_qwen38_hc_q8_0_f32_mix_from_residual(
-                        state_.residual(), layer.hc_attn, hc_f32_scratch, q.rms_eps, stream);
+                        state_.residual(), layer.hc_attn, hc_f32_scratch, q.rms_eps, stream,
+                        kQ38HcSiteAttnF16Norm);
                     q38_float_to_half_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
                         hc_f32_scratch.mixed(), st.hc_attn.mixed(), q.hidden);
                     cur = st.hc_attn.mixed();
@@ -986,6 +1260,9 @@ public:
                     copy_float(stream, hc_f32_scratch.low(),
                         static_cast<size_t>(st.hc_attn.low_rank())));
             }
+            profile_.mark_end(kQwen38StageHcMixAttn, stream);
+
+            profile_.mark_begin(kQwen38StageAttn, stream);
             __half * attn_out = nullptr;
             float * attn_out_f32 = nullptr;
             if (layer.qsa) {
@@ -1743,6 +2020,8 @@ public:
                     trace->gdn_norm_out = copy_half(stream, st.gdn_scratch->norm_out(), static_cast<size_t>(value_dim));
                 }
             }
+            profile_.mark_end(kQwen38StageAttn, stream);
+
             if (trace && trace->state_trace && pos == trace->state_trace_position &&
                 il == trace->debug_attention_output_f32_layer &&
                 !trace->debug_attention_output_f32.empty()) {
@@ -1798,6 +2077,7 @@ public:
                 trace->add_extended(inject_name + "_after_cpu_override",
                     copy_half(stream, st.hc_attn.inject(), static_cast<size_t>(q.hc_count)));
             }
+            profile_.mark_begin(kQwen38StageHcCombineAttn, stream);
             if (attn_out_f32 != nullptr) {
                 run_qwen38_hc_combine_f32_block_f32_inject(
                     state_.residual(), attn_out_f32, hc_f32_scratch, stream,
@@ -1809,6 +2089,7 @@ public:
                 run_qwen38_hc_combine(state_.residual(), attn_out, st.hc_attn, stream,
                     !q38_residual_f32_enabled());
             }
+            profile_.mark_end(kQwen38StageHcCombineAttn, stream);
             if (trace && trace->captures_state_position() &&
                 pos == trace->state_trace_position &&
                 il == trace->debug_hc_attn_combine_layer &&
@@ -1867,28 +2148,40 @@ public:
                                            il <= debug_hc_q8_1_ffn_through);
             bool ffn_used_f32 = false;
             bool ffn_f32_inject = false;
+            profile_.mark_begin(kQwen38StageHcMixFfn, stream);
+            Q38HcKernelScope hc_ffn_region_scope(
+                kQ38HcSiteFfnF16Norm, kQ38HcMixRegion, stream);
             if (q38_hc_f32_enabled() && !debug_hc_q8_0_ffn && !debug_f32_hc_ffn) {
                 __half * f32_cur = run_qwen38_hc_mix_f32(
                     state_.residual(), layer.hc_ffn, hc_f32_scratch, st.hc_ffn,
-                    q.rms_eps, stream);
+                    q.rms_eps, stream, kQ38HcSiteFfnF16Norm);
                 if (f32_cur != nullptr) {
                     cur = f32_cur;
                     ffn_used_f32 = true;
                 }
             }
-            if (!ffn_used_f32) {
+            // Mirrors attn_f32_mix_active: when the exact Q8_0 replay is the one
+            // that will produce the mix row, the legacy F16 pass below is skipped
+            // entirely (it would be recomputed into the same scratch an instant
+            // later). With WARODECODE_HC_SKIP_LEGACY=0 the old order returns.
+            const bool ffn_exact_mix_active = q38_hc_q8_0_enabled() && !debug_hc_q8_0_ffn &&
+                q38_hc_q8_0_compatible(layer.hc_ffn) && q38_hc_skip_legacy_enabled();
+            if (!ffn_used_f32 && !ffn_exact_mix_active) {
                 cur = run_qwen38_hc_mix(
-                    state_.residual(), layer.hc_ffn, st.hc_ffn, q.rms_eps, stream);
+                    state_.residual(), layer.hc_ffn, st.hc_ffn, q.rms_eps, stream,
+                    nullptr, nullptr, nullptr, nullptr, kQ38HcSiteFfnF16Norm);
             }
             if (debug_hc_q8_0_ffn) {
                 __half * inject_cur = run_qwen38_hc_mix_f32_with_inject(
-                    state_.residual(), layer.hc_ffn, hc_f32_scratch, st.hc_ffn, q.rms_eps, stream);
+                    state_.residual(), layer.hc_ffn, hc_f32_scratch, st.hc_ffn, q.rms_eps, stream,
+                    kQ38HcSiteFfnF16Norm);
                 if (inject_cur != nullptr) {
                     cur = inject_cur;
                     ffn_f32_inject = true;
                 } else {
                     run_qwen38_hc_q8_0_f32_mix_from_residual(
-                        state_.residual(), layer.hc_ffn, hc_f32_scratch, q.rms_eps, stream);
+                        state_.residual(), layer.hc_ffn, hc_f32_scratch, q.rms_eps, stream,
+                        kQ38HcSiteFfnF16Norm);
                     const int blocks = (q.hidden + 255) / 256;
                     q38_float_to_half_kernel<<<blocks, 256, 0, stream>>>(
                         hc_f32_scratch.mixed(), st.hc_ffn.mixed(), q.hidden);
@@ -1899,7 +2192,8 @@ public:
                     throw std::runtime_error("F32 HC FFN replay weights unavailable for requested layer");
                 }
                 run_qwen38_hc_f32_mix_from_residual(
-                    state_.residual(), layer.hc_ffn, hc_f32_scratch, q.rms_eps, stream);
+                    state_.residual(), layer.hc_ffn, hc_f32_scratch, q.rms_eps, stream,
+                    kQ38HcSiteFfnF16Norm);
                 const int blocks = (q.hidden + 255) / 256;
                 q38_float_to_half_kernel<<<blocks, 256, 0, stream>>>(
                     hc_f32_scratch.mixed(), st.hc_ffn.mixed(), q.hidden);
@@ -1945,10 +2239,14 @@ public:
                     copy_half(stream, st.hc_ffn.inject(), static_cast<size_t>(q.hc_count)));
             }
             if (legacy_trace && il == 0) trace->hc_ffn_mix = copy_half(stream, cur, static_cast<size_t>(q.hidden));
+            profile_.mark_end(kQwen38StageHcMixFfn, stream);
             if (trace && trace->extended_parity && il == 0) {
                 trace->add_extended("layer0.hc_mixed", trace->hc_ffn_mix);
             }
 
+            // Router + expert cache staging + routed GEMV + shared expert. The
+            // period covers the wait for a cache miss as well as the compute.
+            profile_.mark_begin(kQwen38StageMoe, stream);
             bool experts_preselected = f32_layer0_router_preselected && il == 0;
             Qwen38Trace * debug_trace = active_trace_;
             const Qwen38MoeRouteOverride * route_override = nullptr;
@@ -2310,6 +2608,9 @@ public:
                 trace->add_extended("layer0.shared_expert_weighted_output_f32", shared_weighted);
                 trace->add_extended("layer0.final_moe_output", trace->ffn_out);
             }
+            profile_.mark_end(kQwen38StageMoe, stream);
+
+            profile_.mark_begin(kQwen38StageHcCombineFfn, stream);
             const bool moe_f32_boundary = q38_moe_f32_enabled() &&
                 !all_position_routed_output_override && !selected_routed_output_override &&
                 !(trace && trace->debug_ffn_output_layer == il &&
@@ -2332,6 +2633,7 @@ public:
                 run_qwen38_hc_combine(state_.residual(), st.moe_out, st.hc_ffn, stream,
                     !q38_residual_f32_enabled());
             }
+            profile_.mark_end(kQwen38StageHcCombineFfn, stream);
             Qwen38Trace * output_override = active_trace_;
             const size_t all_position_count = output_override && output_override->debug_hc_residual_all_positions
                 ? output_override->debug_hc_residual.size() / static_cast<size_t>(hc_dim) : 0;
@@ -2390,6 +2692,7 @@ public:
                 trace->add_extended("layer0.hc_ffn_combine_residual", trace->after_ffn);
                 trace->add_extended("layer0.output", trace->after_ffn);
             }
+            profile_.layer_end(il, stream);
         }
 
         if (trace && trace->state_trace && !trace->debug_final_residual_f32.empty()) {
@@ -2408,6 +2711,7 @@ public:
             trace->add_extended("final.residual_after_cpu_override",
                 copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
         }
+        profile_.mark_begin(kQwen38StageHead, stream);
         __half * head = nullptr;
         float * head_f32 = nullptr;
         const bool debug_f32_hc_head = trace && trace->state_trace && trace->debug_f32_hc_head;
@@ -2465,6 +2769,9 @@ public:
         }
         q38_argmax_kernel<<<1, 256, 0, stream>>>(
             logits_, rt_.vocab, next_token_, has_nonfinite_);
+        profile_.mark_end(kQwen38StageHead, stream);
+
+        profile_.mark_begin(kQwen38StageSync, stream);
         if (trace && trace->state_trace) {
             trace_context_ = "position " + std::to_string(pos) + " final logits";
             trace->add_extended("final.logits",
@@ -2485,6 +2792,13 @@ public:
         if (e != cudaSuccess) {
             throw std::runtime_error(std::string("Qwen3.8 step sync failed: ") + cudaGetErrorString(e));
         }
+        profile_.mark_end(kQwen38StageSync, stream);
+        profile_.mark_end(kQwen38StageToken, stream);
+        // Every recorded event is complete now, so the elapsed reads cannot fail
+        // with cudaErrorNotReady.
+        profile_.flush_token();
+        Q38HcKernelProfiler::instance().flush_token();
+        if (profile_on) profile_.note_token_host(Qwen38StageProfiler::host_now() - profile_token_start);
         if (*host_has_nonfinite_) throw std::runtime_error("Qwen3.8 output logits contain NaN or infinity");
 
         if (trace && trace->state_trace) {
@@ -2524,23 +2838,45 @@ public:
             std::vector<std::pair<int, float>> * first_top_logits = nullptr,
             int top_k = 0,
             Qwen38Trace * trace = nullptr,
-            const std::vector<int> * forced_input_tokens = nullptr) {
+            const std::vector<int> * forced_input_tokens = nullptr,
+            const std::vector<int> * prefill_tokens = nullptr,
+            Qwen38RunTiming * timing = nullptr) {
         if (steps <= 0) throw std::runtime_error("Qwen3.8 steps must be positive");
         if (forced_input_tokens &&
             (static_cast<int>(forced_input_tokens->size()) != steps || forced_input_tokens->front() != start_token)) {
             throw std::runtime_error("forced Qwen3.8 input tokens must match --generate and --start-token");
         }
+        const int prefill_steps = prefill_tokens ? static_cast<int>(prefill_tokens->size()) : 0;
+        if (prefill_steps > 0 && forced_input_tokens) {
+            throw std::runtime_error("Qwen3.8 prefill tokens cannot be combined with forced input tokens");
+        }
+        if (prefill_steps + steps > state_.max_ctx()) {
+            throw std::runtime_error("Qwen3.8 prefill + decode exceeds the context length");
+        }
+        if (prefill_tokens) {
+            for (int id : *prefill_tokens) {
+                if (id < 0 || id >= rt_.vocab) throw std::runtime_error("Qwen3.8 prefill token out of range");
+            }
+        }
         active_trace_ = trace;
         clear();
 
 
-        cudaEvent_t begin{}, end{};
+        cudaEvent_t begin{}, end{}, prefill_mark{};
         cudaError_t e = cudaEventCreate(&begin);
         if (e != cudaSuccess) throw std::runtime_error("cudaEventCreate begin failed");
         e = cudaEventCreate(&end);
         if (e != cudaSuccess) {
             cudaEventDestroy(begin);
             throw std::runtime_error("cudaEventCreate end failed");
+        }
+        if (prefill_steps > 0) {
+            e = cudaEventCreate(&prefill_mark);
+            if (e != cudaSuccess) {
+                cudaEventDestroy(begin);
+                cudaEventDestroy(end);
+                throw std::runtime_error("cudaEventCreate prefill mark failed");
+            }
         }
 
         int token = start_token;
@@ -2562,20 +2898,58 @@ public:
         e = cudaEventRecord(begin, state_.stream());
         if (e != cudaSuccess) throw std::runtime_error("cudaEventRecord begin failed");
 
-        for (int pos = 0; pos < steps; ++pos) {
-            if (forced_input_tokens) token = (*forced_input_tokens)[static_cast<size_t>(pos)];
-            const bool capture = trace && (trace->state_trace
-                ? trace->state_trace_position < 0 || pos == trace->state_trace_position
-                : pos == 0);
-            token = step(token, pos, capture ? trace : nullptr,
-                debug_f32_hc_attn_0_8, debug_f32_hc_ffn_0_8, debug_f32_hc_ffn_layer8,
-                debug_hc_q8_1_attn_from, debug_hc_q8_1_attn_through,
-                debug_hc_q8_1_ffn_from, debug_hc_q8_1_ffn_through,
-                debug_hc_q8_0_ffn_from, debug_hc_q8_0_ffn_through);
-            if (pos == 0 && first_top_logits && top_k > 0) {
-                *first_top_logits = top_logits(top_k);
+        if (prefill_steps > 0) {
+            // Prompt phase: forward every prompt token at its real position and
+            // keep the sample of the last one, exactly like a decode step would.
+            // That sample is the first generated token's *input*, so the decode
+            // phase below reports a clean one-forward-per-token ratio. The plain
+            // decode path is untouched and still lives in the else branch.
+            profile_.set_decode_phase(false);
+            for (int pos = 0; pos < prefill_steps; ++pos) {
+                const bool capture = trace && (trace->state_trace
+                    ? trace->state_trace_position < 0 || pos == trace->state_trace_position
+                    : pos == 0);
+                token = step((*prefill_tokens)[static_cast<size_t>(pos)], pos,
+                    capture ? trace : nullptr,
+                    debug_f32_hc_attn_0_8, debug_f32_hc_ffn_0_8, debug_f32_hc_ffn_layer8,
+                    debug_hc_q8_1_attn_from, debug_hc_q8_1_attn_through,
+                    debug_hc_q8_1_ffn_from, debug_hc_q8_1_ffn_through,
+                    debug_hc_q8_0_ffn_from, debug_hc_q8_0_ffn_through);
             }
-            if (generated) generated->push_back(token);
+            e = cudaEventRecord(prefill_mark, state_.stream());
+            if (e != cudaSuccess) throw std::runtime_error("cudaEventRecord prefill mark failed");
+            profile_.set_decode_phase(true);
+            for (int pos = prefill_steps; pos < prefill_steps + steps; ++pos) {
+                const bool capture = trace && (trace->state_trace
+                    ? trace->state_trace_position < 0 || pos == trace->state_trace_position
+                    : pos == 0);
+                token = step(token, pos, capture ? trace : nullptr,
+                    debug_f32_hc_attn_0_8, debug_f32_hc_ffn_0_8, debug_f32_hc_ffn_layer8,
+                    debug_hc_q8_1_attn_from, debug_hc_q8_1_attn_through,
+                    debug_hc_q8_1_ffn_from, debug_hc_q8_1_ffn_through,
+                    debug_hc_q8_0_ffn_from, debug_hc_q8_0_ffn_through);
+                if (pos == prefill_steps && first_top_logits && top_k > 0) {
+                    *first_top_logits = top_logits(top_k);
+                }
+                if (generated) generated->push_back(token);
+            }
+        } else {
+            profile_.set_decode_phase(true);
+            for (int pos = 0; pos < steps; ++pos) {
+                if (forced_input_tokens) token = (*forced_input_tokens)[static_cast<size_t>(pos)];
+                const bool capture = trace && (trace->state_trace
+                    ? trace->state_trace_position < 0 || pos == trace->state_trace_position
+                    : pos == 0);
+                token = step(token, pos, capture ? trace : nullptr,
+                    debug_f32_hc_attn_0_8, debug_f32_hc_ffn_0_8, debug_f32_hc_ffn_layer8,
+                    debug_hc_q8_1_attn_from, debug_hc_q8_1_attn_through,
+                    debug_hc_q8_1_ffn_from, debug_hc_q8_1_ffn_through,
+                    debug_hc_q8_0_ffn_from, debug_hc_q8_0_ffn_through);
+                if (pos == 0 && first_top_logits && top_k > 0) {
+                    *first_top_logits = top_logits(top_k);
+                }
+                if (generated) generated->push_back(token);
+            }
         }
 
         e = cudaEventRecord(end, state_.stream());
@@ -2585,8 +2959,27 @@ public:
 
         float ms = 0.0f;
         e = cudaEventElapsedTime(&ms, begin, end);
+        if (timing) {
+            timing->prefill_tokens = prefill_steps;
+            timing->prefill_seconds = 0.0;
+            timing->decode_tokens = steps;
+            timing->decode_seconds = static_cast<double>(ms) / 1000.0;
+        }
+        if (prefill_steps > 0) {
+            float prefill_ms = 0.0f;
+            float decode_ms = 0.0f;
+            const cudaError_t prefill_error = cudaEventElapsedTime(&prefill_ms, begin, prefill_mark);
+            const cudaError_t phase_error = prefill_error == cudaSuccess
+                ? cudaEventElapsedTime(&decode_ms, prefill_mark, end) : prefill_error;
+            if (e == cudaSuccess) e = phase_error;
+            if (timing) {
+                timing->prefill_seconds = static_cast<double>(prefill_ms) / 1000.0;
+                timing->decode_seconds = static_cast<double>(decode_ms) / 1000.0;
+            }
+        }
         cudaEventDestroy(begin);
         cudaEventDestroy(end);
+        if (prefill_mark) cudaEventDestroy(prefill_mark);
         if (e != cudaSuccess) throw std::runtime_error("cudaEventElapsedTime failed");
         active_trace_ = nullptr;
         return static_cast<double>(ms) / 1000.0;
@@ -2710,6 +3103,7 @@ private:
     Qwen38Runtime & rt_;
     Qwen38DecodeState & state_;
     Qwen38HcF32DebugScratch hc_f32_scratch_;
+    Qwen38StageProfiler profile_;
     Qwen38Trace * active_trace_ = nullptr;
     float * logits_ = nullptr;
     int * next_token_ = nullptr;

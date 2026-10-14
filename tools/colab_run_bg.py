@@ -18,6 +18,10 @@ import time
 import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+# Source tree that gets uploaded. Defaults to this checkout; point
+# WARODECODE_SOURCE_DIR at a frozen worktree to benchmark a fixed revision while
+# other work keeps changing the shared tree. Artifacts stay under ROOT.
+SOURCE = pathlib.Path(os.environ.get("WARODECODE_SOURCE_DIR") or ROOT)
 CLI = ["rtk", "uvx", "--from", "google-colab-cli", "colab", "--auth=oauth2"]
 SESSION = os.environ.get("WARODECODE_COLAB_SESSION", "warpdecode-l4")
 MODEL = "/content/models/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf"
@@ -124,11 +128,11 @@ def main() -> None:
         archive = tmp_path / "src.zip"
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
             for name in ("src", "tests", "tools", "bench"):
-                for f in (ROOT / name).rglob("*"):
+                for f in (SOURCE / name).rglob("*"):
                     if f.is_file() and "qwen38-fixture" not in f.parts:
-                        z.write(f, f.relative_to(ROOT))
+                        z.write(f, f.relative_to(SOURCE))
             for name in ("CMakeLists.txt", "README.md", "setup.sh", ".gitignore"):
-                f = ROOT / name
+                f = SOURCE / name
                 if f.is_file():
                     z.write(f, name)
         print("+ upload source (%d bytes)" % archive.stat().st_size, flush=True)
