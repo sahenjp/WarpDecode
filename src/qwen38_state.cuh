@@ -52,6 +52,7 @@ public:
     ~Qwen38DecodeState() {
         if (residual_) cudaFree(residual_);
         if (head_hidden_) cudaFree(head_hidden_);
+        if (head_hidden_f32_) cudaFree(head_hidden_f32_);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
@@ -66,11 +67,16 @@ public:
         if (e != cudaSuccess) throw std::runtime_error("cudaStreamCreate Qwen3.8 failed");
 
         const size_t residual_n = static_cast<size_t>(q.hidden) * q.hc_count;
-        e = cudaMalloc(reinterpret_cast<void **>(&residual_), residual_n * sizeof(__half));
+        e = cudaMalloc(reinterpret_cast<void **>(&residual_), residual_n * sizeof(float));
         if (e != cudaSuccess) throw std::runtime_error("cudaMalloc Qwen3.8 residual failed");
 
         e = cudaMalloc(reinterpret_cast<void **>(&head_hidden_), static_cast<size_t>(q.hidden) * sizeof(__half));
         if (e != cudaSuccess) throw std::runtime_error("cudaMalloc Qwen3.8 head hidden failed");
+
+        // Unrounded token embedding row: the residual seed must be the F32
+        // dequantised values ggml uses, not their half mirror.
+        e = cudaMalloc(reinterpret_cast<void **>(&head_hidden_f32_), static_cast<size_t>(q.hidden) * sizeof(float));
+        if (e != cudaSuccess) throw std::runtime_error("cudaMalloc Qwen3.8 head hidden f32 failed");
 
         layers_.reserve(static_cast<size_t>(q.trunk_layers));
         for (int il = 0; il < q.trunk_layers; ++il) {
@@ -121,14 +127,15 @@ public:
             if (st->ple_state) st->ple_state->clear(stream_);
         }
         cudaMemsetAsync(residual_, 0,
-            residual_elements() * sizeof(__half), stream_);
+            residual_elements() * sizeof(float), stream_);
         cudaStreamSynchronize(stream_);
     }
 
     cudaStream_t stream() const { return stream_; }
     int max_ctx() const { return max_ctx_; }
-    __half * residual() const { return residual_; }
+    float * residual() const { return residual_; }
     __half * head_hidden() const { return head_hidden_; }
+    float * head_hidden_f32() const { return head_hidden_f32_; }
     Qwen38HcScratch & head_hc() { return head_hc_; }
 
     Qwen38LayerState & layer(int il) {
@@ -147,8 +154,9 @@ private:
 
     int max_ctx_ = 0;
     cudaStream_t stream_ = nullptr;
-    __half * residual_ = nullptr;
+    float * residual_ = nullptr;
     __half * head_hidden_ = nullptr;
+    float * head_hidden_f32_ = nullptr;
     Qwen38HcScratch head_hc_;
     std::vector<std::unique_ptr<Qwen38LayerState>> layers_;
 };

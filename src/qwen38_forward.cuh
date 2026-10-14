@@ -9,13 +9,97 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace wd {
+
+// Diagnostic ablation switches. WARODECODE_RESIDUAL_F32=1 (default) keeps the
+// persistent HC residual stream in F32; =0 reproduces the legacy F16 lifetime.
+// WARODECODE_HC_F32=1 additionally runs the HC mixing in F32.
+inline bool q38_env_flag(const char * name, bool default_on) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return default_on;
+    return v[0] != '0';
+}
+
+inline bool q38_residual_f32_enabled() {
+    static const bool enabled = q38_env_flag("WARODECODE_RESIDUAL_F32", true);
+    return enabled;
+}
+
+inline bool q38_hc_f32_enabled() {
+    static const bool enabled = q38_env_flag("WARODECODE_HC_F32", false);
+    return enabled;
+}
+
+inline bool q38_moe_f32_enabled() {
+    static const bool enabled = q38_env_flag("WARODECODE_MOE_F32", false);
+    return enabled;
+}
+
+// ggml-compatible activation quantisation. llama.cpp feeds quantised weights
+// with activations quantised to Q8_0 (32-element blocks, integer dot, per-block
+// scale); the legacy F16-activation path multiplies a differently rounded
+// activation and drifts ~1% per projection, which compounds over 48 layers and
+// flips the greedy token. Enabled by default when the weights are Q8_0 and the
+// F32 norm weights are available; WARODECODE_HC_Q8_0=0 restores the legacy path.
+// Wiring switches for the F32 branch outputs. The kernels have their own
+// WARODECODE_*_F32_MID switches; these gate whether forward.cuh consumes the
+// unrounded result instead of the half mirror, so each wiring can be A/B'd
+// without a rebuild.
+inline bool q38_f32_out_enabled(const char * name) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return true;
+    return v[0] != '0';
+}
+
+inline bool q38_gdn_f32_out_enabled() {
+    static const bool enabled = q38_f32_out_enabled("WARODECODE_GDN_F32_OUT");
+    return enabled;
+}
+
+inline bool q38_qsa_f32_out_enabled() {
+    static const bool enabled = q38_f32_out_enabled("WARODECODE_QSA_F32_OUT");
+    return enabled;
+}
+
+// MoE F32 output wiring (WARODECODE_MOE_F32_OUT, default ON). The legacy path
+// hands the combine the *half* mirror of the shared expert (d_down), which put a
+// 9.2e-5 error into layer 0's output at every position; routing the unrounded
+// value through moe_out_f32 drops that to 1.1e-7 (measured on L4). The greedy
+// prefix is knife-edge sensitive to this, so the switch stays available for A/B.
+inline bool q38_moe_f32_out_opt_in() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("WARODECODE_MOE_F32_OUT");
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
+    }();
+    return enabled;
+}
+
+inline bool q38_hc_q8_0_enabled() {
+    static const bool enabled = q38_env_flag("WARODECODE_HC_Q8_0", true);
+    return enabled;
+}
+
+// The attn branch is measurably more faithful to the CPU too (HC mix error
+// 1.35% -> 0.03%) but it only helps end to end once the GDN/QSA/MoE paths use
+// the same activation quantisation, so it stays opt-in for now.
+inline bool q38_hc_q8_0_attn_enabled() {
+    static const bool enabled = q38_env_flag("WARODECODE_HC_Q8_0_ATTN", true);
+    return enabled;
+}
+
+inline bool q38_hc_q8_0_compatible(const Qwen38HcWeights & w) {
+    return !w.debug_norm_f32.empty() &&
+           w.down.lowbit && w.down.type == GgmlType::Q8_0 &&
+           w.up.lowbit && w.up.type == GgmlType::Q8_0;
+}
 
 __global__ void q38_repeat_embedding_kernel(
         const __half * __restrict__ emb,
@@ -27,9 +111,49 @@ __global__ void q38_repeat_embedding_kernel(
     if (i < total) residual[i] = emb[i % hidden];
 }
 
+// F32 residual variant: the wide HC residual stream is kept in F32 to match the
+// pinned CPU reference (which stores the residual in F32).
+__global__ void q38_repeat_embedding_f32_kernel(
+        const __half * __restrict__ emb,
+        float * __restrict__ residual,
+        int hidden,
+        int hc) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = hidden * hc;
+    if (i < total) residual[i] = __half2float(emb[i % hidden]);
+}
+
+// F32-source twin: ggml dequantises the token embedding into F32 and seeds the
+// residual with those exact values. Reading the half mirror instead costs ~5e-4
+// on every position (the embedding is the seed of the whole chain), so the F32
+// row is what the residual must be built from.
+__global__ void q38_repeat_embedding_from_f32_kernel(
+        const float * __restrict__ emb,
+        float * __restrict__ residual,
+        int hidden,
+        int hc) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = hidden * hc;
+    if (i < total) residual[i] = emb[i % hidden];
+}
+
+__global__ void q38_float_copy_kernel(
+        const float * __restrict__ in,
+        float * __restrict__ out,
+        int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = in[i];
+}
+
 struct Q38MaxPair {
     float v;
     int i;
+};
+
+struct Qwen38MoeRouteOverride {
+    int position = -1;
+    std::vector<int> expert_ids;
+    std::vector<float> weights;
 };
 
 struct Qwen38Trace {
@@ -59,15 +183,100 @@ struct Qwen38Trace {
     std::vector<float> router_weights;
     std::vector<int> expert_ids;
     bool use_f32_hc_layer0 = false;
+    bool debug_f32_hc_attn_0_8 = false;
+    bool debug_f32_hc_ffn_0_8 = false;
+    bool debug_f32_hc_ffn_layer8 = false;
+    int debug_hc_q8_1_attn_from = 0;
+    int debug_hc_q8_1_attn_through = -1;
+    int debug_hc_q8_1_ffn_from = 0;
+    int debug_hc_q8_1_ffn_through = -1;
+    int debug_hc_q8_0_ffn_from = 0;
+    int debug_hc_q8_0_ffn_through = -1;
+    bool debug_f32_hc_head = false;
+    bool debug_layer0_hc_gate_f32_store = false;
+    bool debug_layer0_hc_gate_f32_sigmoid = false;
+    int debug_hc_gate_q8_0_layer = -1;
+    int debug_hc_full_q8_0_layer = -1;
+    int debug_qsa_q8_0_layer = -1;
+    int debug_qsa_v_q8_0_layer = -1;
+    int debug_hc_norm_f32_layer = -1;
+    std::vector<float> debug_hc_norm_f32;
+    size_t debug_hc_norm_override_count = 0;
+    int debug_attention_output_f32_layer = -1;
+    std::vector<float> debug_attention_output_f32;
+    size_t debug_attention_output_override_count = 0;
+    int debug_attention_input_f32_layer = -1;
+    std::vector<float> debug_attention_input_f32;
+    size_t debug_attention_input_override_count = 0;
+    int debug_qsa_context_f32_layer = -1;
+    std::vector<float> debug_qsa_context_f32;
+    size_t debug_qsa_context_override_count = 0;
+    int debug_qsa_pregate_f32_layer = -1;
+    std::vector<float> debug_qsa_pregate_f32;
+    size_t debug_qsa_pregate_override_count = 0;
+    int debug_qsa_query_f32_layer = -1;
+    std::vector<float> debug_qsa_query_f32;
+    size_t debug_qsa_query_override_count = 0;
+    int debug_qsa_key_store_f32_layer = -1;
+    std::vector<float> debug_qsa_key_store_f32;
+    size_t debug_qsa_key_store_override_count = 0;
+    int debug_qsa_value_store_f32_layer = -1;
+    std::vector<float> debug_qsa_value_store_f32;
+    size_t debug_qsa_value_store_override_count = 0;
+    int debug_qsa_key_cache_prefix_f32_layer = -1;
+    std::vector<float> debug_qsa_key_cache_prefix_f32;
+    size_t debug_qsa_key_cache_prefix_override_count = 0;
+    int debug_qsa_value_cache_prefix_f32_layer = -1;
+    std::vector<float> debug_qsa_value_cache_prefix_f32;
+    size_t debug_qsa_value_cache_prefix_override_count = 0;
+    int debug_hc_attn_combine_layer = -1;
+    std::vector<float> debug_hc_attn_combine_f32;
+    size_t debug_hc_attn_combine_override_count = 0;
+    int debug_hc_inject_f32_layer = -1;
+    std::vector<float> debug_hc_inject_f32;
+    size_t debug_hc_inject_override_count = 0;
+    int debug_layer_input_residual_layer = -1;
+    std::vector<float> debug_layer_input_residual_f32;
+    size_t debug_layer_input_residual_override_count = 0;
+    std::vector<float> debug_layer8_after_attention_residual_f32;
+    std::vector<float> debug_layer8_hc_ffn_mix_f32;
+    std::vector<float> debug_final_residual_f32;
+    std::vector<float> debug_layer14_gdn_core_f32;
+    std::vector<float> debug_layer14_gdn_norm_output_f32;
+    std::vector<float> debug_layer9_gdn_state_f32;
+    std::vector<float> debug_layer9_gdn_conv_state_f32;
+    int debug_layer9_gdn_state_layer = 9;
+    int debug_layer9_gdn_conv_state_layer = 9;
+    std::vector<int> debug_moe_ids;
+    std::vector<float> debug_moe_weights;
+    std::vector<Qwen38MoeRouteOverride> debug_moe_routes;
+    std::vector<float> debug_router_cpu_activation_f32;
+    std::vector<float> debug_routed_moe_output;
+    int debug_routed_moe_output_layer = 8;
+    bool debug_routed_moe_output_all_positions = false;
+    size_t debug_moe_route_override_count = 0;
+    size_t debug_routed_moe_output_override_count = 0;
+    size_t debug_hc_output_override_count = 0;
+    int debug_ffn_output_layer = 8;
+    std::vector<float> debug_ffn_output;
+    std::vector<float> debug_hc_residual;
+    int debug_hc_residual_layer = 8;
+    bool debug_hc_residual_all_positions = false;
     bool extended_parity = false;
     bool state_trace = false;
     int position = -1;
+    int state_trace_position = -1;
+    bool capture_state_position = false;
     std::vector<Qwen38TraceVector> extended_vectors;
     std::vector<Qwen38TraceSummaryVector> state_summaries;
     std::vector<Qwen38TraceIntegerVector> integer_vectors;
 
+    bool captures_state_position() const {
+        return state_trace && capture_state_position;
+    }
+
     void add_extended(const std::string & name, const std::vector<float> & values) {
-        if (extended_parity || state_trace) {
+        if (extended_parity || captures_state_position()) {
             extended_vectors.push_back({state_trace ? "pos" + std::to_string(position) + "." + name : name, values});
         }
     }
@@ -82,14 +291,14 @@ struct Qwen38Trace {
             const std::string & name,
             const std::vector<float> & values,
             std::vector<uint64_t> dims) {
-        if (state_trace) {
+        if (captures_state_position()) {
             state_summaries.push_back({"pos" + std::to_string(position) + "." + name,
                 std::move(dims), qwen38_trace_stats(values)});
         }
     }
 
     void add_integer_vector(const std::string & name, std::vector<int64_t> values) {
-        if (state_trace) {
+        if (captures_state_position()) {
             integer_vectors.push_back({"pos" + std::to_string(position) + "." + name, std::move(values)});
         }
     }
@@ -140,6 +349,7 @@ public:
     Qwen38Decoder(Qwen38Runtime & rt, Qwen38DecodeState & state)
         : rt_(rt), state_(state) {
         if (rt_.vocab <= 0) throw std::runtime_error("Qwen3.8 vocab is not initialized");
+        hc_f32_scratch_.initialize(rt_.layout.hidden, rt_.layout.hc_count, rt_.layout.hc_low_rank);
         cudaError_t e = cudaMalloc(
             reinterpret_cast<void **>(&logits_),
             static_cast<size_t>(rt_.vocab) * sizeof(float));
@@ -170,7 +380,16 @@ public:
         history_.clear();
     }
 
-    int step(int token, int pos, Qwen38Trace * trace = nullptr) {
+    int step(int token, int pos, Qwen38Trace * trace = nullptr,
+             bool debug_f32_hc_attn_0_8 = false,
+             bool debug_f32_hc_ffn_0_8 = false,
+             bool debug_f32_hc_ffn_layer8 = false,
+             int debug_hc_q8_1_attn_from = 0,
+             int debug_hc_q8_1_attn_through = -1,
+             int debug_hc_q8_1_ffn_from = 0,
+             int debug_hc_q8_1_ffn_through = -1,
+             int debug_hc_q8_0_ffn_from = 0,
+             int debug_hc_q8_0_ffn_through = -1) {
         const Qwen38Layout & q = rt_.layout;
         if (token < 0 || token >= rt_.vocab) throw std::runtime_error("Qwen3.8 token out of range");
         if (pos < 0 || pos >= state_.max_ctx()) throw std::runtime_error("Qwen3.8 position out of range");
@@ -179,10 +398,12 @@ public:
         }
 
         cudaStream_t stream = state_.stream();
-        Qwen38HcF32DebugScratch hc_f32_scratch;
+        Qwen38HcF32DebugScratch & hc_f32_scratch = hc_f32_scratch_;
         bool f32_layer0_router_preselected = false;
         if (trace && trace->state_trace) {
             trace->position = pos;
+            trace->capture_state_position = trace->state_trace_position < 0 ||
+                pos == trace->state_trace_position;
             trace_context_ = "position " + std::to_string(pos) + " embedding";
             trace->add_integer_vector("position", {pos});
             trace->add_integer_vector("input_token", {token});
@@ -191,12 +412,25 @@ public:
         }
         const bool legacy_trace = trace &&
             (!trace->state_trace || (trace->use_f32_hc_layer0 && pos == 0));
-
         // The wide HC residual starts as four identical copies of the token embedding.
-        launch_q8_0_gather_row(rt_.token_embd, token, state_.head_hidden(), stream);
+        // ggml dequantises that row into F32 and never rounds it; the F16 gather
+        // would put a ~5e-4 error into the seed of every position.
         const int hc_dim = q.hidden * q.hc_count;
-        q38_repeat_embedding_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
-            state_.head_hidden(), state_.residual(), q.hidden, q.hc_count);
+        const bool embed_f32 = [] {
+            const char * v = std::getenv("WARODECODE_EMBED_F32");
+            return v == nullptr || v[0] == '\0' || v[0] != '0';
+        }();
+        if (embed_f32 && state_.head_hidden_f32() != nullptr) {
+            launch_q8_0_gather_row_f32(rt_.token_embd, token, state_.head_hidden_f32(), stream);
+            q38_repeat_embedding_from_f32_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                state_.head_hidden_f32(), state_.residual(), q.hidden, q.hc_count);
+            q38_float_to_half_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                state_.head_hidden_f32(), state_.head_hidden(), q.hidden);
+        } else {
+            launch_q8_0_gather_row(rt_.token_embd, token, state_.head_hidden(), stream);
+            q38_repeat_embedding_f32_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                state_.head_hidden(), state_.residual(), q.hidden, q.hc_count);
+        }
         if (legacy_trace) {
             if (trace->state_trace) trace_context_ = "position " + std::to_string(pos) + " F32 layer-0 parity";
             trace->hc_init = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
@@ -204,7 +438,6 @@ public:
         }
         if (legacy_trace) {
             const Qwen38HcWeights & hc_attn = rt_.layers.front().hc_attn;
-            hc_f32_scratch.initialize(q.hidden, q.hc_count, q.hc_low_rank);
             run_qwen38_hc_f32_debug(rt_.token_embd, token, hc_attn, hc_f32_scratch, q.rms_eps, stream);
             trace->hc_f32.init = copy_float(stream, hc_f32_scratch.residual(), static_cast<size_t>(hc_dim));
             trace->hc_f32.norm = copy_float(stream, hc_f32_scratch.norm(), static_cast<size_t>(hc_dim));
@@ -256,6 +489,28 @@ public:
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " input residual";
             }
 
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_layer_input_residual_layer &&
+                !trace->debug_layer_input_residual_f32.empty()) {
+                if (trace->debug_layer_input_residual_f32.size() != static_cast<size_t>(hc_dim)) {
+                    throw std::runtime_error("layer input residual override is invalid");
+                }
+                const std::string input_name = "layer" + std::to_string(il) + ".input_residual";
+                trace->add_extended(input_name + "_before_cpu_override",
+                    copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+                const cudaError_t e = cudaMemcpyAsync(
+                    hc_f32_scratch.residual(), trace->debug_layer_input_residual_f32.data(),
+                    static_cast<size_t>(hc_dim) * sizeof(float), cudaMemcpyHostToDevice, stream);
+                if (e != cudaSuccess) throw std::runtime_error("copy layer input residual override failed");
+                q38_float_copy_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.residual(), state_.residual(), hc_dim);
+                ++trace->debug_layer_input_residual_override_count;
+                trace->add_extended(input_name + "_cpu_f32", trace->debug_layer_input_residual_f32);
+                trace->add_extended(input_name + "_after_cpu_override",
+                    copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+            }
+
             if (trace && trace->state_trace) {
                 trace->add_extended(
                     "layer" + std::to_string(il) + ".input_residual",
@@ -287,7 +542,7 @@ public:
                     state_.residual(), token, history_, pos,
                     *layer.ple_w, *rt_.ple_table,
                     *st.ple_state, *st.ple_scratch,
-                    q, stream);
+                    q, stream, !q38_residual_f32_enabled());
                 if (trace && trace->extended_parity && !trace->state_trace && il == 1) {
                     trace->add_extended("layer1.ple_post_residual", copy_half(
                         stream, state_.residual(), static_cast<size_t>(hc_dim)));
@@ -301,6 +556,16 @@ public:
                         copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
                     trace->add_extended("layer" + std::to_string(il) + ".ple_conv_out",
                         copy_half(stream, st.ple_scratch->conv_out(), static_cast<size_t>(hc_dim)));
+                    // F32 twins: the half mirrors above hide everything below 5e-4,
+                    // which is exactly the range the PLE divergence lives in.
+                    trace->add_extended("layer" + std::to_string(il) + ".ple_gated_value_f32",
+                        copy_float(stream, st.ple_scratch->gated_f32(), static_cast<size_t>(hc_dim)));
+                    trace->add_extended("layer" + std::to_string(il) + ".ple_conv_out_f32",
+                        copy_float(stream, st.ple_scratch->conv_f32(), static_cast<size_t>(hc_dim)));
+                    trace->add_extended("layer" + std::to_string(il) + ".ple_post_residual_f32",
+                        copy_float(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+                    trace->add_extended("layer" + std::to_string(il) + ".ple_query_norm_f32",
+                        copy_float(stream, st.ple_scratch->query_norm_f32(), static_cast<size_t>(hc_dim)));
                     trace->add_extended("layer" + std::to_string(il) + ".ple_gate",
                         copy_float(stream, st.ple_scratch->gate(), static_cast<size_t>(q.hc_count)));
                     std::vector<int64_t> history_after(history_.begin(), history_.end());
@@ -315,18 +580,306 @@ public:
                     copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
             }
 
-            __half * cur = run_qwen38_hc_mix(
-                state_.residual(), layer.hc_attn, st.hc_attn, q.rms_eps, stream);
+            const bool debug_f32_hc_attn =
+                (debug_f32_hc_attn_0_8 && il <= 8) ||
+                (debug_hc_q8_1_attn_through >= 0 &&
+                 il >= debug_hc_q8_1_attn_from && il <= debug_hc_q8_1_attn_through);
+            const bool trace_hc_attn_projection = trace && trace->state_trace &&
+                (il == 0 || il == 2) && !debug_f32_hc_attn;
+            const bool trace_layer0_hc_attn = trace_hc_attn_projection && il == 0;
+            const bool debug_hc_norm_override = trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                trace->debug_hc_norm_f32_layer == il && !trace->debug_hc_norm_f32.empty();
+            const bool debug_layer0_hc_gate_f32_store = trace_layer0_hc_attn &&
+                trace->debug_layer0_hc_gate_f32_store;
+            const bool debug_layer0_hc_gate_f32_sigmoid = trace_layer0_hc_attn &&
+                trace->debug_layer0_hc_gate_f32_sigmoid;
+            const bool debug_hc_gate_q8_0 = trace && trace->state_trace &&
+                trace->debug_hc_gate_q8_0_layer == il;
+            const bool debug_hc_full_q8_0 = trace && trace->state_trace &&
+                trace->debug_hc_full_q8_0_layer == il;
+            const bool debug_layer0_hc_gate_replay = debug_layer0_hc_gate_f32_store ||
+                debug_layer0_hc_gate_f32_sigmoid ||
+                (debug_hc_gate_q8_0 && il == 0) ||
+                (debug_hc_full_q8_0 && il == 0);
+            const float * hc_norm_override_f32 = nullptr;
+            if (debug_hc_norm_override) {
+                if (trace->debug_hc_norm_f32.size() != static_cast<size_t>(hc_dim)) {
+                    throw std::runtime_error("HC norm override has the wrong size");
+                }
+                const cudaError_t e = cudaMemcpyAsync(
+                    hc_f32_scratch.norm(), trace->debug_hc_norm_f32.data(),
+                    static_cast<size_t>(hc_dim) * sizeof(float), cudaMemcpyHostToDevice, stream);
+                if (e != cudaSuccess) throw std::runtime_error("copy HC norm override failed");
+                hc_norm_override_f32 = hc_f32_scratch.norm();
+                trace->add_extended("layer" + std::to_string(il) + ".hc_attn_norm_override_f32",
+                    trace->debug_hc_norm_f32);
+                ++trace->debug_hc_norm_override_count;
+            }
+            __half * cur = nullptr;
+            bool attn_f32_inject = false;
+            if (q38_hc_f32_enabled()) {
+                cur = run_qwen38_hc_mix_f32(
+                    state_.residual(), layer.hc_attn, hc_f32_scratch, st.hc_attn,
+                    q.rms_eps, stream);
+            }
+            if (cur == nullptr) {
+                // The legacy F16 path still runs first: it fills the F16 inject
+                // weights that run_qwen38_hc_combine consumes.
+                cur = run_qwen38_hc_mix(
+                    state_.residual(), layer.hc_attn, st.hc_attn, q.rms_eps, stream,
+                    trace_hc_attn_projection ? hc_f32_scratch.low_raw() : nullptr,
+                    trace_hc_attn_projection ? hc_f32_scratch.low() : nullptr,
+                    trace_hc_attn_projection ? hc_f32_scratch.gate() : nullptr,
+                    hc_norm_override_f32);
+            }
+            const bool attn_f32_mix_active = q38_hc_q8_0_enabled() && q38_hc_q8_0_attn_enabled() &&
+                q38_hc_q8_0_compatible(layer.hc_attn) &&
+                !(trace && trace->state_trace && trace->debug_hc_full_q8_0_layer == il);
+            // The unrounded HC mix row is valid whenever one of the exact Q8_0 mix
+            // entry points ran (with or without the F32 inject); the debug replay
+            // branches recompute the mix through half kernels and invalidate it.
+            const bool attn_f32_row_valid = attn_f32_mix_active &&
+                !debug_hc_gate_q8_0 && !debug_layer0_hc_gate_replay;
+            if (attn_f32_mix_active) {
+                __half * inject_cur = run_qwen38_hc_mix_f32_with_inject(
+                    state_.residual(), layer.hc_attn, hc_f32_scratch, st.hc_attn, q.rms_eps, stream);
+                if (inject_cur != nullptr) {
+                    // F32-inject variant: the unrounded inject stays in the F32
+                    // scratch and run_qwen38_hc_combine_f32_inject consumes it.
+                    cur = inject_cur;
+                    attn_f32_inject = true;
+                } else {
+                    run_qwen38_hc_q8_0_f32_mix_from_residual(
+                        state_.residual(), layer.hc_attn, hc_f32_scratch, q.rms_eps, stream);
+                    q38_float_to_half_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                        hc_f32_scratch.mixed(), st.hc_attn.mixed(), q.hidden);
+                    cur = st.hc_attn.mixed();
+                }
+            }
+            if (trace_hc_attn_projection && il == 2) {
+                const std::string layer = "layer" + std::to_string(il) + ".hc_attn_";
+                trace->add_extended(layer + "down_projection_f32",
+                    copy_float(stream, hc_f32_scratch.low_raw(), static_cast<size_t>(st.hc_attn.low_rank())));
+                trace->add_extended(layer + "down_preactivation_f16",
+                    copy_float(stream, hc_f32_scratch.low(), static_cast<size_t>(st.hc_attn.low_rank())));
+                trace->add_extended(layer + "low_post_activation",
+                    copy_half(stream, st.hc_attn.lo(), static_cast<size_t>(st.hc_attn.low_rank())));
+                trace->add_extended(layer + "gate_projection_direct_f32",
+                    copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim)));
+                trace->add_extended(layer + "gate_preactivation_f16",
+                    copy_half(stream, st.hc_attn.gate(), static_cast<size_t>(hc_dim)));
+                q38_hc_sigmoid_gate_f32_trace_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                    st.hc_attn.gate(), hc_f32_scratch.residual(), hc_dim);
+                trace->add_extended(layer + "gate_post_sigmoid_f16_input",
+                    copy_float(stream, hc_f32_scratch.residual(), static_cast<size_t>(hc_dim)));
+                q38_hc_sigmoid_f32_gate_trace_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.gate(), hc_f32_scratch.residual(), hc_dim);
+                trace->add_extended(layer + "gate_post_sigmoid_direct_f32",
+                    copy_float(stream, hc_f32_scratch.residual(), static_cast<size_t>(hc_dim)));
+            }
+            if (debug_hc_full_q8_0 && trace_layer0_hc_attn) {
+                trace->add_extended("layer0.hc_attn_down_direct_f32",
+                    copy_float(stream, hc_f32_scratch.low_raw(), static_cast<size_t>(st.hc_attn.low_rank())));
+                trace->add_extended("layer0.hc_attn_down_direct_preactivation_f16",
+                    copy_float(stream, hc_f32_scratch.low(), static_cast<size_t>(st.hc_attn.low_rank())));
+                trace->add_extended("layer0.hc_attn_low_direct_post_activation_f16",
+                    copy_half(stream, st.hc_attn.lo(), static_cast<size_t>(st.hc_attn.low_rank())));
+                trace->add_extended("layer0.hc_attn_gate_direct_f32",
+                    copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim)));
+                trace->add_extended("layer0.hc_attn_gate_direct_preactivation_f16",
+                    copy_half(stream, st.hc_attn.gate(), static_cast<size_t>(hc_dim)));
+            }
+            if (debug_hc_full_q8_0) {
+                if (!layer.hc_attn.down.lowbit || layer.hc_attn.down.type != GgmlType::Q8_0 ||
+                    !layer.hc_attn.up.lowbit || layer.hc_attn.up.type != GgmlType::Q8_0) {
+                    throw std::runtime_error("full HC Q8_0 replay requires Q8_0 down/up weights");
+                }
+                constexpr int q8_threads = 256;
+                const int low_rank = st.hc_attn.low_rank();
+                const int warps = q8_threads / 32;
+                const int norm_blocks = hc_dim / 32;
+                if (hc_norm_override_f32) {
+                    q38_hc_q8_0_quantize_f32_kernel<<<(norm_blocks + 7) / 8, q8_threads, 0, stream>>>(
+                        hc_norm_override_f32, hc_dim, hc_f32_scratch.q8_0_values(),
+                        hc_f32_scratch.q8_0_scales());
+                } else {
+                    q38_hc_q8_0_quantize_half_kernel<<<(norm_blocks + 7) / 8, q8_threads, 0, stream>>>(
+                        st.hc_attn.xn(), hc_dim, hc_f32_scratch.q8_0_values(),
+                        hc_f32_scratch.q8_0_scales());
+                }
+                q38_hc_q8_0_q8_0_gemv_f32_kernel<<<(low_rank + warps - 1) / warps, q8_threads, 0, stream>>>(
+                    layer.hc_attn.down.low.data, hc_f32_scratch.q8_0_values(),
+                    hc_f32_scratch.q8_0_scales(), hc_f32_scratch.embedding(), low_rank, hc_dim);
+                const cudaError_t e = cudaMemcpyAsync(
+                    hc_f32_scratch.low(), hc_f32_scratch.embedding(),
+                    static_cast<size_t>(low_rank) * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+                if (e != cudaSuccess) throw std::runtime_error("copy full Q8_0 HC down output failed");
+                q38_hc_silu_scale_f32_kernel<<<(low_rank + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.low(), low_rank, 1.0f / static_cast<float>(q.hc_count));
+                const int low_blocks = low_rank / 32;
+                q38_hc_q8_0_quantize_f32_kernel<<<(low_blocks + 7) / 8, q8_threads, 0, stream>>>(
+                    hc_f32_scratch.low(), low_rank, hc_f32_scratch.q8_0_values(),
+                    hc_f32_scratch.q8_0_scales());
+                q38_hc_q8_0_q8_0_gemv_f32_kernel<<<(hc_dim + warps - 1) / warps, q8_threads, 0, stream>>>(
+                    layer.hc_attn.up.low.data, hc_f32_scratch.q8_0_values(),
+                    hc_f32_scratch.q8_0_scales(), hc_f32_scratch.gate(), hc_dim, low_rank);
+                q38_hc_copy_f32_to_half_kernel<<<(low_rank + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.low(), st.hc_attn.lo(), low_rank);
+                q38_hc_copy_f32_to_half_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.gate(), st.hc_attn.gate(), hc_dim);
+                if (hc_norm_override_f32) {
+                    q38_hc_mix_f32_x_f32_gate_replay_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                        hc_norm_override_f32, hc_f32_scratch.gate(), st.hc_attn.mixed(),
+                        q.hidden, q.hc_count);
+                } else {
+                    q38_hc_mix_f32_gate_replay_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                        st.hc_attn.xn(), hc_f32_scratch.gate(), st.hc_attn.mixed(),
+                        q.hidden, q.hc_count, true);
+                }
+                if (trace && trace->state_trace && il != 0) {
+                    const std::string layer = "layer" + std::to_string(il) + ".hc_attn_";
+                    trace->add_extended(layer + "down_full_q8_0_f32",
+                        copy_float(stream, hc_f32_scratch.embedding(), static_cast<size_t>(low_rank)));
+                    trace->add_extended(layer + "low_full_q8_0_f32",
+                        copy_float(stream, hc_f32_scratch.low(), static_cast<size_t>(low_rank)));
+                    trace->add_extended(layer + "gate_full_q8_0_f32",
+                        copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim)));
+                }
+                cur = st.hc_attn.mixed();
+            }
+            if (debug_hc_gate_q8_0) {
+                if (!layer.hc_attn.up.lowbit || layer.hc_attn.up.type != GgmlType::Q8_0) {
+                    throw std::runtime_error("HC Q8_0 gate replay requires Q8_0 up weights");
+                }
+                constexpr int q8_threads = 256;
+                const int low_rank = st.hc_attn.low_rank();
+                const int input_blocks = low_rank / 32;
+                q38_hc_q8_0_quantize_half_kernel<<<(input_blocks + 7) / 8, q8_threads, 0, stream>>>(
+                    st.hc_attn.lo(), low_rank, hc_f32_scratch.q8_0_values(),
+                    hc_f32_scratch.q8_0_scales());
+                const int warps = q8_threads / 32;
+                q38_hc_q8_0_q8_0_gemv_f32_kernel<<<(hc_dim + warps - 1) / warps, q8_threads, 0, stream>>>(
+                    layer.hc_attn.up.low.data, hc_f32_scratch.q8_0_values(),
+                    hc_f32_scratch.q8_0_scales(), hc_f32_scratch.gate(), hc_dim, low_rank);
+                q38_hc_copy_f32_to_half_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.gate(), st.hc_attn.gate(), hc_dim);
+                q38_hc_mix_f32_gate_replay_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                    st.hc_attn.xn(), hc_f32_scratch.gate(), st.hc_attn.mixed(),
+                    q.hidden, q.hc_count, true);
+                if (trace && trace->state_trace && il != 0) {
+                    trace->add_extended("layer" + std::to_string(il) + ".hc_attn_gate_q8_0_f32",
+                        copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim)));
+                }
+                cur = st.hc_attn.mixed();
+            } else if (debug_layer0_hc_gate_f32_store || debug_layer0_hc_gate_f32_sigmoid) {
+                q38_hc_copy_f32_to_half_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.gate(), st.hc_attn.gate(), hc_dim);
+                if (debug_layer0_hc_gate_f32_store) {
+                    q38_hc_mix_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                        st.hc_attn.xn(), st.hc_attn.gate(), st.hc_attn.mixed(),
+                        q.hidden, q.hc_count);
+                } else {
+                    q38_hc_mix_f32_gate_replay_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                        st.hc_attn.xn(), hc_f32_scratch.gate(), st.hc_attn.mixed(),
+                        q.hidden, q.hc_count, false);
+                }
+                cur = st.hc_attn.mixed();
+            }
+            if (trace_layer0_hc_attn) {
+                q38_hc_sigmoid_gate_f32_trace_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                    st.hc_attn.gate(), hc_f32_scratch.residual(), hc_dim);
+                trace->add_extended("layer0.hc_attn_input",
+                    copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+                trace->add_extended("layer0.hc_attn_down_projection_f32",
+                    copy_float(stream, hc_f32_scratch.low_raw(),
+                        static_cast<size_t>(st.hc_attn.low_rank())));
+                if (debug_hc_full_q8_0) {
+                    trace->add_extended("layer0.hc_attn_down_full_q8_0_f32",
+                        copy_float(stream, hc_f32_scratch.embedding(), static_cast<size_t>(st.hc_attn.low_rank())));
+                    trace->add_extended("layer0.hc_attn_low_full_q8_0_f32",
+                        copy_float(stream, hc_f32_scratch.low(), static_cast<size_t>(st.hc_attn.low_rank())));
+                } else {
+                    trace->add_extended("layer0.hc_attn_down_preactivation_f16",
+                        copy_float(stream, hc_f32_scratch.low(),
+                            static_cast<size_t>(st.hc_attn.low_rank())));
+                }
+                trace->add_extended("layer0.hc_attn_low_post_activation",
+                    copy_half(stream, st.hc_attn.lo(), static_cast<size_t>(st.hc_attn.low_rank())));
+                const char * gate_trace_name = debug_hc_full_q8_0
+                    ? "layer0.hc_attn_gate_full_q8_0_f32"
+                    : (debug_hc_gate_q8_0 ? "layer0.hc_attn_gate_q8_0_f32"
+                                          : "layer0.hc_attn_gate_projection_f32");
+                trace->add_extended(gate_trace_name,
+                    copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim)));
+                if (debug_layer0_hc_gate_replay && !debug_hc_full_q8_0) {
+                    trace->add_extended("layer0.hc_attn_gate_replay_f32",
+                        copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim)));
+                }
+                trace->add_extended("layer0.hc_attn_gate_preactivation_f16",
+                    copy_half(stream, st.hc_attn.gate(), static_cast<size_t>(hc_dim)));
+                trace->add_extended("layer0.hc_attn_gate_post_sigmoid_f32",
+                    copy_float(stream, hc_f32_scratch.residual(), static_cast<size_t>(hc_dim)));
+                q38_hc_sigmoid_f32_gate_trace_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.gate(), hc_f32_scratch.residual(), hc_dim);
+                const char * sigmoid_trace_name = debug_hc_full_q8_0
+                    ? "layer0.hc_attn_gate_post_sigmoid_full_q8_0"
+                    : (debug_hc_gate_q8_0 ? "layer0.hc_attn_gate_post_sigmoid_q8_0"
+                                          : "layer0.hc_attn_gate_post_sigmoid_f32_projection");
+                trace->add_extended(sigmoid_trace_name,
+                    copy_float(stream, hc_f32_scratch.residual(), static_cast<size_t>(hc_dim)));
+            }
+            if (debug_f32_hc_attn) {
+                if (layer.hc_attn.debug_norm_f32.empty()) {
+                    throw std::runtime_error("F32 HC attention replay weights unavailable for requested layer");
+                }
+                run_qwen38_hc_f32_mix_from_residual(
+                    state_.residual(), layer.hc_attn, hc_f32_scratch, q.rms_eps, stream);
+                const int blocks = (q.hidden + 255) / 256;
+                q38_float_to_half_kernel<<<blocks, 256, 0, stream>>>(
+                    hc_f32_scratch.mixed(), st.hc_attn.mixed(), q.hidden);
+                cur = st.hc_attn.mixed();
+            }
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_attention_input_f32_layer &&
+                !trace->debug_attention_input_f32.empty()) {
+                if (trace->debug_attention_input_f32.size() != static_cast<size_t>(q.hidden)) {
+                    throw std::runtime_error("attention input override is invalid");
+                }
+                const std::string input_name = "layer" + std::to_string(il) + ".attention_input";
+                trace->add_extended(input_name + "_before_cpu_override",
+                    copy_half(stream, cur, static_cast<size_t>(q.hidden)));
+                const cudaError_t e = cudaMemcpyAsync(
+                    hc_f32_scratch.mixed(), trace->debug_attention_input_f32.data(),
+                    static_cast<size_t>(q.hidden) * sizeof(float), cudaMemcpyHostToDevice, stream);
+                if (e != cudaSuccess) throw std::runtime_error("copy attention input override failed");
+                q38_float_to_half_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.mixed(), st.hc_attn.mixed(), q.hidden);
+                cur = st.hc_attn.mixed();
+                ++trace->debug_attention_input_override_count;
+                trace->add_extended(input_name + "_cpu_f32", trace->debug_attention_input_f32);
+                trace->add_extended(input_name + "_after_cpu_override",
+                    copy_half(stream, cur, static_cast<size_t>(q.hidden)));
+            }
             if (trace && trace->state_trace) {
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_attn_norm";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_attn_norm",
-                    copy_half(stream, st.hc_attn.xn(), static_cast<size_t>(hc_dim)));
+                    debug_f32_hc_attn
+                        ? copy_float(stream, hc_f32_scratch.norm(), static_cast<size_t>(hc_dim))
+                        : copy_half(stream, st.hc_attn.xn(), static_cast<size_t>(hc_dim)));
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_attn_gate";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_attn_gate",
-                    copy_half(stream, st.hc_attn.gate(), static_cast<size_t>(hc_dim)));
+                    debug_f32_hc_attn
+                        ? copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim))
+                        : copy_half(stream, st.hc_attn.gate(), static_cast<size_t>(hc_dim)));
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_attn_mix";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_attn_mix",
                     copy_half(stream, cur, static_cast<size_t>(q.hidden)));
+                if (attn_f32_row_valid) {
+                    trace->add_extended("layer" + std::to_string(il) + ".hc_attn_mix_f32",
+                        copy_float(stream, hc_f32_scratch.mixed(), static_cast<size_t>(q.hidden)));
+                }
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_attn_inject";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_attn_inject",
                     copy_half(stream, st.hc_attn.inject(), static_cast<size_t>(q.hc_count)));
@@ -368,14 +921,512 @@ public:
                     copy_half(stream, cur, static_cast<size_t>(q.hidden)));
             }
 
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_qsa_context_f32_layer &&
+                !trace->debug_qsa_context_f32.empty() && !layer.qsa) {
+                throw std::runtime_error("QSA attention context override targeted a non-QSA layer");
+            }
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_qsa_pregate_f32_layer &&
+                !trace->debug_qsa_pregate_f32.empty() && !layer.qsa) {
+                throw std::runtime_error("QSA pregate override targeted a non-QSA layer");
+            }
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_qsa_query_f32_layer &&
+                !trace->debug_qsa_query_f32.empty() && !layer.qsa) {
+                throw std::runtime_error("QSA query override targeted a non-QSA layer");
+            }
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_qsa_key_store_f32_layer &&
+                !trace->debug_qsa_key_store_f32.empty() && !layer.qsa) {
+                throw std::runtime_error("QSA key store override targeted a non-QSA layer");
+            }
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_qsa_value_store_f32_layer &&
+                !trace->debug_qsa_value_store_f32.empty() && !layer.qsa) {
+                throw std::runtime_error("QSA value store override targeted a non-QSA layer");
+            }
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_qsa_key_cache_prefix_f32_layer &&
+                !trace->debug_qsa_key_cache_prefix_f32.empty() && !layer.qsa) {
+                throw std::runtime_error("QSA key cache prefix override targeted a non-QSA layer");
+            }
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_qsa_value_cache_prefix_f32_layer &&
+                !trace->debug_qsa_value_cache_prefix_f32.empty() && !layer.qsa) {
+                throw std::runtime_error("QSA value cache prefix override targeted a non-QSA layer");
+            }
+
+            // Diagnostic twin of layer*.hc_attn_mix_f32 captured *before* the
+            // attention runs: a difference between the two proves the F32 mix
+            // scratch is being reused by a later stage (and would invalidate any
+            // mix error measured from the late item).
+            if (trace && trace->state_trace && attn_f32_row_valid) {
+                trace->add_extended("layer" + std::to_string(il) + ".hc_attn_mix_f32_early",
+                    copy_float(stream, hc_f32_scratch.mixed(), static_cast<size_t>(q.hidden)));
+                // F32 internals of the exact HC mix: the half mirrors these feed
+                // sit at ~5e-4, so a 0.2% mix error cannot be attributed without
+                // them. hc_norm is the grouped RMSNorm row, hc_gate is the up
+                // projection whose sigmoid weights the mix.
+                trace->add_extended("layer" + std::to_string(il) + ".hc_attn_norm_f32",
+                    copy_float(stream, hc_f32_scratch.norm(), static_cast<size_t>(hc_dim)));
+                trace->add_extended("layer" + std::to_string(il) + ".hc_attn_gate_f32",
+                    copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim)));
+                trace->add_extended("layer" + std::to_string(il) + ".hc_attn_low_raw_f32",
+                    copy_float(stream, hc_f32_scratch.low_raw(),
+                        static_cast<size_t>(st.hc_attn.low_rank())));
+                trace->add_extended("layer" + std::to_string(il) + ".hc_attn_low_f32",
+                    copy_float(stream, hc_f32_scratch.low(),
+                        static_cast<size_t>(st.hc_attn.low_rank())));
+            }
             __half * attn_out = nullptr;
+            float * attn_out_f32 = nullptr;
             if (layer.qsa) {
                 if (!layer.qsa_w || !st.qsa_state || !st.qsa_scratch) {
                     throw std::runtime_error("Qwen3.8 QSA state is incomplete");
                 }
-                attn_out = run_qwen38_qsa(
+                // NOTE: run_qwen38_qsa_f32_x() (F32 activation input) is available
+                // but measurably *worse* here: it moved the position-39 margin from
+                // -0.245 to -0.742. The half round trip apparently compensates for a
+                // larger upstream error, so the half input stays the default.
+                attn_out = (attn_f32_row_valid && q38_qsa_f32_out_enabled())
+                    ? run_qwen38_qsa_f32_x(
+                          hc_f32_scratch.mixed(), *layer.qsa_w, *st.qsa_state, *st.qsa_scratch,
+                          q, il, pos, Qwen38Position4::text(pos), stream,
+                          trace && trace->state_trace &&
+                              (il == 7 || (trace->captures_state_position() &&
+                               pos == trace->state_trace_position &&
+                               il == trace->debug_qsa_pregate_f32_layer &&
+                               !trace->debug_qsa_pregate_f32.empty()))
+                              ? st.qsa_scratch->pre_gate_trace() : nullptr,
+                          trace && trace->state_trace && trace->debug_qsa_q8_0_layer == il,
+                          trace && trace->state_trace && trace->debug_qsa_v_q8_0_layer == il)
+                    : run_qwen38_qsa(
                     cur, *layer.qsa_w, *st.qsa_state, *st.qsa_scratch,
-                    q, il, pos, Qwen38Position4::text(pos), stream);
+                    q, il, pos, Qwen38Position4::text(pos), stream,
+                    trace && trace->state_trace &&
+                        (il == 7 || (trace->captures_state_position() &&
+                         pos == trace->state_trace_position &&
+                         il == trace->debug_qsa_pregate_f32_layer &&
+                         !trace->debug_qsa_pregate_f32.empty()))
+                        ? st.qsa_scratch->pre_gate_trace() : nullptr,
+                    trace && trace->state_trace && trace->debug_qsa_q8_0_layer == il,
+                    trace && trace->state_trace && trace->debug_qsa_v_q8_0_layer == il);
+                if (trace && trace->captures_state_position() &&
+                    pos == trace->state_trace_position &&
+                    il == trace->debug_qsa_query_f32_layer &&
+                    !trace->debug_qsa_query_f32.empty()) {
+                    const int qsa_elements = q.heads * q.key_length;
+                    if (trace->debug_qsa_query_f32.size() !=
+                        static_cast<size_t>(qsa_elements)) {
+                        throw std::runtime_error("QSA query override has the wrong size");
+                    }
+                    const std::string query_name = "layer" + std::to_string(il) + ".qsa.query";
+                    trace->add_extended(query_name + "_before_cpu_override",
+                        copy_half(stream, st.qsa_scratch->q(),
+                            static_cast<size_t>(qsa_elements)));
+                    std::vector<__half> query_half(trace->debug_qsa_query_f32.size());
+                    for (size_t i = 0; i < query_half.size(); ++i) {
+                        query_half[i] = __float2half(trace->debug_qsa_query_f32[i]);
+                    }
+                    cudaError_t debug_error = cudaStreamSynchronize(stream);
+                    if (debug_error != cudaSuccess) {
+                        throw std::runtime_error("sync before QSA query override failed");
+                    }
+                    debug_error = cudaMemcpyAsync(
+                        st.qsa_scratch->q(), query_half.data(),
+                        query_half.size() * sizeof(__half), cudaMemcpyHostToDevice, stream);
+                    if (debug_error != cudaSuccess) {
+                        throw std::runtime_error("copy QSA query override failed");
+                    }
+                    debug_error = cudaStreamSynchronize(stream);
+                    if (debug_error != cudaSuccess) {
+                        throw std::runtime_error("sync QSA query override failed");
+                    }
+                    const int ratio = st.qsa_state->ratio();
+                    const int full_blocks = (pos + 1) / ratio;
+                    const int tail_start = full_blocks * ratio;
+                    const int block_budget = q.indexer_top_k / ratio;
+                    const int selected_count = std::min(full_blocks, block_budget);
+                    const int * selected_ids = full_blocks > block_budget
+                        ? st.qsa_state->ids_sorted() : st.qsa_state->ids();
+                    const float attention_scale = q.attention_scale != 0.0f
+                        ? q.attention_scale
+                        : rsqrtf(static_cast<float>(q.key_length));
+                    q38_qsa_sparse_attention_kernel<<<q.heads, 256, 0, stream>>>(
+                        st.qsa_scratch->q(), st.qsa_scratch->gate(),
+                        st.qsa_state->k_cache(), st.qsa_state->v_cache(),
+                        selected_ids, st.qsa_scratch->attn(), nullptr,
+                        selected_count, ratio, tail_start, pos,
+                        q.heads, q.kv_heads, q.key_length, attention_scale);
+                    launch_matrix_gemv_half(
+                        layer.qsa_w->out, st.qsa_scratch->attn(),
+                        st.qsa_scratch->final(), stream);
+                    attn_out = st.qsa_scratch->final();
+                    ++trace->debug_qsa_query_override_count;
+                    trace->add_extended(query_name + "_cpu_f32",
+                        trace->debug_qsa_query_f32);
+                }
+                const bool override_qsa_key_store = trace && trace->captures_state_position() &&
+                    pos == trace->state_trace_position &&
+                    il == trace->debug_qsa_key_store_f32_layer &&
+                    !trace->debug_qsa_key_store_f32.empty();
+                const bool override_qsa_value_store = trace && trace->captures_state_position() &&
+                    pos == trace->state_trace_position &&
+                    il == trace->debug_qsa_value_store_f32_layer &&
+                    !trace->debug_qsa_value_store_f32.empty();
+                if (override_qsa_key_store || override_qsa_value_store) {
+                    const size_t kv_n = static_cast<size_t>(q.kv_heads) * q.key_length;
+                    const size_t expected_kv_n = kv_n;
+                    if ((override_qsa_key_store &&
+                         trace->debug_qsa_key_store_f32.size() != expected_kv_n) ||
+                        (override_qsa_value_store &&
+                         trace->debug_qsa_value_store_f32.size() != expected_kv_n)) {
+                        throw std::runtime_error("QSA key/value store override has the wrong size");
+                    }
+                    std::vector<__half> key_store_half;
+                    std::vector<__half> value_store_half;
+                    if (override_qsa_key_store) {
+                        key_store_half.resize(kv_n);
+                        for (size_t i = 0; i < kv_n; ++i) {
+                            key_store_half[i] = __float2half(trace->debug_qsa_key_store_f32[i]);
+                        }
+                    }
+                    if (override_qsa_value_store) {
+                        value_store_half.resize(kv_n);
+                        for (size_t i = 0; i < kv_n; ++i) {
+                            value_store_half[i] = __float2half(trace->debug_qsa_value_store_f32[i]);
+                        }
+                    }
+                    const size_t cache_offset = static_cast<size_t>(pos) * kv_n;
+                    if (override_qsa_key_store) {
+                        cudaError_t debug_error = cudaMemcpyAsync(
+                            st.qsa_state->k_cache() + cache_offset, key_store_half.data(),
+                            kv_n * sizeof(__half), cudaMemcpyHostToDevice, stream);
+                        if (debug_error != cudaSuccess) {
+                            throw std::runtime_error("copy QSA key store override failed");
+                        }
+                    }
+                    if (override_qsa_value_store) {
+                        cudaError_t debug_error = cudaMemcpyAsync(
+                            st.qsa_state->v_cache() + cache_offset, value_store_half.data(),
+                            kv_n * sizeof(__half), cudaMemcpyHostToDevice, stream);
+                        if (debug_error != cudaSuccess) {
+                            throw std::runtime_error("copy QSA value store override failed");
+                        }
+                    }
+                    const std::string qsa_name = "layer" + std::to_string(il) + ".qsa.";
+                    if (override_qsa_key_store) {
+                        trace->add_extended(qsa_name + "key_cache_position_cpu_store_f32",
+                            trace->debug_qsa_key_store_f32);
+                        trace->add_extended(qsa_name + "key_cache_position_after_cpu_store_override",
+                            copy_half(stream, st.qsa_state->k_cache() + cache_offset, kv_n));
+                        trace->add_integer_vector(qsa_name + "key_store_override_position", {pos});
+                    }
+                    if (override_qsa_value_store) {
+                        trace->add_extended(qsa_name + "value_cache_position_cpu_store_f32",
+                            trace->debug_qsa_value_store_f32);
+                        trace->add_extended(qsa_name + "value_cache_position_after_cpu_store_override",
+                            copy_half(stream, st.qsa_state->v_cache() + cache_offset, kv_n));
+                        trace->add_integer_vector(qsa_name + "value_store_override_position", {pos});
+                    }
+
+                    const int ratio = st.qsa_state->ratio();
+                    const int full_blocks = (pos + 1) / ratio;
+                    const int tail_start = full_blocks * ratio;
+                    const int block_budget = q.indexer_top_k / ratio;
+                    const int selected_count = std::min(full_blocks, block_budget);
+                    const int * selected_ids = full_blocks > block_budget
+                        ? st.qsa_state->ids_sorted() : st.qsa_state->ids();
+                    const float attention_scale = q.attention_scale != 0.0f
+                        ? q.attention_scale
+                        : rsqrtf(static_cast<float>(q.key_length));
+                    q38_qsa_sparse_attention_kernel<<<q.heads, 256, 0, stream>>>(
+                        st.qsa_scratch->q(), st.qsa_scratch->gate(),
+                        st.qsa_state->k_cache(), st.qsa_state->v_cache(),
+                        selected_ids, st.qsa_scratch->attn(), nullptr,
+                        selected_count, ratio, tail_start, pos,
+                        q.heads, q.kv_heads, q.key_length, attention_scale);
+                    cudaError_t debug_error = cudaSuccess;
+                    if (override_qsa_key_store) {
+                        debug_error = cudaMemcpyAsync(
+                            st.qsa_state->k_cache() + cache_offset, st.qsa_scratch->k(),
+                            kv_n * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+                        if (debug_error != cudaSuccess) {
+                            throw std::runtime_error("restore Warp QSA key cache position failed");
+                        }
+                    }
+                    if (override_qsa_value_store) {
+                        debug_error = cudaMemcpyAsync(
+                            st.qsa_state->v_cache() + cache_offset, st.qsa_scratch->v(),
+                            kv_n * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+                        if (debug_error != cudaSuccess) {
+                            throw std::runtime_error("restore Warp QSA value cache position failed");
+                        }
+                    }
+                    launch_matrix_gemv_half(
+                        layer.qsa_w->out, st.qsa_scratch->attn(),
+                        st.qsa_scratch->final(), stream);
+                    attn_out = st.qsa_scratch->final();
+                    if (override_qsa_key_store) ++trace->debug_qsa_key_store_override_count;
+                    if (override_qsa_value_store) ++trace->debug_qsa_value_store_override_count;
+                }
+                const bool override_qsa_key_cache_prefix = trace && trace->captures_state_position() &&
+                    pos == trace->state_trace_position &&
+                    il == trace->debug_qsa_key_cache_prefix_f32_layer &&
+                    !trace->debug_qsa_key_cache_prefix_f32.empty();
+                const bool override_qsa_value_cache_prefix = trace && trace->captures_state_position() &&
+                    pos == trace->state_trace_position &&
+                    il == trace->debug_qsa_value_cache_prefix_f32_layer &&
+                    !trace->debug_qsa_value_cache_prefix_f32.empty();
+                if (override_qsa_key_cache_prefix || override_qsa_value_cache_prefix) {
+                    const size_t kv_n = static_cast<size_t>(q.kv_heads) * q.key_length;
+                    const size_t max_prefix_n = static_cast<size_t>(pos + 1) * kv_n;
+                    const size_t key_prefix_n = override_qsa_key_cache_prefix
+                        ? trace->debug_qsa_key_cache_prefix_f32.size() : 0;
+                    const size_t value_prefix_n = override_qsa_value_cache_prefix
+                        ? trace->debug_qsa_value_cache_prefix_f32.size() : 0;
+                    if ((override_qsa_key_cache_prefix &&
+                         (key_prefix_n == 0 || key_prefix_n > max_prefix_n || key_prefix_n % kv_n != 0)) ||
+                        (override_qsa_value_cache_prefix &&
+                         (value_prefix_n == 0 || value_prefix_n > max_prefix_n || value_prefix_n % kv_n != 0))) {
+                        throw std::runtime_error(
+                            "QSA cache prefix override must contain whole position-major cache slots not beyond the current position");
+                    }
+                    std::vector<__half> key_prefix_half;
+                    std::vector<__half> value_prefix_half;
+                    std::vector<__half> original_key_prefix;
+                    std::vector<__half> original_value_prefix;
+                    if (override_qsa_key_cache_prefix) {
+                        key_prefix_half.resize(key_prefix_n);
+                        original_key_prefix.resize(key_prefix_n);
+                        for (size_t i = 0; i < key_prefix_n; ++i) {
+                            key_prefix_half[i] = __float2half(
+                                trace->debug_qsa_key_cache_prefix_f32[i]);
+                        }
+                    }
+                    if (override_qsa_value_cache_prefix) {
+                        value_prefix_half.resize(value_prefix_n);
+                        original_value_prefix.resize(value_prefix_n);
+                        for (size_t i = 0; i < value_prefix_n; ++i) {
+                            value_prefix_half[i] = __float2half(
+                                trace->debug_qsa_value_cache_prefix_f32[i]);
+                        }
+                    }
+                    cudaError_t debug_error = cudaStreamSynchronize(stream);
+                    if (debug_error != cudaSuccess) {
+                        throw std::runtime_error("sync before QSA cache prefix override failed");
+                    }
+                    const size_t key_prefix_bytes = key_prefix_n * sizeof(__half);
+                    const size_t value_prefix_bytes = value_prefix_n * sizeof(__half);
+                    if (override_qsa_key_cache_prefix) {
+                        debug_error = cudaMemcpy(original_key_prefix.data(),
+                            st.qsa_state->k_cache(), key_prefix_bytes, cudaMemcpyDeviceToHost);
+                        if (debug_error != cudaSuccess) {
+                            throw std::runtime_error("save Warp QSA key cache prefix failed");
+                        }
+                        debug_error = cudaMemcpyAsync(st.qsa_state->k_cache(),
+                            key_prefix_half.data(), key_prefix_bytes,
+                            cudaMemcpyHostToDevice, stream);
+                        if (debug_error != cudaSuccess) {
+                            throw std::runtime_error("copy CPU QSA key cache prefix failed");
+                        }
+                    }
+                    if (override_qsa_value_cache_prefix) {
+                        debug_error = cudaMemcpy(original_value_prefix.data(),
+                            st.qsa_state->v_cache(), value_prefix_bytes, cudaMemcpyDeviceToHost);
+                        if (debug_error != cudaSuccess) {
+                            throw std::runtime_error("save Warp QSA value cache prefix failed");
+                        }
+                        debug_error = cudaMemcpyAsync(st.qsa_state->v_cache(),
+                            value_prefix_half.data(), value_prefix_bytes,
+                            cudaMemcpyHostToDevice, stream);
+                        if (debug_error != cudaSuccess) {
+                            throw std::runtime_error("copy CPU QSA value cache prefix failed");
+                        }
+                    }
+                    debug_error = cudaStreamSynchronize(stream);
+                    if (debug_error != cudaSuccess) {
+                        throw std::runtime_error("sync QSA cache prefix override failed");
+                    }
+                    const std::string qsa_name = "layer" + std::to_string(il) + ".qsa.";
+                    if (override_qsa_key_cache_prefix) {
+                        trace->add_extended(qsa_name + "key_cache_prefix_cpu_f32",
+                            trace->debug_qsa_key_cache_prefix_f32);
+                        trace->add_extended(qsa_name + "key_cache_prefix_after_cpu_override",
+                            copy_half(stream, st.qsa_state->k_cache(), key_prefix_n));
+                    }
+                    if (override_qsa_value_cache_prefix) {
+                        trace->add_extended(qsa_name + "value_cache_prefix_cpu_f32",
+                            trace->debug_qsa_value_cache_prefix_f32);
+                        trace->add_extended(qsa_name + "value_cache_prefix_after_cpu_override",
+                            copy_half(stream, st.qsa_state->v_cache(), value_prefix_n));
+                    }
+
+                    const int ratio = st.qsa_state->ratio();
+                    const int full_blocks = (pos + 1) / ratio;
+                    const int tail_start = full_blocks * ratio;
+                    const int block_budget = q.indexer_top_k / ratio;
+                    const int selected_count = std::min(full_blocks, block_budget);
+                    const int * selected_ids = full_blocks > block_budget
+                        ? st.qsa_state->ids_sorted() : st.qsa_state->ids();
+                    const float attention_scale = q.attention_scale != 0.0f
+                        ? q.attention_scale
+                        : rsqrtf(static_cast<float>(q.key_length));
+                    q38_qsa_sparse_attention_kernel<<<q.heads, 256, 0, stream>>>(
+                        st.qsa_scratch->q(), st.qsa_scratch->gate(),
+                        st.qsa_state->k_cache(), st.qsa_state->v_cache(),
+                        selected_ids, st.qsa_scratch->attn(), nullptr,
+                        selected_count, ratio, tail_start, pos,
+                        q.heads, q.kv_heads, q.key_length, attention_scale);
+
+                    if (override_qsa_key_cache_prefix) {
+                        debug_error = cudaMemcpyAsync(st.qsa_state->k_cache(),
+                            original_key_prefix.data(), key_prefix_bytes,
+                            cudaMemcpyHostToDevice, stream);
+                        if (debug_error != cudaSuccess) {
+                            throw std::runtime_error("restore Warp QSA key cache prefix failed");
+                        }
+                    }
+                    if (override_qsa_value_cache_prefix) {
+                        debug_error = cudaMemcpyAsync(st.qsa_state->v_cache(),
+                            original_value_prefix.data(), value_prefix_bytes,
+                            cudaMemcpyHostToDevice, stream);
+                        if (debug_error != cudaSuccess) {
+                            throw std::runtime_error("restore Warp QSA value cache prefix failed");
+                        }
+                    }
+                    if (override_qsa_key_cache_prefix) {
+                        trace->add_extended(qsa_name + "key_cache_prefix_after_restore",
+                            copy_half(stream, st.qsa_state->k_cache(), key_prefix_n));
+                        trace->add_integer_vector(qsa_name + "key_cache_prefix_override_position",
+                            {pos});
+                        trace->add_integer_vector(qsa_name + "key_cache_prefix_override_length",
+                            {static_cast<int64_t>(key_prefix_n)});
+                        trace->add_integer_vector(qsa_name + "key_cache_prefix_override_cache_slot_range",
+                            {0, static_cast<int64_t>(key_prefix_n / kv_n) - 1});
+                        ++trace->debug_qsa_key_cache_prefix_override_count;
+                    }
+                    if (override_qsa_value_cache_prefix) {
+                        trace->add_extended(qsa_name + "value_cache_prefix_after_restore",
+                            copy_half(stream, st.qsa_state->v_cache(), value_prefix_n));
+                        trace->add_integer_vector(qsa_name + "value_cache_prefix_override_position",
+                            {pos});
+                        trace->add_integer_vector(qsa_name + "value_cache_prefix_override_length",
+                            {static_cast<int64_t>(value_prefix_n)});
+                        trace->add_integer_vector(qsa_name + "value_cache_prefix_override_cache_slot_range",
+                            {0, static_cast<int64_t>(value_prefix_n / kv_n) - 1});
+                        ++trace->debug_qsa_value_cache_prefix_override_count;
+                    }
+                    launch_matrix_gemv_half(
+                        layer.qsa_w->out, st.qsa_scratch->attn(),
+                        st.qsa_scratch->final(), stream);
+                    attn_out = st.qsa_scratch->final();
+                }
+                if (trace && trace->captures_state_position() &&
+                    pos == trace->state_trace_position &&
+                    il == trace->debug_qsa_context_f32_layer &&
+                    !trace->debug_qsa_context_f32.empty()) {
+                    if (trace->debug_qsa_context_f32.size() !=
+                        static_cast<size_t>(q.heads) * q.key_length) {
+                        throw std::runtime_error("QSA attention context override has the wrong size");
+                    }
+                    if (!st.qsa_scratch || !layer.qsa_w) {
+                        throw std::runtime_error("QSA attention context override targeted an incomplete layer");
+                    }
+                    const std::string context_name =
+                        "layer" + std::to_string(il) + ".qsa.attention_context";
+                    trace->add_extended(context_name + "_before_cpu_override",
+                        copy_half(stream, st.qsa_scratch->attn(),
+                            static_cast<size_t>(q.heads) * q.key_length));
+                    std::vector<__half> context_half(trace->debug_qsa_context_f32.size());
+                    for (size_t i = 0; i < context_half.size(); ++i) {
+                        context_half[i] = __float2half(trace->debug_qsa_context_f32[i]);
+                    }
+                    cudaError_t debug_error = cudaStreamSynchronize(stream);
+                    if (debug_error != cudaSuccess) {
+                        throw std::runtime_error("sync before QSA attention context override failed");
+                    }
+                    debug_error = cudaMemcpyAsync(
+                        st.qsa_scratch->attn(), context_half.data(),
+                        context_half.size() * sizeof(__half), cudaMemcpyHostToDevice, stream);
+                    if (debug_error != cudaSuccess) {
+                        throw std::runtime_error("copy QSA attention context override failed");
+                    }
+                    debug_error = cudaStreamSynchronize(stream);
+                    if (debug_error != cudaSuccess) {
+                        throw std::runtime_error("sync QSA attention context override failed");
+                    }
+                    launch_matrix_gemv_half(
+                        layer.qsa_w->out, st.qsa_scratch->attn(),
+                        st.qsa_scratch->final(), stream);
+                    attn_out = st.qsa_scratch->final();
+                    ++trace->debug_qsa_context_override_count;
+                    trace->add_extended(context_name + "_cpu_f32",
+                        trace->debug_qsa_context_f32);
+                    trace->add_extended(context_name + "_after_cpu_override",
+                        copy_half(stream, st.qsa_scratch->attn(),
+                            static_cast<size_t>(q.heads) * q.key_length));
+                }
+                if (trace && trace->captures_state_position() &&
+                    pos == trace->state_trace_position &&
+                    il == trace->debug_qsa_pregate_f32_layer &&
+                    !trace->debug_qsa_pregate_f32.empty()) {
+                    const int qsa_elements = q.heads * q.key_length;
+                    if (trace->debug_qsa_pregate_f32.size() !=
+                        static_cast<size_t>(qsa_elements)) {
+                        throw std::runtime_error("QSA pregate override has the wrong size");
+                    }
+                    const std::string pregate_name =
+                        "layer" + std::to_string(il) + ".qsa.attention_pregate";
+                    trace->add_extended(pregate_name + "_before_cpu_override",
+                        copy_float(stream, st.qsa_scratch->pre_gate_trace(),
+                            static_cast<size_t>(qsa_elements)));
+                    cudaError_t debug_error = cudaMemcpyAsync(
+                        st.qsa_scratch->pre_gate_trace(), trace->debug_qsa_pregate_f32.data(),
+                        static_cast<size_t>(qsa_elements) * sizeof(float),
+                        cudaMemcpyHostToDevice, stream);
+                    if (debug_error != cudaSuccess) {
+                        throw std::runtime_error("copy QSA pregate override failed");
+                    }
+                    q38_qsa_apply_gate_to_pregate_kernel<<<(qsa_elements + 255) / 256, 256, 0, stream>>>(
+                        st.qsa_scratch->pre_gate_trace(), st.qsa_scratch->gate(),
+                        st.qsa_scratch->attn(), qsa_elements);
+                    launch_matrix_gemv_half(
+                        layer.qsa_w->out, st.qsa_scratch->attn(),
+                        st.qsa_scratch->final(), stream);
+                    attn_out = st.qsa_scratch->final();
+                    ++trace->debug_qsa_pregate_override_count;
+                    trace->add_extended(pregate_name + "_cpu_f32",
+                        trace->debug_qsa_pregate_f32);
+                    const cudaError_t sync_error = cudaStreamSynchronize(stream);
+                    if (sync_error != cudaSuccess) {
+                        throw std::runtime_error("sync QSA pregate override failed");
+                    }
+                }
+                if (q38_qsa_f32_out_enabled() && q38_qsa_f32_mid_enabled() &&
+                    st.qsa_scratch->final_f32() != nullptr) {
+                    // Unrounded QSA output, unless a CPU injection recomputed the
+                    // final projection through the half mirror.
+                    const bool qsa_override_active = trace && trace->captures_state_position() &&
+                        (il == trace->debug_qsa_query_f32_layer ||
+                         il == trace->debug_qsa_key_store_f32_layer ||
+                         il == trace->debug_qsa_value_store_f32_layer ||
+                         il == trace->debug_qsa_context_f32_layer ||
+                         il == trace->debug_qsa_pregate_f32_layer ||
+                         il == trace->debug_qsa_key_cache_prefix_f32_layer ||
+                         il == trace->debug_qsa_value_cache_prefix_f32_layer);
+                    if (!qsa_override_active) {
+                        attn_out_f32 = st.qsa_scratch->final_f32();
+                    }
+                }
                 if (trace && trace->state_trace) {
                     trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " QSA cache/output";
                     const size_t kv_n = static_cast<size_t>(q.kv_heads) * q.key_length;
@@ -388,6 +1439,39 @@ public:
                         copy_half(stream, st.qsa_scratch->k(), kv_n));
                     trace->add_extended("layer" + std::to_string(il) + ".qsa.value_projection",
                         copy_half(stream, st.qsa_scratch->v(), kv_n));
+                    trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".qsa.attention_context";
+                    trace->add_extended("layer" + std::to_string(il) + ".qsa.attention_context",
+                        copy_half(stream, st.qsa_scratch->attn(), static_cast<size_t>(q.heads) * q.key_length));
+                    // Unrounded QSA rows: the half mirrors above are dominated by
+                    // their own rounding, so the F32 twins are what an error budget
+                    // against the CPU oracle has to use.
+                    if (st.qsa_scratch->q_f32() != nullptr) {
+                        trace->add_extended("layer" + std::to_string(il) + ".qsa.query_f32",
+                            copy_float(stream, st.qsa_scratch->q_f32(),
+                                static_cast<size_t>(q.heads) * q.key_length));
+                        trace->add_extended("layer" + std::to_string(il) + ".qsa.key_f32",
+                            copy_float(stream, st.qsa_scratch->k_f32(), kv_n));
+                        trace->add_extended("layer" + std::to_string(il) + ".qsa.value_f32",
+                            copy_float(stream, st.qsa_scratch->v_f32(), kv_n));
+                        trace->add_extended("layer" + std::to_string(il) + ".qsa.attn_f32",
+                            copy_float(stream, st.qsa_scratch->attn_f32(),
+                                static_cast<size_t>(q.heads) * q.key_length));
+                        trace->add_extended("layer" + std::to_string(il) + ".qsa.gate_f32",
+                            copy_float(stream, st.qsa_scratch->gate_f32(),
+                                static_cast<size_t>(q.heads) * q.key_length));
+                    }
+                    if (il == 7) {
+                        trace->add_extended("layer7.qsa.attention_pre_gate_f32",
+                            copy_float(stream, st.qsa_scratch->pre_gate_trace(),
+                                static_cast<size_t>(q.heads) * q.key_length));
+                    }
+                    const size_t cache_n = static_cast<size_t>(pos + 1) * kv_n;
+                    trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".qsa.key_cache_prefix";
+                    trace->add_extended("layer" + std::to_string(il) + ".qsa.key_cache_prefix",
+                        copy_half(stream, st.qsa_state->k_cache(), cache_n));
+                    trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".qsa.value_cache_prefix";
+                    trace->add_extended("layer" + std::to_string(il) + ".qsa.value_cache_prefix",
+                        copy_half(stream, st.qsa_state->v_cache(), cache_n));
                     trace->add_extended("layer" + std::to_string(il) + ".qsa.key_cache_position",
                         copy_half(stream, st.qsa_state->k_cache() + static_cast<size_t>(pos) * kv_n, kv_n));
                     trace->add_extended("layer" + std::to_string(il) + ".qsa.value_cache_position",
@@ -430,6 +1514,7 @@ public:
                 const int conv_channels = q.ssm_state_size * q.ssm_group_count * 2 +
                                           q.ssm_state_size * q.ssm_dt_rank;
                 const size_t conv_state_n = static_cast<size_t>(q.ssm_conv_kernel - 1) * conv_channels;
+                const bool capture_full_gdn = (il <= 8 || il == 9 || il == 10 || il == 14) && !q.is_qsa(il);
                 if (trace && trace->state_trace) {
                     trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " GDN before";
                     trace->add_extended("layer" + std::to_string(il) + ".gdn.input",
@@ -438,19 +1523,132 @@ public:
                         copy_float(stream, st.gdn_state->state(), gdn_state_n),
                         {static_cast<uint64_t>(q.ssm_dt_rank), static_cast<uint64_t>(q.ssm_state_size),
                          static_cast<uint64_t>(q.ssm_state_size)});
+                    if (capture_full_gdn) {
+                        trace->add_extended("layer" + std::to_string(il) + ".gdn.recurrent_before_full",
+                            copy_float(stream, st.gdn_state->state(), gdn_state_n));
+                    }
                     trace->add_extended("layer" + std::to_string(il) + ".gdn.conv_before",
                         copy_half(stream, st.gdn_state->conv_state(), conv_state_n));
                     trace->add_integer_vector("layer" + std::to_string(il) + ".gdn.write_position", {pos});
                 }
-                attn_out = run_qwen38_gdn(
-                    cur, *layer.gdn_w, *st.gdn_state, *st.gdn_scratch,
-                    q, q.rms_eps, stream);
+                if (trace && trace->state_trace && il == trace->debug_layer9_gdn_state_layer &&
+                    !trace->debug_layer9_gdn_state_f32.empty()) {
+                    if (trace->debug_layer9_gdn_state_f32.size() != gdn_state_n) {
+                        throw std::runtime_error("GDN recurrent-state override is invalid");
+                    }
+                    const cudaError_t e = cudaMemcpyAsync(
+                        st.gdn_state->state(), trace->debug_layer9_gdn_state_f32.data(),
+                        gdn_state_n * sizeof(float), cudaMemcpyHostToDevice, stream);
+                    if (e != cudaSuccess) throw std::runtime_error("copy GDN recurrent-state override failed");
+                    trace->add_extended("layer" + std::to_string(il) + ".gdn.recurrent_before_cpu_override",
+                        copy_float(stream, st.gdn_state->state(), gdn_state_n));
+                }
+                if (trace && trace->state_trace && il == trace->debug_layer9_gdn_conv_state_layer &&
+                    !trace->debug_layer9_gdn_conv_state_f32.empty()) {
+                    if (trace->debug_layer9_gdn_conv_state_f32.size() != conv_state_n) {
+                        throw std::runtime_error("GDN convolution-state override is invalid");
+                    }
+                    std::vector<__half> conv_state_cpu(conv_state_n);
+                    std::transform(trace->debug_layer9_gdn_conv_state_f32.begin(),
+                        trace->debug_layer9_gdn_conv_state_f32.end(), conv_state_cpu.begin(),
+                        [] (float value) { return __float2half(value); });
+                    cudaError_t e = cudaStreamSynchronize(stream);
+                    if (e != cudaSuccess) throw std::runtime_error("sync before GDN convolution-state override failed");
+                    e = cudaMemcpy(st.gdn_state->conv_state(), conv_state_cpu.data(),
+                        conv_state_n * sizeof(__half), cudaMemcpyHostToDevice);
+                    if (e != cudaSuccess) throw std::runtime_error("copy GDN convolution-state override failed");
+                    const std::string gdn_state_name = "layer" + std::to_string(il) + ".gdn.";
+                    trace->add_extended(gdn_state_name + "conv_state_cpu_f32",
+                        trace->debug_layer9_gdn_conv_state_f32);
+                    trace->add_extended(gdn_state_name + "conv_state_after_cpu_override",
+                        copy_half(stream, st.gdn_state->conv_state(), conv_state_n));
+                }
+                if (q38_gdn_f32_out_enabled() &&
+                    q38_gdn_f32_path_available(*st.gdn_state, *st.gdn_scratch, q)) {
+                    // F32 GDN: the branch output stays unrounded so the HC combine
+                    // does not reintroduce a half round trip. The F32 *input*
+                    // variant (run_qwen38_gdn_f32_x) is available but measured
+                    // worse for the same reason as the QSA one above.
+                    float * gdn_f32 = (attn_f32_row_valid && q38_gdn_f32_out_enabled())
+                        ? run_qwen38_gdn_f32_x(
+                              hc_f32_scratch.mixed(), *layer.gdn_w, *st.gdn_state, *st.gdn_scratch,
+                              q, q.rms_eps, stream)
+                        : run_qwen38_gdn_f32(
+                              cur, *layer.gdn_w, *st.gdn_state, *st.gdn_scratch,
+                              q, q.rms_eps, stream);
+                    if (gdn_f32 != nullptr) {
+                        attn_out_f32 = gdn_f32;
+                        attn_out = st.gdn_scratch->final_out();
+                    }
+                }
+                if (attn_out_f32 == nullptr) {
+                    attn_out = run_qwen38_gdn(
+                        cur, *layer.gdn_w, *st.gdn_state, *st.gdn_scratch,
+                        q, q.rms_eps, stream);
+                }
+                if (trace && trace->state_trace && il == 14 &&
+                    !trace->debug_layer14_gdn_core_f32.empty()) {
+                    const size_t value_dim = static_cast<size_t>(q.ssm_state_size) * q.ssm_dt_rank;
+                    if (trace->debug_layer14_gdn_core_f32.size() != value_dim) {
+                        throw std::runtime_error("layer-14 GDN core override is invalid");
+                    }
+                    trace->add_extended("layer14.gdn.core_output_before_cpu_override",
+                        copy_half(stream, st.gdn_scratch->core_out(), value_dim));
+                    trace->add_extended("layer14.gdn.norm_output_before_cpu_core_override",
+                        copy_half(stream, st.gdn_scratch->norm_out(), value_dim));
+                    trace->add_extended("layer14.attention_output_before_cpu_core_override",
+                        copy_half(stream, attn_out, static_cast<size_t>(q.hidden)));
+                    const cudaError_t e = cudaMemcpyAsync(
+                        hc_f32_scratch.residual(), trace->debug_layer14_gdn_core_f32.data(),
+                        value_dim * sizeof(float), cudaMemcpyHostToDevice, stream);
+                    if (e != cudaSuccess) throw std::runtime_error("copy layer-14 GDN core override failed");
+                    q38_float_to_half_kernel<<<(static_cast<int>(value_dim) + 255) / 256, 256, 0, stream>>>(
+                        hc_f32_scratch.residual(), st.gdn_scratch->core_out(), static_cast<int>(value_dim));
+                    q38_gdn_gated_rmsnorm_kernel<<<q.ssm_dt_rank, 256, 0, stream>>>(
+                        st.gdn_scratch->core_out(), layer.gdn_w->norm.data, st.gdn_scratch->z(),
+                        st.gdn_scratch->norm_out(), q.ssm_state_size, q.ssm_dt_rank, q.rms_eps);
+                    launch_matrix_gemv_half(
+                        layer.gdn_w->out, st.gdn_scratch->norm_out(), st.gdn_scratch->final_out(), stream);
+                    attn_out = st.gdn_scratch->final_out();
+                    trace->add_extended("layer14.gdn.core_output_cpu_f32",
+                        trace->debug_layer14_gdn_core_f32);
+                    trace->add_extended("layer14.gdn.norm_output_after_cpu_core_override",
+                        copy_half(stream, st.gdn_scratch->norm_out(), value_dim));
+                }
+                if (trace && trace->state_trace && il == 14 &&
+                    !trace->debug_layer14_gdn_norm_output_f32.empty()) {
+                    const size_t value_dim = static_cast<size_t>(q.ssm_state_size) * q.ssm_dt_rank;
+                    if (trace->debug_layer14_gdn_norm_output_f32.size() != value_dim) {
+                        throw std::runtime_error("layer-14 GDN norm output override is invalid");
+                    }
+                    trace->add_extended("layer14.gdn.norm_output_before_cpu_override",
+                        copy_half(stream, st.gdn_scratch->norm_out(), value_dim));
+                    trace->add_extended("layer14.attention_output_before_cpu_norm_override",
+                        copy_half(stream, attn_out, static_cast<size_t>(q.hidden)));
+                    const cudaError_t e = cudaMemcpyAsync(
+                        hc_f32_scratch.residual(), trace->debug_layer14_gdn_norm_output_f32.data(),
+                        value_dim * sizeof(float), cudaMemcpyHostToDevice, stream);
+                    if (e != cudaSuccess) throw std::runtime_error("copy layer-14 GDN norm output override failed");
+                    q38_float_to_half_kernel<<<(static_cast<int>(value_dim) + 255) / 256, 256, 0, stream>>>(
+                        hc_f32_scratch.residual(), st.gdn_scratch->norm_out(), static_cast<int>(value_dim));
+                    launch_matrix_gemv_half(
+                        layer.gdn_w->out, st.gdn_scratch->norm_out(), st.gdn_scratch->final_out(), stream);
+                    attn_out = st.gdn_scratch->final_out();
+                    trace->add_extended("layer14.gdn.norm_output_cpu_f32",
+                        trace->debug_layer14_gdn_norm_output_f32);
+                    trace->add_extended("layer14.gdn.norm_output_after_cpu_override",
+                        copy_half(stream, st.gdn_scratch->norm_out(), value_dim));
+                }
                 if (trace && trace->state_trace) {
                     trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " GDN after";
                     trace->add_state_summary("layer" + std::to_string(il) + ".gdn.recurrent_after",
                         copy_float(stream, st.gdn_state->state(), gdn_state_n),
                         {static_cast<uint64_t>(q.ssm_dt_rank), static_cast<uint64_t>(q.ssm_state_size),
                          static_cast<uint64_t>(q.ssm_state_size)});
+                    if (capture_full_gdn) {
+                        trace->add_extended("layer" + std::to_string(il) + ".gdn.recurrent_after_full",
+                            copy_float(stream, st.gdn_state->state(), gdn_state_n));
+                    }
                     trace->add_extended("layer" + std::to_string(il) + ".gdn.conv_after",
                         copy_half(stream, st.gdn_state->conv_state(), conv_state_n));
                     trace->add_state_summary("layer" + std::to_string(il) + ".gdn.conv_output",
@@ -481,6 +1679,56 @@ public:
                     trace->add_state_summary("layer" + std::to_string(il) + ".gdn.final_output",
                         copy_half(stream, st.gdn_scratch->final_out(), static_cast<size_t>(q.hidden)),
                         {static_cast<uint64_t>(q.hidden)});
+                    if (capture_full_gdn) {
+                        const std::string gdn_name = "layer" + std::to_string(il) + ".gdn.";
+                        const int key_dim = q.ssm_state_size * q.ssm_group_count;
+                        const int value_dim = q.ssm_state_size * q.ssm_dt_rank;
+                        const int conv_dim = key_dim * 2 + value_dim;
+                        const __half * conv = st.gdn_scratch->conv_out();
+                        trace->add_extended(gdn_name + "qkv_full",
+                            copy_half(stream, st.gdn_scratch->qkv(), static_cast<size_t>(conv_dim)));
+                        trace->add_extended(gdn_name + "conv_output_postnorm_full",
+                            copy_half(stream, conv, static_cast<size_t>(conv_dim)));
+                        trace->add_extended(gdn_name + "q_conv_postnorm",
+                            copy_half(stream, conv, static_cast<size_t>(key_dim)));
+                        trace->add_extended(gdn_name + "k_conv_postnorm",
+                            copy_half(stream, conv + key_dim, static_cast<size_t>(key_dim)));
+                        trace->add_extended(gdn_name + "v_conv",
+                            copy_half(stream, conv + key_dim * 2, static_cast<size_t>(value_dim)));
+                        trace->add_extended(gdn_name + "z_full",
+                            copy_half(stream, st.gdn_scratch->z(), static_cast<size_t>(value_dim)));
+                        trace->add_extended(gdn_name + "beta_full",
+                            copy_half(stream, st.gdn_scratch->beta(), static_cast<size_t>(q.ssm_dt_rank)));
+                        trace->add_extended(gdn_name + "alpha_full",
+                            copy_half(stream, st.gdn_scratch->alpha(), static_cast<size_t>(q.ssm_dt_rank)));
+                        trace->add_extended(gdn_name + "gate_full",
+                            copy_float(stream, st.gdn_scratch->gate(), static_cast<size_t>(q.ssm_dt_rank)));
+                        trace->add_extended(gdn_name + "core_output_full",
+                            copy_half(stream, st.gdn_scratch->core_out(), static_cast<size_t>(value_dim)));
+                        trace->add_extended(gdn_name + "norm_output_full",
+                            copy_half(stream, st.gdn_scratch->norm_out(), static_cast<size_t>(value_dim)));
+                        trace->add_extended(gdn_name + "final_output_full",
+                            copy_half(stream, st.gdn_scratch->final_out(), static_cast<size_t>(q.hidden)));
+                        // F32 twins of the GDN chain; the half mirrors above sit at
+                        // ~5e-4, i.e. above the error an error budget must resolve.
+                        if (st.gdn_scratch->qkv_f32() != nullptr) {
+                            trace->add_extended(gdn_name + "qkv_f32",
+                                copy_float(stream, st.gdn_scratch->qkv_f32(),
+                                    static_cast<size_t>(conv_dim)));
+                            trace->add_extended(gdn_name + "z_f32",
+                                copy_float(stream, st.gdn_scratch->z_f32(),
+                                    static_cast<size_t>(value_dim)));
+                            trace->add_extended(gdn_name + "conv_out_f32",
+                                copy_float(stream, st.gdn_scratch->conv_out_f32(),
+                                    static_cast<size_t>(conv_dim)));
+                            trace->add_extended(gdn_name + "norm_out_f32",
+                                copy_float(stream, st.gdn_scratch->norm_out_f32(),
+                                    static_cast<size_t>(value_dim)));
+                            trace->add_extended(gdn_name + "final_out_f32",
+                                copy_float(stream, st.gdn_scratch->final_out_f32(),
+                                    static_cast<size_t>(q.hidden)));
+                        }
+                    }
                 }
                 if (legacy_trace && il == 0) {
                     const int key_dim = q.ssm_state_size * q.ssm_group_count;
@@ -495,6 +1743,24 @@ public:
                     trace->gdn_norm_out = copy_half(stream, st.gdn_scratch->norm_out(), static_cast<size_t>(value_dim));
                 }
             }
+            if (trace && trace->state_trace && pos == trace->state_trace_position &&
+                il == trace->debug_attention_output_f32_layer &&
+                !trace->debug_attention_output_f32.empty()) {
+                if (trace->debug_attention_output_f32.size() != static_cast<size_t>(q.hidden)) {
+                    throw std::runtime_error("attention output override is invalid");
+                }
+                const std::string layer_name = "layer" + std::to_string(il) + ".attention_output";
+                trace->add_extended(layer_name + "_before_cpu_override",
+                    copy_half(stream, attn_out, static_cast<size_t>(q.hidden)));
+                const cudaError_t e = cudaMemcpyAsync(
+                    hc_f32_scratch.mixed(), trace->debug_attention_output_f32.data(),
+                    static_cast<size_t>(q.hidden) * sizeof(float), cudaMemcpyHostToDevice, stream);
+                if (e != cudaSuccess) throw std::runtime_error("copy attention output override failed");
+                q38_float_to_half_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.mixed(), attn_out, q.hidden);
+                ++trace->debug_attention_output_override_count;
+                trace->add_extended(layer_name + "_cpu_f32", trace->debug_attention_output_f32);
+            }
             if (trace && trace->state_trace) {
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " attention output";
                 trace->add_extended("layer" + std::to_string(il) + ".attention_output",
@@ -504,7 +1770,83 @@ public:
             if (trace && trace->extended_parity && il == 0) {
                 trace->add_extended("layer0.attn_out", trace->attn_out);
             }
-            run_qwen38_hc_combine(state_.residual(), attn_out, st.hc_attn, stream);
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_hc_inject_f32_layer &&
+                !trace->debug_hc_inject_f32.empty()) {
+                if (trace->debug_hc_inject_f32.size() != static_cast<size_t>(q.hc_count)) {
+                    throw std::runtime_error("HC inject override is invalid");
+                }
+                const std::string inject_name = "layer" + std::to_string(il) + ".hc_attn_inject";
+                trace->add_extended(inject_name + "_before_cpu_override",
+                    copy_half(stream, st.hc_attn.inject(), static_cast<size_t>(q.hc_count)));
+                std::vector<__half> injected(static_cast<size_t>(q.hc_count));
+                for (int i = 0; i < q.hc_count; ++i) {
+                    injected[static_cast<size_t>(i)] =
+                        __float2half(trace->debug_hc_inject_f32[static_cast<size_t>(i)]);
+                }
+                cudaError_t debug_error = cudaStreamSynchronize(stream);
+                if (debug_error != cudaSuccess) {
+                    throw std::runtime_error("sync before HC inject override failed");
+                }
+                debug_error = cudaMemcpy(
+                    st.hc_attn.inject(), injected.data(),
+                    injected.size() * sizeof(__half), cudaMemcpyHostToDevice);
+                if (debug_error != cudaSuccess) throw std::runtime_error("HC inject override failed");
+                ++trace->debug_hc_inject_override_count;
+                trace->add_extended(inject_name + "_cpu_f32", trace->debug_hc_inject_f32);
+                trace->add_extended(inject_name + "_after_cpu_override",
+                    copy_half(stream, st.hc_attn.inject(), static_cast<size_t>(q.hc_count)));
+            }
+            if (attn_out_f32 != nullptr) {
+                run_qwen38_hc_combine_f32_block_f32_inject(
+                    state_.residual(), attn_out_f32, hc_f32_scratch, stream,
+                    !q38_residual_f32_enabled());
+            } else if (attn_f32_inject) {
+                run_qwen38_hc_combine_f32_inject(state_.residual(), attn_out, hc_f32_scratch, stream,
+                    !q38_residual_f32_enabled());
+            } else {
+                run_qwen38_hc_combine(state_.residual(), attn_out, st.hc_attn, stream,
+                    !q38_residual_f32_enabled());
+            }
+            if (trace && trace->captures_state_position() &&
+                pos == trace->state_trace_position &&
+                il == trace->debug_hc_attn_combine_layer &&
+                !trace->debug_hc_attn_combine_f32.empty()) {
+                if (trace->debug_hc_attn_combine_f32.size() != static_cast<size_t>(hc_dim)) {
+                    throw std::runtime_error("HC attention combine override is invalid");
+                }
+                const std::string residual_name =
+                    "layer" + std::to_string(il) + ".after_attention_residual";
+                trace->add_extended(residual_name + "_before_cpu_override",
+                    copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+                const cudaError_t e = cudaMemcpyAsync(
+                    hc_f32_scratch.residual(), trace->debug_hc_attn_combine_f32.data(),
+                    static_cast<size_t>(hc_dim) * sizeof(float), cudaMemcpyHostToDevice, stream);
+                if (e != cudaSuccess) throw std::runtime_error("copy HC attention combine override failed");
+                q38_float_copy_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.residual(), state_.residual(), hc_dim);
+                ++trace->debug_hc_attn_combine_override_count;
+                trace->add_extended(residual_name + "_cpu_f32", trace->debug_hc_attn_combine_f32);
+                trace->add_extended(residual_name + "_after_cpu_override",
+                    copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+            }
+            if (trace && trace->state_trace && il == 8 &&
+                !trace->debug_layer8_after_attention_residual_f32.empty()) {
+                if (trace->debug_layer8_after_attention_residual_f32.size() != static_cast<size_t>(hc_dim)) {
+                    throw std::runtime_error("layer-8 after-attention residual override is invalid");
+                }
+                trace->add_extended("layer8.after_attention_residual_before_cpu_override",
+                    copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+                const cudaError_t e = cudaMemcpyAsync(
+                    hc_f32_scratch.residual(), trace->debug_layer8_after_attention_residual_f32.data(),
+                    static_cast<size_t>(hc_dim) * sizeof(float), cudaMemcpyHostToDevice, stream);
+                if (e != cudaSuccess) throw std::runtime_error("copy layer-8 after-attention residual override failed");
+                q38_float_copy_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.residual(), state_.residual(), hc_dim);
+                trace->add_extended("layer8.after_attention_residual_cpu_f32",
+                    trace->debug_layer8_after_attention_residual_f32);
+            }
             if (legacy_trace && il == 0) trace->after_attn = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
             if (trace && trace->state_trace) {
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " HC attention combine";
@@ -515,16 +1857,87 @@ public:
                 trace->add_extended("layer0.after_attn_hc_combine", trace->after_attn);
             }
 
-            cur = run_qwen38_hc_mix(
-                state_.residual(), layer.hc_ffn, st.hc_ffn, q.rms_eps, stream);
+            const bool debug_hc_q8_0_ffn = (debug_hc_q8_0_ffn_through >= 0 &&
+                il >= debug_hc_q8_0_ffn_from && il <= debug_hc_q8_0_ffn_through) ||
+                (q38_hc_q8_0_enabled() && q38_hc_q8_0_compatible(layer.hc_ffn));
+            const bool debug_f32_hc_ffn = (debug_f32_hc_ffn_0_8 && il <= 8) ||
+                                          (debug_f32_hc_ffn_layer8 && il == 8) ||
+                                          (debug_hc_q8_1_ffn_through >= 0 &&
+                                           il >= debug_hc_q8_1_ffn_from &&
+                                           il <= debug_hc_q8_1_ffn_through);
+            bool ffn_used_f32 = false;
+            bool ffn_f32_inject = false;
+            if (q38_hc_f32_enabled() && !debug_hc_q8_0_ffn && !debug_f32_hc_ffn) {
+                __half * f32_cur = run_qwen38_hc_mix_f32(
+                    state_.residual(), layer.hc_ffn, hc_f32_scratch, st.hc_ffn,
+                    q.rms_eps, stream);
+                if (f32_cur != nullptr) {
+                    cur = f32_cur;
+                    ffn_used_f32 = true;
+                }
+            }
+            if (!ffn_used_f32) {
+                cur = run_qwen38_hc_mix(
+                    state_.residual(), layer.hc_ffn, st.hc_ffn, q.rms_eps, stream);
+            }
+            if (debug_hc_q8_0_ffn) {
+                __half * inject_cur = run_qwen38_hc_mix_f32_with_inject(
+                    state_.residual(), layer.hc_ffn, hc_f32_scratch, st.hc_ffn, q.rms_eps, stream);
+                if (inject_cur != nullptr) {
+                    cur = inject_cur;
+                    ffn_f32_inject = true;
+                } else {
+                    run_qwen38_hc_q8_0_f32_mix_from_residual(
+                        state_.residual(), layer.hc_ffn, hc_f32_scratch, q.rms_eps, stream);
+                    const int blocks = (q.hidden + 255) / 256;
+                    q38_float_to_half_kernel<<<blocks, 256, 0, stream>>>(
+                        hc_f32_scratch.mixed(), st.hc_ffn.mixed(), q.hidden);
+                    cur = st.hc_ffn.mixed();
+                }
+            } else if (debug_f32_hc_ffn) {
+                if (layer.hc_ffn.debug_norm_f32.empty()) {
+                    throw std::runtime_error("F32 HC FFN replay weights unavailable for requested layer");
+                }
+                run_qwen38_hc_f32_mix_from_residual(
+                    state_.residual(), layer.hc_ffn, hc_f32_scratch, q.rms_eps, stream);
+                const int blocks = (q.hidden + 255) / 256;
+                q38_float_to_half_kernel<<<blocks, 256, 0, stream>>>(
+                    hc_f32_scratch.mixed(), st.hc_ffn.mixed(), q.hidden);
+                cur = st.hc_ffn.mixed();
+            }
+            if (trace && trace->state_trace && il == 8 &&
+                !trace->debug_layer8_hc_ffn_mix_f32.empty()) {
+                if (trace->debug_layer8_hc_ffn_mix_f32.size() != static_cast<size_t>(q.hidden)) {
+                    throw std::runtime_error("layer-8 HC FFN mix override is invalid");
+                }
+                trace->add_extended("layer8.hc_ffn_mix_before_cpu_override",
+                    copy_half(stream, cur, static_cast<size_t>(q.hidden)));
+                const cudaError_t e = cudaMemcpyAsync(
+                    hc_f32_scratch.mixed(), trace->debug_layer8_hc_ffn_mix_f32.data(),
+                    static_cast<size_t>(q.hidden) * sizeof(float), cudaMemcpyHostToDevice, stream);
+                if (e != cudaSuccess) throw std::runtime_error("copy layer-8 HC FFN mix override failed");
+                q38_float_to_half_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                    hc_f32_scratch.mixed(), st.hc_ffn.mixed(), q.hidden);
+                cur = st.hc_ffn.mixed();
+                trace->add_extended("layer8.hc_ffn_mix_cpu_f32", trace->debug_layer8_hc_ffn_mix_f32);
+            }
             if (trace && trace->state_trace) {
+                const bool trace_hc_ffn_f32 = debug_f32_hc_ffn || debug_hc_q8_0_ffn;
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_ffn_norm";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_ffn_norm",
-                    copy_half(stream, st.hc_ffn.xn(), static_cast<size_t>(hc_dim)));
+                    trace_hc_ffn_f32
+                        ? copy_float(stream, hc_f32_scratch.norm(), static_cast<size_t>(hc_dim))
+                        : copy_half(stream, st.hc_ffn.xn(), static_cast<size_t>(hc_dim)));
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_ffn_gate";
                 trace->add_extended("layer" + std::to_string(il) + ".hc_ffn_gate",
-                    copy_half(stream, st.hc_ffn.gate(), static_cast<size_t>(hc_dim)));
+                    trace_hc_ffn_f32
+                        ? copy_float(stream, hc_f32_scratch.gate(), static_cast<size_t>(hc_dim))
+                        : copy_half(stream, st.hc_ffn.gate(), static_cast<size_t>(hc_dim)));
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_ffn_mix";
+                if (ffn_f32_inject && hc_f32_scratch.hidden() == q.hidden) {
+                    trace->add_extended("layer" + std::to_string(il) + ".hc_ffn_mix_f32",
+                        copy_float(stream, hc_f32_scratch.mixed(), static_cast<size_t>(q.hidden)));
+                }
                 trace->add_extended("layer" + std::to_string(il) + ".hc_ffn_mix",
                     copy_half(stream, cur, static_cast<size_t>(q.hidden)));
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + ".hc_ffn_inject";
@@ -536,17 +1949,102 @@ public:
                 trace->add_extended("layer0.hc_mixed", trace->hc_ffn_mix);
             }
 
-            const bool experts_preselected = f32_layer0_router_preselected && il == 0;
+            bool experts_preselected = f32_layer0_router_preselected && il == 0;
+            Qwen38Trace * debug_trace = active_trace_;
+            const Qwen38MoeRouteOverride * route_override = nullptr;
+            if (debug_trace && il == 8) {
+                for (const auto & candidate : debug_trace->debug_moe_routes) {
+                    if (candidate.position == pos) {
+                        route_override = &candidate;
+                        break;
+                    }
+                }
+            }
+            const bool single_position_route_override = debug_trace && debug_trace->state_trace &&
+                il == 8 && pos == debug_trace->state_trace_position && !debug_trace->debug_moe_ids.empty();
+            if (route_override || single_position_route_override) {
+                const std::vector<int> & override_ids = route_override
+                    ? route_override->expert_ids : debug_trace->debug_moe_ids;
+                const std::vector<float> * override_weights = route_override
+                    ? (route_override->weights.empty() ? nullptr : &route_override->weights)
+                    : (debug_trace->debug_moe_weights.empty() ? nullptr : &debug_trace->debug_moe_weights);
+                if (override_ids.size() != static_cast<size_t>(q.experts_used) ||
+                    (override_weights && override_weights->size() != static_cast<size_t>(q.experts_used))) {
+                    throw std::runtime_error("debug MoE override count does not match selected expert count");
+                }
+                q38_select_experts(layer.router, cur, st.moe, q.expert_weights_scale, stream);
+                for (int j = 0; j < q.experts_used; ++j) {
+                    const int expert = override_ids[static_cast<size_t>(j)];
+                    if (expert < 0 || expert >= q.experts) {
+                        throw std::runtime_error("invalid debug MoE override");
+                    }
+                    for (int prior = 0; prior < j; ++prior) {
+                        if (override_ids[static_cast<size_t>(prior)] == expert) {
+                            throw std::runtime_error("duplicate expert in debug MoE override");
+                        }
+                    }
+                    st.moe.h_ids()[j] = expert;
+                    if (override_weights) {
+                        const float weight = (*override_weights)[static_cast<size_t>(j)];
+                        if (!std::isfinite(weight)) throw std::runtime_error("invalid debug MoE weight");
+                        st.moe.h_weights()[j] = weight;
+                    }
+                }
+                if (!override_weights) {
+                    const std::vector<float> logits = copy_float(
+                        stream, st.moe.d_logits(), static_cast<size_t>(q.experts));
+                    float max_logit = -std::numeric_limits<float>::infinity();
+                    for (int expert : override_ids) {
+                        max_logit = std::max(max_logit, logits[static_cast<size_t>(expert)]);
+                    }
+                    float sum = 0.0f;
+                    for (int j = 0; j < q.experts_used; ++j) {
+                        const int expert = override_ids[static_cast<size_t>(j)];
+                        const float weight = std::exp(logits[static_cast<size_t>(expert)] - max_logit);
+                        st.moe.h_weights()[j] = weight;
+                        sum += weight;
+                    }
+                    const float scale = sum > 0.0f ? q.expert_weights_scale / sum : 0.0f;
+                    for (int j = 0; j < q.experts_used; ++j) st.moe.h_weights()[j] *= scale;
+                }
+                experts_preselected = true;
+                ++debug_trace->debug_moe_route_override_count;
+            }
 
             __half * selected_output_trace = nullptr;
-            if (trace && trace->extended_parity && il == 0) {
+            if (trace && (trace->state_trace || (trace->extended_parity && il == 0))) {
                 selected_output_trace = st.moe.selected_output_trace();
             }
+            // F32 MoE: the routed sum, the shared expert and the MoE branch stay
+            // unrounded; the half buffer is refreshed only so the traces and the
+            // legacy consumers keep their meaning.
+            // Input-only F32 switch: the expert/router/shared-expert activations
+            // are read from the unrounded HC mix row (the same rule the GDN and
+            // QSA paths follow), while the output contract stays the legacy one so
+            // the combine keeps consuming d_accum / d_down.
+            const bool ffn_f32_row_valid = ffn_used_f32 || ffn_f32_inject ||
+                debug_hc_q8_0_ffn || debug_f32_hc_ffn;
+            const bool moe_f32_in = q38_moe_f32_mid_enabled() && ffn_f32_row_valid;
+            const bool moe_f32_mid = q38_moe_f32_out_opt_in() && moe_f32_in &&
+                st.moe.moe_out_f32() != nullptr;
+            float * moe_out_f32 = nullptr;
             if (rt_.fused_experts) {
                 if (!layer.routed.gate_up || !layer.routed.down) {
                     throw std::runtime_error("Qwen3.8 fused expert tensor set is incomplete");
                 }
-                if (selected_output_trace) {
+                if (moe_f32_in && selected_output_trace) {
+                    run_qwen38_routed_moe_fused_f32_x<true>(
+                        il, hc_f32_scratch.mixed(), layer.router,
+                        *layer.routed.gate_up, *layer.routed.down,
+                        rt_.fused_expert_cache, st.moe, st.moe.d_accum(),
+                        q.expert_weights_scale, stream, experts_preselected, selected_output_trace);
+                } else if (moe_f32_in) {
+                    run_qwen38_routed_moe_fused_f32_x<false>(
+                        il, hc_f32_scratch.mixed(), layer.router,
+                        *layer.routed.gate_up, *layer.routed.down,
+                        rt_.fused_expert_cache, st.moe, st.moe.d_accum(),
+                        q.expert_weights_scale, stream, experts_preselected);
+                } else if (selected_output_trace) {
                     run_qwen38_routed_moe_fused<true>(
                         il, cur, layer.router,
                         *layer.routed.gate_up, *layer.routed.down,
@@ -563,7 +2061,19 @@ public:
                 if (!layer.routed.gate || !layer.routed.up || !layer.routed.down) {
                     throw std::runtime_error("Qwen3.8 expert tensor set is incomplete");
                 }
-                if (selected_output_trace) {
+                if (moe_f32_in && selected_output_trace) {
+                    run_qwen38_routed_moe_separate_f32_x<true>(
+                        il, hc_f32_scratch.mixed(), layer.router,
+                        *layer.routed.gate, *layer.routed.up, *layer.routed.down,
+                        rt_.expert_cache, st.moe, st.moe.d_accum(),
+                        q.expert_weights_scale, stream, experts_preselected, selected_output_trace);
+                } else if (moe_f32_in) {
+                    run_qwen38_routed_moe_separate_f32_x<false>(
+                        il, hc_f32_scratch.mixed(), layer.router,
+                        *layer.routed.gate, *layer.routed.up, *layer.routed.down,
+                        rt_.expert_cache, st.moe, st.moe.d_accum(),
+                        q.expert_weights_scale, stream, experts_preselected);
+                } else if (selected_output_trace) {
                     run_qwen38_routed_moe_separate<true>(
                         il, cur, layer.router,
                         *layer.routed.gate, *layer.routed.up, *layer.routed.down,
@@ -575,6 +2085,116 @@ public:
                         *layer.routed.gate, *layer.routed.up, *layer.routed.down,
                         rt_.expert_cache, st.moe, st.moe_out,
                         q.expert_weights_scale, stream, experts_preselected);
+                }
+            }
+            if (trace && trace->state_trace) {
+                trace->add_extended("layer" + std::to_string(il) + ".ffn.selected_expert_outputs",
+                    copy_half(stream, selected_output_trace,
+                        static_cast<size_t>(q.experts_used) * q.hidden));
+            }
+            if (trace && trace->state_trace) {
+                const std::string layer_name = "layer" + std::to_string(il) + ".ffn";
+                trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " MoE router";
+                if (il == 8) {
+                    trace->add_extended(layer_name + ".router_input",
+                        copy_half(stream, cur, static_cast<size_t>(q.hidden)));
+                }
+                trace->add_extended(layer_name + ".router_logits",
+                    copy_float(stream, st.moe.d_logits(), static_cast<size_t>(q.experts)));
+                std::vector<int64_t> expert_ids;
+                std::vector<float> expert_weights;
+                expert_ids.reserve(static_cast<size_t>(q.experts_used));
+                expert_weights.reserve(static_cast<size_t>(q.experts_used));
+                for (int j = 0; j < q.experts_used; ++j) {
+                    expert_ids.push_back(st.moe.h_ids()[j]);
+                    expert_weights.push_back(st.moe.h_weights()[j]);
+                }
+                trace->add_integer_vector(layer_name + ".expert_ids", std::move(expert_ids));
+                trace->add_extended(layer_name + ".expert_weights", std::move(expert_weights));
+                trace->add_extended(layer_name + ".ffn_moe_out",
+                    copy_half(stream, st.moe_out, static_cast<size_t>(q.hidden)));
+            }
+            if (trace && trace->captures_state_position() && il == 8 &&
+                !trace->debug_router_cpu_activation_f32.empty()) {
+                if (trace->debug_router_cpu_activation_f32.size() != static_cast<size_t>(q.hidden)) {
+                    throw std::runtime_error("CPU router activation size does not match hidden size");
+                }
+                const std::vector<float> warp_activation = copy_half(
+                    stream, cur, static_cast<size_t>(q.hidden));
+                const std::vector<float> router_weights = decode_router_weights(*layer.routed.router);
+                const std::vector<float> cpu_reference_logits = deterministic_router_logits(
+                    router_weights, trace->debug_router_cpu_activation_f32, q.experts, q.hidden);
+                const std::vector<float> warp_reference_logits = deterministic_router_logits(
+                    router_weights, warp_activation, q.experts, q.hidden);
+                trace->add_extended("layer8.router_cross.cpu_activation_reference_logits",
+                    cpu_reference_logits);
+                trace->add_extended("layer8.router_cross.warp_activation_reference_logits",
+                    warp_reference_logits);
+                trace->add_extended("layer8.router_cross.warp_activation_warp_cuda_logits",
+                    copy_float(stream, st.moe.d_logits(), static_cast<size_t>(q.experts)));
+
+                const cudaError_t input_copy = cudaMemcpyAsync(
+                    hc_f32_scratch.embedding(), trace->debug_router_cpu_activation_f32.data(),
+                    static_cast<size_t>(q.hidden) * sizeof(float), cudaMemcpyHostToDevice, stream);
+                if (input_copy != cudaSuccess) {
+                    throw std::runtime_error("copy CPU router activation for CUDA cross failed");
+                }
+                launch_matrix_gemv_f32_input(
+                    layer.router, hc_f32_scratch.embedding(), st.moe.d_logits(), stream);
+                trace->add_extended("layer8.router_cross.cpu_activation_warp_cuda_logits",
+                    copy_float(stream, st.moe.d_logits(), static_cast<size_t>(q.experts)));
+
+                const cudaError_t warp_input_copy = cudaMemcpyAsync(
+                    hc_f32_scratch.embedding(), warp_activation.data(),
+                    static_cast<size_t>(q.hidden) * sizeof(float), cudaMemcpyHostToDevice, stream);
+                if (warp_input_copy != cudaSuccess) {
+                    throw std::runtime_error("copy Warp router activation for CUDA cross failed");
+                }
+                launch_matrix_gemv_f32_input(
+                    layer.router, hc_f32_scratch.embedding(), st.moe.d_logits(), stream);
+                trace->add_extended("layer8.router_cross.warp_activation_warp_cuda_f32_input_logits",
+                    copy_float(stream, st.moe.d_logits(), static_cast<size_t>(q.experts)));
+            }
+            Qwen38Trace * moe_output_override = active_trace_;
+            const size_t routed_output_count = moe_output_override &&
+                moe_output_override->debug_routed_moe_output_all_positions
+                ? moe_output_override->debug_routed_moe_output.size() / static_cast<size_t>(q.hidden) : 0;
+            const bool all_position_routed_output_override = moe_output_override &&
+                moe_output_override->debug_routed_moe_output_all_positions &&
+                il == moe_output_override->debug_routed_moe_output_layer &&
+                pos < static_cast<int>(routed_output_count);
+            const bool selected_routed_output_override = trace && trace->captures_state_position() &&
+                il == trace->debug_routed_moe_output_layer &&
+                !trace->debug_routed_moe_output.empty() &&
+                !trace->debug_routed_moe_output_all_positions;
+            if (all_position_routed_output_override || selected_routed_output_override) {
+                if (moe_output_override->debug_routed_moe_output.size() % static_cast<size_t>(q.hidden) != 0 ||
+                    (!moe_output_override->debug_routed_moe_output_all_positions &&
+                     moe_output_override->debug_routed_moe_output.size() != static_cast<size_t>(q.hidden))) {
+                    throw std::runtime_error("debug routed MoE output has an invalid size");
+                }
+                const size_t offset = moe_output_override->debug_routed_moe_output_all_positions
+                    ? static_cast<size_t>(pos) * q.hidden : 0;
+                std::vector<__half> injected(static_cast<size_t>(q.hidden));
+                for (int i = 0; i < q.hidden; ++i) {
+                    injected[static_cast<size_t>(i)] =
+                        __float2half(moe_output_override->debug_routed_moe_output[offset +
+                            static_cast<size_t>(i)]);
+                }
+                cudaError_t debug_error = cudaStreamSynchronize(stream);
+                if (debug_error != cudaSuccess) throw std::runtime_error("sync before routed MoE output injection failed");
+                debug_error = cudaMemcpy(st.moe_out, injected.data(), injected.size() * sizeof(__half),
+                    cudaMemcpyHostToDevice);
+                if (debug_error != cudaSuccess) throw std::runtime_error("routed MoE output injection failed");
+                ++moe_output_override->debug_routed_moe_output_override_count;
+                if (trace && trace->captures_state_position()) {
+                    std::vector<float> injected_values(
+                        moe_output_override->debug_routed_moe_output.begin() +
+                            static_cast<std::ptrdiff_t>(offset),
+                        moe_output_override->debug_routed_moe_output.begin() +
+                            static_cast<std::ptrdiff_t>(offset + static_cast<size_t>(q.hidden)));
+                    trace->add_extended("layer" + std::to_string(il) + ".ffn_moe_out_cpu_override",
+                        injected_values);
                 }
             }
             if (legacy_trace && il == 0) {
@@ -610,11 +2230,72 @@ public:
                 }
             }
 
-            run_qwen38_shared_expert(cur, layer.shared, st.moe, st.moe_out, stream);
+            if (moe_f32_in) {
+                run_qwen38_shared_expert_f32_x(hc_f32_scratch.mixed(), layer.shared, st.moe, stream);
+                // Keep the legacy output contract: mirror the routed sum into the
+                // half buffer and add the shared expert there, exactly like the
+                // F16 path does, so the traces and the combine are unchanged.
+                q38_float_to_half_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                    st.moe.d_accum(), st.moe_out, q.hidden);
+                q38_float_to_half_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                    st.moe.down_f32(), st.moe.d_down(), q.hidden);
+                q38_add_shared_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
+                    st.moe_out, st.moe.d_down(), st.moe.d_shared_gate(), q.hidden);
+                if (moe_f32_mid) {
+                    q38_finish_moe_f32(st.moe, st.moe.moe_out_f32(), stream);
+                    moe_out_f32 = st.moe.moe_out_f32();
+                }
+            } else {
+                run_qwen38_shared_expert(cur, layer.shared, st.moe, st.moe_out, stream);
+            }
+            if (trace && trace->state_trace && il == trace->debug_ffn_output_layer &&
+                pos == trace->state_trace_position &&
+                !trace->debug_ffn_output.empty()) {
+                if (trace->debug_ffn_output.size() != static_cast<size_t>(q.hidden)) {
+                    throw std::runtime_error("debug FFN output size does not match hidden size");
+                }
+                std::vector<__half> injected(q.hidden);
+                for (int i = 0; i < q.hidden; ++i) {
+                    injected[static_cast<size_t>(i)] = __float2half(trace->debug_ffn_output[static_cast<size_t>(i)]);
+                }
+                cudaError_t debug_error = cudaStreamSynchronize(stream);
+                if (debug_error != cudaSuccess) throw std::runtime_error("sync before debug FFN output injection failed");
+                debug_error = cudaMemcpy(st.moe_out, injected.data(), injected.size() * sizeof(__half), cudaMemcpyHostToDevice);
+                if (debug_error != cudaSuccess) throw std::runtime_error("debug FFN output injection failed");
+            }
             if (trace && trace->state_trace) {
+                const std::string layer_name = "layer" + std::to_string(il);
+                const std::vector<float> shared_output = copy_half(
+                    stream, st.moe.d_down(), static_cast<size_t>(q.hidden));
+                const std::vector<float> shared_gate = copy_float(stream, st.moe.d_shared_gate(), 1);
+                std::vector<float> shared_gated(shared_output.size());
+                std::transform(shared_output.begin(), shared_output.end(), shared_gated.begin(),
+                    [&](float value) { return value * shared_gate[0]; });
+                trace->add_extended(layer_name + ".ffn_shexp", shared_output);
+                trace->add_extended(layer_name + ".shared_expert_gate_sigmoid", shared_gate);
+                trace->add_extended(layer_name + ".ffn_shexp_gated", std::move(shared_gated));
+                // F32 twins of the MoE branch. The half mirrors above sit at ~5e-4,
+                // which is far above the 1e-4-level errors that actually drive the
+                // layer-to-layer drift, so an error budget needs these.
+                trace->add_extended(layer_name + ".ffn_routed_sum_f32",
+                    copy_float(stream, st.moe.d_accum(), static_cast<size_t>(q.hidden)));
+                if (st.moe.down_f32() != nullptr) {
+                    trace->add_extended(layer_name + ".ffn_shexp_f32",
+                        copy_float(stream, st.moe.down_f32(), static_cast<size_t>(q.hidden)));
+                }
+                trace->add_extended(layer_name + ".hc_ffn_inject_f32",
+                    copy_float(stream, hc_f32_scratch.inject(), static_cast<size_t>(q.hc_count)));
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " FFN output";
                 trace->add_extended("layer" + std::to_string(il) + ".ffn_output",
                     copy_half(stream, st.moe_out, static_cast<size_t>(q.hidden)));
+                if (moe_out_f32 != nullptr) {
+                    trace->add_extended("layer" + std::to_string(il) + ".ffn_output_f32",
+                        copy_float(stream, moe_out_f32, static_cast<size_t>(q.hidden)));
+                }
+                if (attn_out_f32 != nullptr) {
+                    trace->add_extended("layer" + std::to_string(il) + ".attention_out_f32",
+                        copy_float(stream, attn_out_f32, static_cast<size_t>(q.hidden)));
+                }
             }
             if (legacy_trace && il == 0) trace->ffn_out = copy_half(stream, st.moe_out, static_cast<size_t>(q.hidden));
             if (trace && trace->extended_parity && il == 0) {
@@ -629,12 +2310,81 @@ public:
                 trace->add_extended("layer0.shared_expert_weighted_output_f32", shared_weighted);
                 trace->add_extended("layer0.final_moe_output", trace->ffn_out);
             }
-            run_qwen38_hc_combine(state_.residual(), st.moe_out, st.hc_ffn, stream);
+            const bool moe_f32_boundary = q38_moe_f32_enabled() &&
+                !all_position_routed_output_override && !selected_routed_output_override &&
+                !(trace && trace->debug_ffn_output_layer == il &&
+                  !trace->debug_ffn_output.empty());
+            if (moe_f32_boundary) {
+                run_qwen38_hc_combine_moe_f32(
+                    state_.residual(), st.moe.d_accum(), st.moe.d_down(),
+                    st.moe.d_shared_gate(), st.hc_ffn, stream,
+                    !q38_residual_f32_enabled());
+            } else if (moe_out_f32 != nullptr && ffn_f32_inject) {
+                run_qwen38_hc_combine_f32_block_f32_inject(
+                    state_.residual(), moe_out_f32, hc_f32_scratch, stream,
+                    !q38_residual_f32_enabled());
+            } else if (ffn_f32_inject) {
+                run_qwen38_hc_combine_moe_f32_inject(
+                    state_.residual(), st.moe.d_accum(), st.moe.d_down(),
+                    st.moe.d_shared_gate(), hc_f32_scratch, stream,
+                    !q38_residual_f32_enabled());
+            } else {
+                run_qwen38_hc_combine(state_.residual(), st.moe_out, st.hc_ffn, stream,
+                    !q38_residual_f32_enabled());
+            }
+            Qwen38Trace * output_override = active_trace_;
+            const size_t all_position_count = output_override && output_override->debug_hc_residual_all_positions
+                ? output_override->debug_hc_residual.size() / static_cast<size_t>(hc_dim) : 0;
+            const bool all_position_output_override = output_override &&
+                output_override->debug_hc_residual_all_positions &&
+                il == output_override->debug_hc_residual_layer &&
+                pos < static_cast<int>(all_position_count);
+            const bool selected_output_override = trace && trace->captures_state_position() &&
+                il == trace->debug_hc_residual_layer && !trace->debug_hc_residual.empty() &&
+                !trace->debug_hc_residual_all_positions;
+            if (all_position_output_override || selected_output_override) {
+                const size_t expected_size = output_override->debug_hc_residual_all_positions
+                    ? all_position_count * static_cast<size_t>(hc_dim) : static_cast<size_t>(hc_dim);
+                if (output_override->debug_hc_residual.size() != expected_size) {
+                    throw std::runtime_error("debug HC residual output has an invalid size");
+                }
+                const std::string residual_name = "layer" + std::to_string(il) + ".output";
+                if (trace && trace->captures_state_position()) {
+                    trace->add_extended(residual_name + "_before_cpu_override",
+                        copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+                }
+                const size_t offset = output_override->debug_hc_residual_all_positions
+                    ? static_cast<size_t>(pos) * hc_dim : 0;
+                std::vector<float> injected(static_cast<size_t>(hc_dim));
+                for (int i = 0; i < hc_dim; ++i) {
+                    injected[static_cast<size_t>(i)] =
+                        output_override->debug_hc_residual[offset + static_cast<size_t>(i)];
+                }
+                cudaError_t debug_error = cudaStreamSynchronize(stream);
+                if (debug_error != cudaSuccess) throw std::runtime_error("sync before debug HC residual injection failed");
+                debug_error = cudaMemcpy(state_.residual(), injected.data(), injected.size() * sizeof(float), cudaMemcpyHostToDevice);
+                if (debug_error != cudaSuccess) throw std::runtime_error("debug HC residual injection failed");
+                ++output_override->debug_hc_output_override_count;
+                if (trace && trace->captures_state_position()) {
+                    std::vector<float> injected_values(
+                        output_override->debug_hc_residual.begin() + static_cast<std::ptrdiff_t>(offset),
+                        output_override->debug_hc_residual.begin() +
+                            static_cast<std::ptrdiff_t>(offset + static_cast<size_t>(hc_dim)));
+                    trace->add_extended(residual_name + "_cpu_f32", injected_values);
+                    trace->add_extended(residual_name + "_after_cpu_override",
+                        copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+                }
+            }
             if (legacy_trace && il == 0) trace->after_ffn = copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim));
             if (trace && trace->state_trace) {
                 trace_context_ = "position " + std::to_string(pos) + " layer " + std::to_string(il) + " layer output";
                 trace->add_extended("layer" + std::to_string(il) + ".output",
                     copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+                // Unrounded residual: the half mirror above hides every error below
+                // its own rounding (~5e-4), which is exactly the range that decides
+                // whether the next layer's Q8_0 activation codes match the CPU.
+                trace->add_extended("layer" + std::to_string(il) + ".output_f32",
+                    copy_float(stream, state_.residual(), static_cast<size_t>(hc_dim)));
             }
             if (trace && trace->extended_parity && il == 0) {
                 trace->add_extended("layer0.hc_ffn_combine_residual", trace->after_ffn);
@@ -642,13 +2392,77 @@ public:
             }
         }
 
-        __half * head = run_qwen38_hc_mix(
-            state_.residual(), rt_.hc_head, state_.head_hc(), q.rms_eps, stream);
+        if (trace && trace->state_trace && !trace->debug_final_residual_f32.empty()) {
+            if (trace->debug_final_residual_f32.size() != static_cast<size_t>(hc_dim)) {
+                throw std::runtime_error("final residual override is invalid");
+            }
+            trace->add_extended("final.residual_before_cpu_override",
+                copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+            const cudaError_t e = cudaMemcpyAsync(
+                hc_f32_scratch_.residual(), trace->debug_final_residual_f32.data(),
+                static_cast<size_t>(hc_dim) * sizeof(float), cudaMemcpyHostToDevice, stream);
+            if (e != cudaSuccess) throw std::runtime_error("copy final residual override failed");
+            q38_float_copy_kernel<<<(hc_dim + 255) / 256, 256, 0, stream>>>(
+                hc_f32_scratch_.residual(), state_.residual(), hc_dim);
+            trace->add_extended("final.residual_cpu_f32", trace->debug_final_residual_f32);
+            trace->add_extended("final.residual_after_cpu_override",
+                copy_half(stream, state_.residual(), static_cast<size_t>(hc_dim)));
+        }
+        __half * head = nullptr;
+        float * head_f32 = nullptr;
+        const bool debug_f32_hc_head = trace && trace->state_trace && trace->debug_f32_hc_head;
+        if (debug_f32_hc_head) {
+            if (rt_.hc_head.debug_norm_f32.empty()) {
+                throw std::runtime_error("F32 HC head replay weights unavailable");
+            }
+            run_qwen38_hc_f32_mix_from_residual(
+                state_.residual(), rt_.hc_head, hc_f32_scratch_, q.rms_eps, stream);
+            const int blocks = (q.hidden + 255) / 256;
+            q38_float_to_half_kernel<<<blocks, 256, 0, stream>>>(
+                hc_f32_scratch_.mixed(), state_.head_hc().mixed(), q.hidden);
+            head = state_.head_hc().mixed();
+        } else {
+            head = run_qwen38_hc_mix_f32(
+                state_.residual(), rt_.hc_head, hc_f32_scratch_, state_.head_hc(),
+                q.rms_eps, stream);
+            if (head != nullptr) head_f32 = hc_f32_scratch_.mixed();
+            if (head == nullptr) {
+                head = run_qwen38_hc_mix(
+                    state_.residual(), rt_.hc_head, state_.head_hc(), q.rms_eps, stream);
+            }
+        }
         if (trace && trace->state_trace) {
+            trace->add_extended("final.hc_gamma_half",
+                copy_half(stream, rt_.hc_head.norm.data, static_cast<size_t>(hc_dim)));
+            if (!rt_.hc_head.debug_norm_f32.empty()) {
+                trace->add_extended("final.hc_gamma_f32", rt_.hc_head.debug_norm_f32);
+            }
+            trace->add_extended("final.hc_norm",
+                debug_f32_hc_head
+                    ? copy_float(stream, hc_f32_scratch_.norm(), static_cast<size_t>(hc_dim))
+                    : copy_half(stream, state_.head_hc().xn(), static_cast<size_t>(hc_dim)));
+            trace->add_extended("final.hc_gate",
+                debug_f32_hc_head
+                    ? copy_float(stream, hc_f32_scratch_.gate(), static_cast<size_t>(hc_dim))
+                    : copy_half(stream, state_.head_hc().gate(), static_cast<size_t>(hc_dim)));
+            trace->add_extended("final.hc_mixed",
+                copy_half(stream, head, static_cast<size_t>(q.hidden)));
             trace_context_ = "position " + std::to_string(pos) + " final head input";
             trace->add_extended("final.head_input", copy_half(stream, head, static_cast<size_t>(q.hidden)));
         }
-        launch_lowbit_gemv_float(rt_.output, head, logits_, stream);
+        // Feed the head GEMV the unrounded F32 HC mix when the F32 path produced
+        // it: the CPU quantises its F32 head input, and the half round trip would
+        // shift every Q8_K block scale.
+        const bool head_f32_input = [] {
+            const char * v = std::getenv("WARODECODE_HEAD_F32_IN");
+            return v == nullptr || v[0] == '\0' || v[0] != '0';
+        }();
+        if (head_f32_input && head_f32 != nullptr &&
+            lowbit_q6_k_head_q8_k_eligible(rt_.output)) {
+            launch_q6_k_head_gemv_q8_k_from_f32(rt_.output, head_f32, logits_, stream, 256);
+        } else {
+            launch_lowbit_gemv_float(rt_.output, head, logits_, stream);
+        }
         q38_argmax_kernel<<<1, 256, 0, stream>>>(
             logits_, rt_.vocab, next_token_, has_nonfinite_);
         if (trace && trace->state_trace) {
@@ -716,7 +2530,9 @@ public:
             (static_cast<int>(forced_input_tokens->size()) != steps || forced_input_tokens->front() != start_token)) {
             throw std::runtime_error("forced Qwen3.8 input tokens must match --generate and --start-token");
         }
+        active_trace_ = trace;
         clear();
+
 
         cudaEvent_t begin{}, end{};
         cudaError_t e = cudaEventCreate(&begin);
@@ -728,12 +2544,34 @@ public:
         }
 
         int token = start_token;
+        const bool debug_f32_hc_attn_0_8 = trace && trace->debug_f32_hc_attn_0_8;
+        const bool debug_f32_hc_ffn_0_8 = trace && trace->debug_f32_hc_ffn_0_8;
+        const bool debug_f32_hc_ffn_layer8 = trace && trace->debug_f32_hc_ffn_layer8;
+        const int debug_hc_q8_1_attn_from = trace
+            ? trace->debug_hc_q8_1_attn_from : 0;
+        const int debug_hc_q8_1_attn_through = trace
+            ? trace->debug_hc_q8_1_attn_through : -1;
+        const int debug_hc_q8_1_ffn_from = trace
+            ? trace->debug_hc_q8_1_ffn_from : 0;
+        const int debug_hc_q8_1_ffn_through = trace
+            ? trace->debug_hc_q8_1_ffn_through : -1;
+        const int debug_hc_q8_0_ffn_from = trace
+            ? trace->debug_hc_q8_0_ffn_from : 0;
+        const int debug_hc_q8_0_ffn_through = trace
+            ? trace->debug_hc_q8_0_ffn_through : -1;
         e = cudaEventRecord(begin, state_.stream());
         if (e != cudaSuccess) throw std::runtime_error("cudaEventRecord begin failed");
 
         for (int pos = 0; pos < steps; ++pos) {
             if (forced_input_tokens) token = (*forced_input_tokens)[static_cast<size_t>(pos)];
-            token = step(token, pos, trace && (trace->state_trace || pos == 0) ? trace : nullptr);
+            const bool capture = trace && (trace->state_trace
+                ? trace->state_trace_position < 0 || pos == trace->state_trace_position
+                : pos == 0);
+            token = step(token, pos, capture ? trace : nullptr,
+                debug_f32_hc_attn_0_8, debug_f32_hc_ffn_0_8, debug_f32_hc_ffn_layer8,
+                debug_hc_q8_1_attn_from, debug_hc_q8_1_attn_through,
+                debug_hc_q8_1_ffn_from, debug_hc_q8_1_ffn_through,
+                debug_hc_q8_0_ffn_from, debug_hc_q8_0_ffn_through);
             if (pos == 0 && first_top_logits && top_k > 0) {
                 *first_top_logits = top_logits(top_k);
             }
@@ -750,10 +2588,76 @@ public:
         cudaEventDestroy(begin);
         cudaEventDestroy(end);
         if (e != cudaSuccess) throw std::runtime_error("cudaEventElapsedTime failed");
+        active_trace_ = nullptr;
         return static_cast<double>(ms) / 1000.0;
     }
 
 private:
+    static std::vector<float> decode_router_weights(const TensorInfo & tensor) {
+        const size_t count = static_cast<size_t>(tensor.elements());
+        std::vector<float> values(count);
+        if (tensor.type == GgmlType::F32) {
+            std::memcpy(values.data(), tensor.data, count * sizeof(float));
+            return values;
+        }
+        if (tensor.type == GgmlType::F16) {
+            for (size_t i = 0; i < count; ++i) {
+                __half value;
+                std::memcpy(&value, tensor.data + i * sizeof(uint16_t), sizeof(uint16_t));
+                values[i] = __half2float(value);
+            }
+            return values;
+        }
+        if (tensor.type == GgmlType::BF16) {
+            for (size_t i = 0; i < count; ++i) {
+                uint16_t bits = 0;
+                std::memcpy(&bits, tensor.data + i * sizeof(uint16_t), sizeof(bits));
+                const uint32_t expanded = static_cast<uint32_t>(bits) << 16;
+                std::memcpy(&values[i], &expanded, sizeof(float));
+            }
+            return values;
+        }
+        if (tensor.type == GgmlType::Q8_0) {
+            const size_t blocks = count / 32;
+            if (count % 32 != 0) throw std::runtime_error("Q8_0 router width is not block aligned");
+            for (size_t block = 0; block < blocks; ++block) {
+                const uint8_t * raw = tensor.data + block * 34;
+                __half scale_half;
+                std::memcpy(&scale_half, raw, sizeof(uint16_t));
+                const float scale = __half2float(scale_half);
+                for (size_t i = 0; i < 32; ++i) {
+                    int8_t quantized = 0;
+                    std::memcpy(&quantized, raw + 2 + i, sizeof(quantized));
+                    values[block * 32 + i] = scale * static_cast<float>(quantized);
+                }
+            }
+            return values;
+        }
+        throw std::runtime_error("deterministic router reference does not support tensor type " +
+            std::to_string(static_cast<uint32_t>(tensor.type)));
+    }
+
+    static std::vector<float> deterministic_router_logits(
+            const std::vector<float> & weights,
+            const std::vector<float> & activation,
+            int experts,
+            int hidden) {
+        if (weights.size() != static_cast<size_t>(experts) * hidden ||
+            activation.size() != static_cast<size_t>(hidden)) {
+            throw std::runtime_error("deterministic router input geometry mismatch");
+        }
+        std::vector<float> logits(static_cast<size_t>(experts));
+        for (int expert = 0; expert < experts; ++expert) {
+            float sum = 0.0f;
+            const size_t row = static_cast<size_t>(expert) * hidden;
+            for (int i = 0; i < hidden; ++i) {
+                sum = std::fma(weights[row + static_cast<size_t>(i)], activation[static_cast<size_t>(i)], sum);
+            }
+            logits[static_cast<size_t>(expert)] = sum;
+        }
+        return logits;
+    }
+
     std::vector<float> copy_half(cudaStream_t stream, const __half * data, size_t n) {
         cudaError_t e = cudaStreamSynchronize(stream);
         if (e != cudaSuccess) throw std::runtime_error("sync Qwen3.8 trace stream failed");
@@ -784,6 +2688,12 @@ private:
         return out;
     }
 
+    // The persistent HC residual stream is F32; trace call sites that were
+    // written for a half residual still resolve through this overload.
+    std::vector<float> copy_half(cudaStream_t stream, const float * data, size_t n) {
+        return copy_float(stream, data, n);
+    }
+
     std::vector<int64_t> copy_ints(cudaStream_t stream, const int * data, size_t n) {
         if (n == 0) return {};
         cudaError_t e = cudaStreamSynchronize(stream);
@@ -799,6 +2709,8 @@ private:
 
     Qwen38Runtime & rt_;
     Qwen38DecodeState & state_;
+    Qwen38HcF32DebugScratch hc_f32_scratch_;
+    Qwen38Trace * active_trace_ = nullptr;
     float * logits_ = nullptr;
     int * next_token_ = nullptr;
     int * has_nonfinite_ = nullptr;

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 
 namespace wd {
 
@@ -52,6 +53,14 @@ inline Qwen38Tuning qwen38_tuning_for_gpu(int sm, int memory_mib) {
         t.ple_hot_cache_mib = 64;
         t.expert_cache_mib = 512;
         t.expert_prefetch_depth = 1;
+    }
+
+    // Diagnostic override: the cache holds roughly 1.7 layers at the 1536 MiB
+    // default, so the first eviction happens inside layer 2. Bumping it moves
+    // that boundary and makes cache-related divergence easy to spot.
+    if (const char * v = std::getenv("WARODECODE_EXPERT_CACHE_MIB")) {
+        const int mib = std::atoi(v);
+        if (mib > 0) t.expert_cache_mib = mib;
     }
 
     if (sm >= 90) t.ple_prefetch_rows = 64;

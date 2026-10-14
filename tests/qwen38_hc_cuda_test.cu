@@ -50,13 +50,15 @@ int main() {
     wd::Qwen38HcScratch scratch;
     scratch.initialize(hidden, hc, low_rank);
 
-    std::vector<__half> hres(hc_dim, __float2half(1.0f));
+    // The persistent HC residual stream is F32 since the Issue #1 precision work;
+    // only the block output remains F16.
+    std::vector<float> hres(hc_dim, 1.0f);
     std::vector<__half> hblock(hidden, __float2half(2.0f));
-    __half * dres = nullptr;
+    float * dres = nullptr;
     __half * dblock = nullptr;
-    ck(cudaMalloc(reinterpret_cast<void **>(&dres), hres.size() * sizeof(__half)), "alloc residual");
+    ck(cudaMalloc(reinterpret_cast<void **>(&dres), hres.size() * sizeof(float)), "alloc residual");
     ck(cudaMalloc(reinterpret_cast<void **>(&dblock), hblock.size() * sizeof(__half)), "alloc block");
-    ck(cudaMemcpy(dres, hres.data(), hres.size() * sizeof(__half), cudaMemcpyHostToDevice), "copy residual");
+    ck(cudaMemcpy(dres, hres.data(), hres.size() * sizeof(float), cudaMemcpyHostToDevice), "copy residual");
     ck(cudaMemcpy(dblock, hblock.data(), hblock.size() * sizeof(__half), cudaMemcpyHostToDevice), "copy block");
 
     __half * mixed = wd::run_qwen38_hc_mix(dres, w, scratch, 1e-6f, nullptr);
@@ -72,8 +74,8 @@ int main() {
     ck(cudaGetLastError(), "HC launch");
     ck(cudaDeviceSynchronize(), "HC sync");
 
-    ck(cudaMemcpy(hres.data(), dres, hres.size() * sizeof(__half), cudaMemcpyDeviceToHost), "copy residual back");
-    const float r0 = __half2float(hres[0]);
+    ck(cudaMemcpy(hres.data(), dres, hres.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy residual back");
+    const float r0 = hres[0];
     if (std::fabs(r0 - 3.0f) > 0.01f) {
         throw std::runtime_error("HC combine mismatch: " + std::to_string(r0));
     }

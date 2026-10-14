@@ -4,3 +4,10 @@ __pycache__/
 CMakeFiles/
 CMakeCache.txt
 compile_commands.json
+
+# 開発用・検証用のローカル成果物 (トレース、ベンチ出力、エディタ補助)
+.serena/
+.venv/
+issue1_artifacts/
+*.zip
+*.webp

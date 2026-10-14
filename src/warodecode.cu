@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -65,9 +66,98 @@ struct Args {
     bool autotune = true;
     bool load_only = false;
     bool debug_f32_hc_layer0 = false;
+    bool debug_f32_hc_attn_0_8 = false;
+    bool debug_f32_hc_ffn_0_8 = false;
+    bool debug_f32_hc_ffn_layer8 = false;
+    int debug_hc_q8_1_attn_from = 0;
+    int debug_hc_q8_1_attn_through = -1;
+    int debug_hc_q8_1_ffn_from = 0;
+    int debug_hc_q8_1_ffn_through = -1;
+    int debug_hc_q8_0_ffn_from = 0;
+    int debug_hc_q8_0_ffn_through = -1;
+    bool debug_f32_hc_head = false;
+    bool debug_layer0_hc_gate_f32_store = false;
+    bool debug_layer0_hc_gate_f32_sigmoid = false;
+    int debug_hc_gate_q8_0_layer = -1;
+    int debug_hc_full_q8_0_layer = -1;
+    int debug_qsa_q8_0_layer = -1;
+    int debug_qsa_v_q8_0_layer = -1;
+    int debug_hc_norm_f32_layer = -1;
+    std::string debug_hc_norm_f32_file;
+    std::vector<float> debug_hc_norm_f32;
+    int debug_attention_output_f32_layer = -1;
+    std::string debug_attention_output_f32_file;
+    std::vector<float> debug_attention_output_f32;
+    int debug_attention_input_f32_layer = -1;
+    std::string debug_attention_input_f32_file;
+    std::vector<float> debug_attention_input_f32;
+    int debug_qsa_context_f32_layer = -1;
+    std::string debug_qsa_context_f32_file;
+    std::vector<float> debug_qsa_context_f32;
+    int debug_qsa_pregate_f32_layer = -1;
+    std::string debug_qsa_pregate_f32_file;
+    std::vector<float> debug_qsa_pregate_f32;
+    int debug_qsa_query_f32_layer = -1;
+    std::string debug_qsa_query_f32_file;
+    std::vector<float> debug_qsa_query_f32;
+    int debug_qsa_key_store_f32_layer = -1;
+    std::string debug_qsa_key_store_f32_file;
+    std::vector<float> debug_qsa_key_store_f32;
+    int debug_qsa_value_store_f32_layer = -1;
+    std::string debug_qsa_value_store_f32_file;
+    std::vector<float> debug_qsa_value_store_f32;
+    int debug_qsa_key_cache_prefix_f32_layer = -1;
+    std::string debug_qsa_key_cache_prefix_f32_file;
+    std::vector<float> debug_qsa_key_cache_prefix_f32;
+    int debug_qsa_value_cache_prefix_f32_layer = -1;
+    std::string debug_qsa_value_cache_prefix_f32_file;
+    std::vector<float> debug_qsa_value_cache_prefix_f32;
+    int debug_hc_attn_combine_layer = -1;
+    std::string debug_hc_attn_combine_f32_file;
+    std::vector<float> debug_hc_attn_combine_f32;
+    int debug_hc_inject_f32_layer = -1;
+    std::string debug_hc_inject_f32_file;
+    std::vector<float> debug_hc_inject_f32;
+    int debug_layer_input_residual_layer = -1;
+    std::string debug_layer_input_residual_f32_file;
+    std::vector<float> debug_layer_input_residual_f32;
+    std::string debug_layer8_after_attention_residual_f32_file;
+    std::vector<float> debug_layer8_after_attention_residual_f32;
+    std::string debug_layer8_hc_ffn_mix_f32_file;
+    std::vector<float> debug_layer8_hc_ffn_mix_f32;
+    std::string debug_layer8_output_f32_file;
+    int debug_layer8_output_layer = 8;
+    std::string debug_layer_output_all_positions_f32_file;
+    std::vector<float> debug_layer_output_all_positions_f32;
+    std::string debug_final_residual_f32_file;
+    std::vector<float> debug_final_residual_f32;
+    std::string debug_layer14_gdn_core_f32_file;
+    std::vector<float> debug_layer14_gdn_core_f32;
+    std::string debug_layer14_gdn_norm_output_f32_file;
+    std::vector<float> debug_layer14_gdn_norm_output_f32;
+    std::string debug_layer9_gdn_state_f32_file;
+    std::vector<float> debug_layer9_gdn_state_f32;
+    int debug_layer9_gdn_state_layer = 9;
+    std::string debug_layer9_gdn_conv_state_f32_file;
+    std::vector<float> debug_layer9_gdn_conv_state_f32;
+    int debug_layer9_gdn_conv_state_layer = 9;
     std::string extended_parity_trace;
     std::string state_trace_path;
     std::vector<int> forced_input_tokens;
+    std::vector<int> debug_moe_ids;
+    std::vector<float> debug_moe_weights;
+    std::string debug_moe_routes_file;
+    std::vector<wd::Qwen38MoeRouteOverride> debug_moe_routes;
+    std::string debug_router_cpu_activation_f32_file;
+    std::vector<float> debug_router_cpu_activation_f32;
+    std::string debug_routed_moe_output_f32_file;
+    std::vector<float> debug_routed_moe_output;
+    std::string debug_routed_moe_output_all_positions_f32_file;
+    std::vector<float> debug_routed_moe_output_all_positions;
+    int debug_ffn_output_layer = 8;
+    std::vector<float> debug_ffn_output;
+    std::vector<float> debug_hc_residual;
+    int state_trace_position = -1;
 };
 
 static std::vector<int> parse_token_ids(const std::string & value) {
@@ -83,6 +173,89 @@ static std::vector<int> parse_token_ids(const std::string & value) {
         ids.push_back(id);
     }
     return ids;
+}
+
+static std::vector<float> parse_float_values(const std::string & value) {
+    if (value.empty() || value.back() == ',') throw std::runtime_error("invalid float list");
+    std::stringstream stream(value);
+    std::vector<float> values;
+    std::string part;
+    while (std::getline(stream, part, ',')) {
+        if (part.empty()) throw std::runtime_error("invalid float list");
+        size_t consumed = 0;
+        const float parsed = std::stof(part, &consumed);
+        if (consumed != part.size() || !std::isfinite(parsed)) throw std::runtime_error("invalid float list");
+        values.push_back(parsed);
+    }
+    return values;
+}
+
+static std::vector<float> read_f32_file(const std::string & path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) throw std::runtime_error("cannot open F32 vector: " + path);
+    const std::streamsize bytes = file.tellg();
+    if (bytes <= 0 || bytes % static_cast<std::streamsize>(sizeof(float)) != 0) {
+        throw std::runtime_error("invalid F32 vector file size: " + path);
+    }
+    std::vector<float> values(static_cast<size_t>(bytes) / sizeof(float));
+    file.seekg(0);
+    file.read(reinterpret_cast<char *>(values.data()), bytes);
+    if (!file || std::any_of(values.begin(), values.end(), [](float x) { return !std::isfinite(x); })) {
+        throw std::runtime_error("invalid F32 vector data: " + path);
+    }
+    return values;
+}
+
+static std::vector<wd::Qwen38MoeRouteOverride> read_moe_routes_file(const std::string & path) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("cannot open MoE route override file: " + path);
+    std::vector<wd::Qwen38MoeRouteOverride> routes;
+    std::string line;
+    int previous_position = -1;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        std::vector<std::string> fields;
+        std::stringstream row(line);
+        std::string field;
+        while (std::getline(row, field, ',')) fields.push_back(field);
+        if (fields.size() < 2) {
+            throw std::runtime_error("MoE route rows must include a position and expert IDs: " + path);
+        }
+        wd::Qwen38MoeRouteOverride route;
+        size_t consumed = 0;
+        route.position = std::stoi(fields[0], &consumed);
+        if (consumed != fields[0].size() || route.position < 0 || route.position <= previous_position) {
+            throw std::runtime_error("MoE route positions must be nonnegative and strictly increasing");
+        }
+        previous_position = route.position;
+        const bool ids_only = fields.size() >= 2 && fields[1] == "ids";
+        const bool weighted = fields.size() >= 2 && fields[1] == "weights";
+        const size_t first_value = (ids_only || weighted) ? 2 : 1;
+        if (!ids_only && (fields.size() - first_value) % 2 != 0) {
+            throw std::runtime_error("weighted MoE route rows must contain ID/weight pairs: " + path);
+        }
+        for (size_t i = first_value; i < fields.size(); i += ids_only ? 1 : 2) {
+            consumed = 0;
+            const int expert = std::stoi(fields[i], &consumed);
+            if (consumed != fields[i].size() || expert < 0) {
+                throw std::runtime_error("invalid expert ID in MoE route file");
+            }
+            route.expert_ids.push_back(expert);
+            if (ids_only) continue;
+            consumed = 0;
+            const float weight = std::stof(fields[i + 1], &consumed);
+            if (consumed != fields[i + 1].size() || !std::isfinite(weight)) {
+                throw std::runtime_error("invalid routing weight in MoE route file");
+            }
+            route.weights.push_back(weight);
+        }
+        if (!route.weights.empty() && route.expert_ids.size() != route.weights.size()) {
+            throw std::runtime_error("MoE route ID/weight count mismatch");
+        }
+        routes.push_back(std::move(route));
+    }
+    if (routes.empty()) throw std::runtime_error("MoE route override file is empty: " + path);
+    return routes;
 }
 
 static Args parse_args(int argc, char** argv) {
@@ -103,11 +276,93 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--no-autotune") a.autotune = false;
         else if (s == "--load-only") a.load_only = true;
         else if (s == "--debug-f32-hc-layer0") a.debug_f32_hc_layer0 = true;
+        else if (s == "--debug-f32-hc-attn-0-8") a.debug_f32_hc_attn_0_8 = true;
+        else if (s == "--debug-f32-hc-ffn-0-8") a.debug_f32_hc_ffn_0_8 = true;
+        else if (s == "--debug-hc-q8_1-attn-from-layer") a.debug_hc_q8_1_attn_from = std::stoi(need(i, "--debug-hc-q8_1-attn-from-layer"));
+        else if (s == "--debug-hc-q8_1-attn-through-layer") a.debug_hc_q8_1_attn_through = std::stoi(need(i, "--debug-hc-q8_1-attn-through-layer"));
+        else if (s == "--debug-hc-q8_1-ffn-from-layer") a.debug_hc_q8_1_ffn_from = std::stoi(need(i, "--debug-hc-q8_1-ffn-from-layer"));
+        else if (s == "--debug-hc-q8_1-ffn-through-layer") a.debug_hc_q8_1_ffn_through = std::stoi(need(i, "--debug-hc-q8_1-ffn-through-layer"));
+        else if (s == "--debug-hc-q8_0-ffn-from-layer") a.debug_hc_q8_0_ffn_from = std::stoi(need(i, "--debug-hc-q8_0-ffn-from-layer"));
+        else if (s == "--debug-hc-q8_0-ffn-through-layer") a.debug_hc_q8_0_ffn_through = std::stoi(need(i, "--debug-hc-q8_0-ffn-through-layer"));
+        else if (s == "--debug-f32-hc-ffn-layer8") a.debug_f32_hc_ffn_layer8 = true;
+        else if (s == "--debug-f32-hc-head") a.debug_f32_hc_head = true;
+        else if (s == "--debug-layer0-hc-gate-f32-store") a.debug_layer0_hc_gate_f32_store = true;
+        else if (s == "--debug-layer0-hc-gate-f32-sigmoid") a.debug_layer0_hc_gate_f32_sigmoid = true;
+        else if (s == "--debug-layer0-hc-gate-q8_0-activation") a.debug_hc_gate_q8_0_layer = 0;
+        else if (s == "--debug-hc-gate-q8_0-layer") a.debug_hc_gate_q8_0_layer = std::stoi(need(i, "--debug-hc-gate-q8_0-layer"));
+        else if (s == "--debug-hc-attn-q8_0-full-layer") a.debug_hc_full_q8_0_layer = std::stoi(need(i, "--debug-hc-attn-q8_0-full-layer"));
+        else if (s == "--debug-qsa-q8_0-layer") a.debug_qsa_q8_0_layer = std::stoi(need(i, "--debug-qsa-q8_0-layer"));
+        else if (s == "--debug-qsa-v-q8_0-layer") a.debug_qsa_v_q8_0_layer = std::stoi(need(i, "--debug-qsa-v-q8_0-layer"));
+        else if (s == "--debug-layer0-hc-norm-f32-file") {
+            a.debug_hc_norm_f32_layer = 0;
+            a.debug_hc_norm_f32_file = need(i, "--debug-layer0-hc-norm-f32-file");
+        }
+        else if (s == "--debug-hc-norm-f32-layer") a.debug_hc_norm_f32_layer = std::stoi(need(i, "--debug-hc-norm-f32-layer"));
+        else if (s == "--debug-hc-norm-f32-file") a.debug_hc_norm_f32_file = need(i, "--debug-hc-norm-f32-file");
+        else if (s == "--debug-attention-output-f32-layer") a.debug_attention_output_f32_layer = std::stoi(need(i, "--debug-attention-output-f32-layer"));
+        else if (s == "--debug-attention-output-f32-file") a.debug_attention_output_f32_file = need(i, "--debug-attention-output-f32-file");
+        else if (s == "--debug-attention-input-f32-layer") a.debug_attention_input_f32_layer = std::stoi(need(i, "--debug-attention-input-f32-layer"));
+        else if (s == "--debug-attention-input-f32-file") a.debug_attention_input_f32_file = need(i, "--debug-attention-input-f32-file");
+        else if (s == "--debug-qsa-context-f32-layer") a.debug_qsa_context_f32_layer = std::stoi(need(i, "--debug-qsa-context-f32-layer"));
+        else if (s == "--debug-qsa-context-f32-file") a.debug_qsa_context_f32_file = need(i, "--debug-qsa-context-f32-file");
+        else if (s == "--debug-qsa-pregate-f32-layer") a.debug_qsa_pregate_f32_layer = std::stoi(need(i, "--debug-qsa-pregate-f32-layer"));
+        else if (s == "--debug-qsa-pregate-f32-file") a.debug_qsa_pregate_f32_file = need(i, "--debug-qsa-pregate-f32-file");
+        else if (s == "--debug-qsa-query-f32-layer") a.debug_qsa_query_f32_layer = std::stoi(need(i, "--debug-qsa-query-f32-layer"));
+        else if (s == "--debug-qsa-query-f32-file") a.debug_qsa_query_f32_file = need(i, "--debug-qsa-query-f32-file");
+        else if (s == "--debug-qsa-key-store-f32-layer") a.debug_qsa_key_store_f32_layer = std::stoi(need(i, "--debug-qsa-key-store-f32-layer"));
+        else if (s == "--debug-qsa-key-store-f32-file") a.debug_qsa_key_store_f32_file = need(i, "--debug-qsa-key-store-f32-file");
+        else if (s == "--debug-qsa-value-store-f32-layer") a.debug_qsa_value_store_f32_layer = std::stoi(need(i, "--debug-qsa-value-store-f32-layer"));
+        else if (s == "--debug-qsa-value-store-f32-file") a.debug_qsa_value_store_f32_file = need(i, "--debug-qsa-value-store-f32-file");
+        else if (s == "--debug-qsa-key-cache-prefix-f32-layer") a.debug_qsa_key_cache_prefix_f32_layer = std::stoi(need(i, "--debug-qsa-key-cache-prefix-f32-layer"));
+        else if (s == "--debug-qsa-key-cache-prefix-f32-file") a.debug_qsa_key_cache_prefix_f32_file = need(i, "--debug-qsa-key-cache-prefix-f32-file");
+        else if (s == "--debug-qsa-value-cache-prefix-f32-layer") a.debug_qsa_value_cache_prefix_f32_layer = std::stoi(need(i, "--debug-qsa-value-cache-prefix-f32-layer"));
+        else if (s == "--debug-qsa-value-cache-prefix-f32-file") a.debug_qsa_value_cache_prefix_f32_file = need(i, "--debug-qsa-value-cache-prefix-f32-file");
+        else if (s == "--debug-hc-attn-combine-layer") a.debug_hc_attn_combine_layer = std::stoi(need(i, "--debug-hc-attn-combine-layer"));
+        else if (s == "--debug-hc-attn-combine-f32-file") a.debug_hc_attn_combine_f32_file = need(i, "--debug-hc-attn-combine-f32-file");
+        else if (s == "--debug-hc-inject-f32-layer") a.debug_hc_inject_f32_layer = std::stoi(need(i, "--debug-hc-inject-f32-layer"));
+        else if (s == "--debug-hc-inject-f32-file") a.debug_hc_inject_f32_file = need(i, "--debug-hc-inject-f32-file");
+        else if (s == "--debug-layer-input-residual-layer") a.debug_layer_input_residual_layer = std::stoi(need(i, "--debug-layer-input-residual-layer"));
+        else if (s == "--debug-layer-input-residual-f32-file") a.debug_layer_input_residual_f32_file = need(i, "--debug-layer-input-residual-f32-file");
+        else if (s == "--debug-layer8-after-attn-residual-f32-file") a.debug_layer8_after_attention_residual_f32_file = need(i, "--debug-layer8-after-attn-residual-f32-file");
+        else if (s == "--debug-layer8-hc-ffn-mix-f32-file") a.debug_layer8_hc_ffn_mix_f32_file = need(i, "--debug-layer8-hc-ffn-mix-f32-file");
+        else if (s == "--debug-layer8-output-f32-file") a.debug_layer8_output_f32_file = need(i, "--debug-layer8-output-f32-file");
+        else if (s == "--debug-layer8-output-layer") a.debug_layer8_output_layer = std::stoi(need(i, "--debug-layer8-output-layer"));
+        else if (s == "--debug-layer-output-all-positions-f32-file") {
+            a.debug_layer_output_all_positions_f32_file = need(i, "--debug-layer-output-all-positions-f32-file");
+        }
+        else if (s == "--debug-final-residual-f32-file") a.debug_final_residual_f32_file = need(i, "--debug-final-residual-f32-file");
+        else if (s == "--debug-layer14-gdn-core-f32-file") a.debug_layer14_gdn_core_f32_file = need(i, "--debug-layer14-gdn-core-f32-file");
+        else if (s == "--debug-layer14-gdn-norm-output-f32-file") a.debug_layer14_gdn_norm_output_f32_file = need(i, "--debug-layer14-gdn-norm-output-f32-file");
+        else if (s == "--debug-layer9-gdn-state-f32-file") a.debug_layer9_gdn_state_f32_file = need(i, "--debug-layer9-gdn-state-f32-file");
+        else if (s == "--debug-layer9-gdn-conv-state-f32-file") a.debug_layer9_gdn_conv_state_f32_file = need(i, "--debug-layer9-gdn-conv-state-f32-file");
+        else if (s == "--debug-layer9-gdn-state-layer") a.debug_layer9_gdn_state_layer = std::stoi(need(i, "--debug-layer9-gdn-state-layer"));
+        else if (s == "--debug-layer9-gdn-conv-state-layer") a.debug_layer9_gdn_conv_state_layer = std::stoi(need(i, "--debug-layer9-gdn-conv-state-layer"));
+        else if (s == "--debug-moe-ids") a.debug_moe_ids = parse_token_ids(need(i, "--debug-moe-ids"));
+        else if (s == "--debug-moe-weights") a.debug_moe_weights = parse_float_values(need(i, "--debug-moe-weights"));
+        else if (s == "--debug-moe-routes-file") a.debug_moe_routes_file = need(i, "--debug-moe-routes-file");
+        else if (s == "--debug-router-cpu-activation-f32-file") {
+            a.debug_router_cpu_activation_f32_file = need(i, "--debug-router-cpu-activation-f32-file");
+        }
+        else if (s == "--debug-routed-moe-output-f32-file") {
+            a.debug_routed_moe_output_f32_file = need(i, "--debug-routed-moe-output-f32-file");
+        }
+        else if (s == "--debug-routed-moe-output-all-positions-f32-file") {
+            a.debug_routed_moe_output_all_positions_f32_file =
+                need(i, "--debug-routed-moe-output-all-positions-f32-file");
+        }
+        else if (s == "--debug-ffn-output-layer") a.debug_ffn_output_layer = std::stoi(need(i, "--debug-ffn-output-layer"));
+        else if (s == "--debug-ffn-output") a.debug_ffn_output = parse_float_values(need(i, "--debug-ffn-output"));
+        else if (s == "--debug-hc-residual") {
+            const auto values = parse_float_values(need(i, "--debug-hc-residual"));
+            a.debug_hc_residual.insert(a.debug_hc_residual.end(), values.begin(), values.end());
+        }
         else if (s == "--extended-parity-trace") a.extended_parity_trace = need(i, "--extended-parity-trace");
         else if (s == "--state-trace") a.state_trace_path = need(i, "--state-trace");
         else if (s == "--forced-input-tokens") a.forced_input_tokens = parse_token_ids(need(i, "--forced-input-tokens"));
+        else if (s == "--state-trace-position") a.state_trace_position = std::stoi(need(i, "--state-trace-position"));
         else if (s == "-h" || s == "--help") {
-            std::cout << "warodecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--debug-f32-hc-layer0] [--extended-parity-trace path] [--state-trace path --forced-input-tokens 1,271,2] [--no-graph] [--no-autotune] [--load-only]\n";
+            std::cout << "warodecode --model model.gguf [--ctx 4096] [--generate 128] [--device 0] [--start-token 1] [--top-k 10] [--debug-f32-hc-layer0] [--debug-f32-hc-attn-0-8] [--debug-f32-hc-ffn-0-8] [--debug-hc-q8_1-attn-from-layer N --debug-hc-q8_1-attn-through-layer N] [--debug-hc-q8_1-ffn-from-layer N --debug-hc-q8_1-ffn-through-layer N] [--debug-f32-hc-ffn-layer8] [--debug-hc-norm-f32-layer N --debug-hc-norm-f32-file path | --debug-layer0-hc-gate-f32-store | --debug-layer0-hc-gate-f32-sigmoid | --debug-hc-gate-q8_0-layer N | --debug-hc-attn-q8_0-full-layer N | --debug-qsa-q8_0-layer N | --debug-qsa-v-q8_0-layer N] [--debug-attention-input-f32-layer N --debug-attention-input-f32-file path] [--debug-qsa-context-f32-layer N --debug-qsa-context-f32-file path] [--debug-qsa-pregate-f32-layer N --debug-qsa-pregate-f32-file path] [--debug-qsa-query-f32-layer N --debug-qsa-query-f32-file path] [--debug-attention-output-f32-layer N --debug-attention-output-f32-file path] [--debug-hc-attn-combine-layer N --debug-hc-attn-combine-f32-file path] [--debug-hc-inject-f32-layer N --debug-hc-inject-f32-file path] [--debug-layer-input-residual-layer N --debug-layer-input-residual-f32-file path] [--debug-router-cpu-activation-f32-file path] [--debug-moe-ids ids [--debug-moe-weights weights] | --debug-moe-routes-file path] [--debug-routed-moe-output-f32-file path | --debug-routed-moe-output-all-positions-f32-file path] [--debug-layer8-after-attn-residual-f32-file path] [--debug-layer8-hc-ffn-mix-f32-file path | --debug-layer8-output-layer N --debug-layer8-output-f32-file path | --debug-layer-output-all-positions-f32-file path] [--debug-ffn-output-layer N --debug-ffn-output values] [--debug-final-residual-f32-file path | --debug-layer9-gdn-state-layer N --debug-layer9-gdn-state-f32-file path | --debug-layer9-gdn-conv-state-layer N --debug-layer9-gdn-conv-state-f32-file path | --debug-layer14-gdn-core-f32-file path | --debug-layer14-gdn-norm-output-f32-file] [--extended-parity-trace path] [--state-trace path --forced-input-tokens 1,271,2 [--state-trace-position N]] [--no-graph] [--no-autotune] [--load-only]\n";
+            std::cout << "[--debug-qsa-key-store-f32-layer N --debug-qsa-key-store-f32-file path] [--debug-qsa-value-store-f32-layer N --debug-qsa-value-store-f32-file path] [--debug-qsa-key-cache-prefix-f32-layer N --debug-qsa-key-cache-prefix-f32-file path] [--debug-qsa-value-cache-prefix-f32-layer N --debug-qsa-value-cache-prefix-f32-file path]\n";
             std::exit(0);
         } else throw std::runtime_error("不明な引数: " + s);
     }
@@ -115,16 +370,440 @@ static Args parse_args(int argc, char** argv) {
     if (a.debug_f32_hc_layer0 && a.generate != 1 && a.state_trace_path.empty()) {
         throw std::runtime_error("--debug-f32-hc-layer0 requires --generate 1");
     }
+    const bool debug_hc_q8_1_prefix =
+        a.debug_hc_q8_1_attn_through >= 0 || a.debug_hc_q8_1_ffn_through >= 0;
+    const bool debug_hc_q8_0_ffn_prefix = a.debug_hc_q8_0_ffn_through >= 0;
+    if ((debug_hc_q8_1_prefix || debug_hc_q8_0_ffn_prefix) &&
+        (a.debug_f32_hc_attn_0_8 || a.debug_f32_hc_ffn_0_8 || a.debug_f32_hc_ffn_layer8)) {
+        throw std::runtime_error("choose either legacy HC F32 flags or a HC Q8 cutoff replay");
+    }
+    if (debug_hc_q8_1_prefix && debug_hc_q8_0_ffn_prefix) {
+        throw std::runtime_error("choose either HC Q8_1 or exact HC Q8_0 FFN replay");
+    }
+    if ((a.debug_f32_hc_attn_0_8 || a.debug_f32_hc_ffn_0_8 || a.debug_f32_hc_ffn_layer8) &&
+        a.state_trace_path.empty() && a.top_k == 0) {
+        throw std::runtime_error("layer 0-8 HC F32 experiments require tracing");
+    }
     if (!a.extended_parity_trace.empty() && !a.debug_f32_hc_layer0) {
         throw std::runtime_error("--extended-parity-trace requires --debug-f32-hc-layer0");
+    }
+    const int hc_gate_replays = static_cast<int>(a.debug_layer0_hc_gate_f32_store) +
+        static_cast<int>(a.debug_layer0_hc_gate_f32_sigmoid) +
+        static_cast<int>(a.debug_hc_gate_q8_0_layer >= 0) +
+        static_cast<int>(a.debug_hc_full_q8_0_layer >= 0) +
+        static_cast<int>(a.debug_qsa_q8_0_layer >= 0) +
+        static_cast<int>(a.debug_qsa_v_q8_0_layer >= 0) +
+        static_cast<int>(debug_hc_q8_0_ffn_prefix);
+    if (hc_gate_replays > 1) throw std::runtime_error("choose one HC diagnostic projection replay at a time");
+    if (hc_gate_replays > 0 &&
+        (a.debug_hc_q8_1_attn_through >= 0 || a.debug_hc_q8_1_ffn_through >= 0)) {
+        throw std::runtime_error("HC Q8_1 prefix replay conflicts with another HC/QSA projection replay");
+    }
+    const bool has_hc_norm_override = !a.debug_hc_norm_f32_file.empty();
+    if (hc_gate_replays > 0 &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("Q8_0 projection replay requires a selected state trace position");
+    }
+    if (has_hc_norm_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("HC norm override requires a selected state trace position");
+    }
+    const bool has_attention_output_override = !a.debug_attention_output_f32_file.empty();
+    const bool has_attention_input_override = !a.debug_attention_input_f32_file.empty();
+    const bool has_qsa_context_override = !a.debug_qsa_context_f32_file.empty();
+    const bool has_qsa_pregate_override = !a.debug_qsa_pregate_f32_file.empty();
+    const bool has_qsa_query_override = !a.debug_qsa_query_f32_file.empty();
+    const bool has_qsa_key_store_override = !a.debug_qsa_key_store_f32_file.empty();
+    const bool has_qsa_value_store_override = !a.debug_qsa_value_store_f32_file.empty();
+    const bool has_qsa_store_override =
+        has_qsa_key_store_override || has_qsa_value_store_override;
+    const bool has_qsa_key_cache_prefix_override =
+        !a.debug_qsa_key_cache_prefix_f32_file.empty();
+    const bool has_qsa_value_cache_prefix_override =
+        !a.debug_qsa_value_cache_prefix_f32_file.empty();
+    const bool has_qsa_cache_prefix_override =
+        has_qsa_key_cache_prefix_override || has_qsa_value_cache_prefix_override;
+    const bool qsa_store_q8_conflict =
+        (has_qsa_key_store_override &&
+         (a.debug_qsa_q8_0_layer == a.debug_qsa_key_store_f32_layer ||
+          a.debug_qsa_v_q8_0_layer == a.debug_qsa_key_store_f32_layer)) ||
+        (has_qsa_value_store_override &&
+         (a.debug_qsa_q8_0_layer == a.debug_qsa_value_store_f32_layer ||
+          a.debug_qsa_v_q8_0_layer == a.debug_qsa_value_store_f32_layer));
+    const bool qsa_cache_prefix_q8_conflict =
+        (has_qsa_key_cache_prefix_override &&
+         (a.debug_qsa_q8_0_layer == a.debug_qsa_key_cache_prefix_f32_layer ||
+          a.debug_qsa_v_q8_0_layer == a.debug_qsa_key_cache_prefix_f32_layer)) ||
+        (has_qsa_value_cache_prefix_override &&
+         (a.debug_qsa_q8_0_layer == a.debug_qsa_value_cache_prefix_f32_layer ||
+          a.debug_qsa_v_q8_0_layer == a.debug_qsa_value_cache_prefix_f32_layer));
+    const bool has_hc_attn_combine_override = !a.debug_hc_attn_combine_f32_file.empty();
+    const bool has_hc_inject_override = !a.debug_hc_inject_f32_file.empty();
+    const bool has_layer_input_residual_override = !a.debug_layer_input_residual_f32_file.empty();
+    const bool has_layer8_residual_override = !a.debug_layer8_after_attention_residual_f32_file.empty();
+    const bool has_layer8_hc_ffn_mix_override = !a.debug_layer8_hc_ffn_mix_f32_file.empty();
+    const bool has_layer8_output_override = !a.debug_layer8_output_f32_file.empty();
+    const bool has_layer_output_all_positions_override =
+        !a.debug_layer_output_all_positions_f32_file.empty();
+    const bool has_routed_moe_output_override = !a.debug_routed_moe_output_f32_file.empty();
+    const bool has_routed_moe_output_all_positions_override =
+        !a.debug_routed_moe_output_all_positions_f32_file.empty();
+    const bool has_final_residual_override = !a.debug_final_residual_f32_file.empty();
+    const bool has_layer14_gdn_core_override = !a.debug_layer14_gdn_core_f32_file.empty();
+    const bool has_layer14_gdn_norm_override = !a.debug_layer14_gdn_norm_output_f32_file.empty();
+    const bool has_layer9_gdn_state_override = !a.debug_layer9_gdn_state_f32_file.empty();
+    const bool has_layer9_gdn_conv_state_override = !a.debug_layer9_gdn_conv_state_f32_file.empty();
+    if (a.debug_layer8_output_layer < 0 || a.debug_layer8_output_layer >= 48 ||
+        (a.debug_layer8_output_layer != 8 && !has_layer8_output_override &&
+         !has_layer_output_all_positions_override && a.debug_hc_residual.empty())) {
+        throw std::runtime_error("HC residual output target requires an override and layer in 0..47");
+    }
+    if (a.debug_layer9_gdn_state_layer < 0 || a.debug_layer9_gdn_state_layer >= 48 ||
+        (a.debug_layer9_gdn_state_layer != 9 && !has_layer9_gdn_state_override)) {
+        throw std::runtime_error("layer-9 GDN state target requires a state file and layer in 0..47");
+    }
+    if (a.debug_layer9_gdn_conv_state_layer < 0 || a.debug_layer9_gdn_conv_state_layer >= 48 ||
+        (a.debug_layer9_gdn_conv_state_layer != 9 && !has_layer9_gdn_conv_state_override)) {
+        throw std::runtime_error("layer-9 GDN convolution-state target requires a state file and layer in 0..47");
+    }
+    if (a.debug_attention_output_f32_layer < -1 || a.debug_attention_output_f32_layer >= 48 ||
+        has_attention_output_override != (a.debug_attention_output_f32_layer >= 0)) {
+        throw std::runtime_error("attention output override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_attention_input_f32_layer < -1 || a.debug_attention_input_f32_layer >= 48 ||
+        has_attention_input_override != (a.debug_attention_input_f32_layer >= 0)) {
+        throw std::runtime_error("attention input override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_qsa_context_f32_layer < -1 || a.debug_qsa_context_f32_layer >= 48 ||
+        has_qsa_context_override != (a.debug_qsa_context_f32_layer >= 0)) {
+        throw std::runtime_error("QSA attention context override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_qsa_pregate_f32_layer < -1 || a.debug_qsa_pregate_f32_layer >= 48 ||
+        has_qsa_pregate_override != (a.debug_qsa_pregate_f32_layer >= 0)) {
+        throw std::runtime_error("QSA pregate override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_qsa_query_f32_layer < -1 || a.debug_qsa_query_f32_layer >= 48 ||
+        has_qsa_query_override != (a.debug_qsa_query_f32_layer >= 0)) {
+        throw std::runtime_error("QSA query override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_qsa_key_store_f32_layer < -1 || a.debug_qsa_key_store_f32_layer >= 48 ||
+        has_qsa_key_store_override != (a.debug_qsa_key_store_f32_layer >= 0)) {
+        throw std::runtime_error("QSA key store override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_qsa_value_store_f32_layer < -1 || a.debug_qsa_value_store_f32_layer >= 48 ||
+        has_qsa_value_store_override != (a.debug_qsa_value_store_f32_layer >= 0)) {
+        throw std::runtime_error("QSA value store override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_qsa_key_cache_prefix_f32_layer < -1 ||
+        a.debug_qsa_key_cache_prefix_f32_layer >= 48 ||
+        has_qsa_key_cache_prefix_override != (a.debug_qsa_key_cache_prefix_f32_layer >= 0)) {
+        throw std::runtime_error("QSA key cache prefix override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_qsa_value_cache_prefix_f32_layer < -1 ||
+        a.debug_qsa_value_cache_prefix_f32_layer >= 48 ||
+        has_qsa_value_cache_prefix_override != (a.debug_qsa_value_cache_prefix_f32_layer >= 0)) {
+        throw std::runtime_error("QSA value cache prefix override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_hc_attn_combine_layer < -1 || a.debug_hc_attn_combine_layer >= 48 ||
+        has_hc_attn_combine_override != (a.debug_hc_attn_combine_layer >= 0)) {
+        throw std::runtime_error("HC attention combine override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_hc_inject_f32_layer < -1 || a.debug_hc_inject_f32_layer >= 48 ||
+        has_hc_inject_override != (a.debug_hc_inject_f32_layer >= 0)) {
+        throw std::runtime_error("HC inject override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_layer_input_residual_layer < -1 || a.debug_layer_input_residual_layer >= 48 ||
+        has_layer_input_residual_override != (a.debug_layer_input_residual_layer >= 0)) {
+        throw std::runtime_error("layer input residual override requires a layer in 0..47 and an F32 file");
+    }
+    if ((has_attention_input_override || has_layer_input_residual_override) &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("component override requires a selected state trace position");
+    }
+    if (has_qsa_context_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("QSA attention context override requires a selected state trace position");
+    }
+    if (has_qsa_context_override &&
+        (has_attention_output_override || has_hc_attn_combine_override)) {
+        throw std::runtime_error("choose one QSA context/output override at a time");
+    }
+    if (has_qsa_pregate_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("QSA pregate override requires a selected state trace position");
+    }
+    if (has_qsa_pregate_override &&
+        (has_qsa_context_override || has_attention_output_override || has_hc_attn_combine_override)) {
+        throw std::runtime_error("choose one QSA pregate/context/output override at a time");
+    }
+    if (has_qsa_query_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("QSA query override requires a selected state trace position");
+    }
+    if (has_qsa_query_override &&
+        (has_qsa_context_override || has_qsa_pregate_override ||
+         has_attention_output_override || has_hc_attn_combine_override)) {
+        throw std::runtime_error("choose one QSA query/context/output override at a time");
+    }
+    if (has_qsa_store_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("QSA key/value store override requires a selected state trace position");
+    }
+    if (has_qsa_store_override &&
+        (has_qsa_context_override || has_qsa_pregate_override || has_qsa_query_override ||
+         has_attention_output_override || has_hc_attn_combine_override)) {
+        throw std::runtime_error("choose one QSA key/value store or context/query/output override at a time");
+    }
+    if (qsa_store_q8_conflict) {
+        throw std::runtime_error("QSA key/value store override cannot be combined with Q8_0 replay");
+    }
+    if (has_qsa_cache_prefix_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("QSA cache prefix override requires a selected state trace position");
+    }
+    if (has_qsa_cache_prefix_override &&
+        (has_qsa_context_override || has_qsa_pregate_override || has_qsa_query_override ||
+         has_qsa_store_override || has_attention_output_override ||
+         has_hc_attn_combine_override)) {
+        throw std::runtime_error("choose one QSA cache prefix or context/query/store/output override at a time");
+    }
+    if (qsa_cache_prefix_q8_conflict) {
+        throw std::runtime_error("QSA cache prefix override cannot be combined with Q8_0 replay");
+    }
+    if (has_hc_attn_combine_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("HC attention combine override requires a selected state trace position");
+    }
+    if (has_hc_attn_combine_override &&
+        (has_attention_input_override || has_attention_output_override ||
+         has_hc_inject_override || has_layer8_residual_override)) {
+        throw std::runtime_error("choose one attention output/residual override at a time");
+    }
+    if (has_hc_inject_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("HC inject override requires a selected state trace position");
+    }
+    if (has_attention_output_override && has_layer8_residual_override) {
+        throw std::runtime_error("choose one attention/residual override at a time");
+    }
+    if ((has_layer8_residual_override ||
+         has_final_residual_override || has_layer14_gdn_core_override ||
+         has_layer14_gdn_norm_override) &&
+        (a.state_trace_path.empty() || a.state_trace_position != 36)) {
+        throw std::runtime_error("diagnostic override requires state trace position 36");
+    }
+    // TEMPORARY DIAGNOSTIC RELAXATION (Issue #1 MoE same-input test): allow the
+    // layer-8 HC FFN mix override at the traced position so the MoE execution
+    // can be measured with exact CPU inputs. REVERT BEFORE COMMIT.
+    // TEMPORARY DIAGNOSTIC RELAXATION (Issue #1 GDN same-input test): allow the
+    // layer-9 GDN recurrent/convolution state overrides at the traced position
+    // so the AR-core execution can be separated from state inheritance.
+    // REVERT BEFORE COMMIT.
+    if (has_layer8_hc_ffn_mix_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("layer-8 HC FFN mix override requires a selected state trace position");
+    }
+    if ((has_layer9_gdn_state_override || has_layer9_gdn_conv_state_override) &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("GDN state override requires a selected state trace position");
+    }
+    if (has_attention_output_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("attention output override requires a selected state trace position");
+    }
+    if (has_layer8_output_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("layer output override requires a selected state trace position");
+    }
+    if ((has_layer8_output_override || has_layer_output_all_positions_override) &&
+        !a.debug_hc_residual.empty()) {
+        throw std::runtime_error("choose one layer-8 output override at a time");
+    }
+    if (has_layer_output_all_positions_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("all-position layer output replay requires a selected state trace position");
+    }
+    if (has_routed_moe_output_override && has_routed_moe_output_all_positions_override) {
+        throw std::runtime_error("choose a single-position or all-position routed MoE output override");
+    }
+    if (has_routed_moe_output_all_positions_override &&
+        (a.state_trace_path.empty() || a.state_trace_position < 0)) {
+        throw std::runtime_error("all-position routed MoE output replay requires a selected state trace position");
+    }
+    if (a.debug_hc_q8_0_ffn_from < 0 || a.debug_hc_q8_0_ffn_from >= 48 ||
+        a.debug_hc_q8_0_ffn_through < -1 || a.debug_hc_q8_0_ffn_through >= 48 ||
+        (a.debug_hc_q8_0_ffn_through >= 0 &&
+         a.debug_hc_q8_0_ffn_from > a.debug_hc_q8_0_ffn_through) ||
+        (a.debug_hc_q8_0_ffn_through < 0 && a.debug_hc_q8_0_ffn_from != 0)) {
+        throw std::runtime_error("exact HC Q8_0 FFN layer range must satisfy 0 <= start <= end < 48");
+    }
+    if (a.debug_hc_q8_1_attn_from < 0 || a.debug_hc_q8_1_attn_from >= 48 ||
+        a.debug_hc_q8_1_ffn_from < 0 || a.debug_hc_q8_1_ffn_from >= 48 ||
+        a.debug_hc_q8_1_attn_through < -1 || a.debug_hc_q8_1_attn_through >= 48 ||
+        a.debug_hc_q8_1_ffn_through < -1 || a.debug_hc_q8_1_ffn_through >= 48 ||
+        (a.debug_hc_q8_1_attn_through >= 0 &&
+         a.debug_hc_q8_1_attn_from > a.debug_hc_q8_1_attn_through) ||
+        (a.debug_hc_q8_1_ffn_through >= 0 &&
+         a.debug_hc_q8_1_ffn_from > a.debug_hc_q8_1_ffn_through)) {
+        throw std::runtime_error("HC Q8_1 layer range must satisfy 0 <= start <= end < 48");
+    }
+    if ((a.debug_hc_q8_1_attn_through < 0 && a.debug_hc_q8_1_attn_from != 0) ||
+        (a.debug_hc_q8_1_ffn_through < 0 && a.debug_hc_q8_1_ffn_from != 0)) {
+        throw std::runtime_error("HC Q8_1 from-layer requires a matching through-layer");
+    }
+    if ((debug_hc_q8_1_prefix || debug_hc_q8_0_ffn_prefix) &&
+        a.state_trace_path.empty() && a.top_k == 0) {
+        throw std::runtime_error("HC Q8 prefix replay requires tracing");
+    }
+    if (a.debug_hc_gate_q8_0_layer < -1 || a.debug_hc_gate_q8_0_layer > 8) {
+        throw std::runtime_error("Q8_0 HC gate replay layer must be in 0..8");
+    }
+    if (a.debug_hc_full_q8_0_layer < -1 || a.debug_hc_full_q8_0_layer >= 48) {
+        throw std::runtime_error("full Q8_0 HC replay layer must be in 0..47");
+    }
+    if (a.debug_qsa_q8_0_layer < -1 || a.debug_qsa_q8_0_layer >= 48) {
+        throw std::runtime_error("QSA Q8_0 replay layer must be in 0..47");
+    }
+    if (a.debug_qsa_v_q8_0_layer < -1 || a.debug_qsa_v_q8_0_layer >= 48) {
+        throw std::runtime_error("QSA V Q8_0 replay layer must be in 0..47");
+    }
+    if (a.debug_ffn_output_layer < 0 || a.debug_ffn_output_layer >= 48) {
+        throw std::runtime_error("FFN output override layer must be in 0..47");
+    }
+    if (a.debug_hc_norm_f32_file.empty() != (a.debug_hc_norm_f32_layer < 0) ||
+        a.debug_hc_norm_f32_layer < -1 || a.debug_hc_norm_f32_layer >= 48) {
+        throw std::runtime_error("HC norm override requires a layer in 0..47 and an F32 file");
+    }
+    if (a.debug_hc_full_q8_0_layer >= 0 && has_hc_norm_override &&
+        a.debug_hc_full_q8_0_layer != a.debug_hc_norm_f32_layer) {
+        throw std::runtime_error("full Q8_0 HC replay and norm override layers must match");
+    }
+    if (a.debug_hc_norm_f32_layer >= 0) {
+        a.debug_hc_norm_f32 = read_f32_file(a.debug_hc_norm_f32_file);
+        if (a.debug_hc_norm_f32.size() != 10240) {
+            throw std::runtime_error("HC norm override must contain 10240 F32 values");
+        }
+    }
+    if (has_attention_output_override) {
+        a.debug_attention_output_f32 = read_f32_file(a.debug_attention_output_f32_file);
+    }
+    if (has_attention_input_override) {
+        a.debug_attention_input_f32 = read_f32_file(a.debug_attention_input_f32_file);
+        if (a.debug_attention_input_f32.size() != 2560) {
+            throw std::runtime_error("attention input override must contain 2560 F32 values");
+        }
+    }
+    if (has_qsa_context_override) {
+        a.debug_qsa_context_f32 = read_f32_file(a.debug_qsa_context_f32_file);
+    }
+    if (has_qsa_pregate_override) {
+        a.debug_qsa_pregate_f32 = read_f32_file(a.debug_qsa_pregate_f32_file);
+    }
+    if (has_qsa_query_override) {
+        a.debug_qsa_query_f32 = read_f32_file(a.debug_qsa_query_f32_file);
+    }
+    if (has_qsa_key_store_override) {
+        a.debug_qsa_key_store_f32 = read_f32_file(a.debug_qsa_key_store_f32_file);
+    }
+    if (has_qsa_value_store_override) {
+        a.debug_qsa_value_store_f32 = read_f32_file(a.debug_qsa_value_store_f32_file);
+    }
+    if (has_qsa_key_cache_prefix_override) {
+        a.debug_qsa_key_cache_prefix_f32 =
+            read_f32_file(a.debug_qsa_key_cache_prefix_f32_file);
+    }
+    if (has_qsa_value_cache_prefix_override) {
+        a.debug_qsa_value_cache_prefix_f32 =
+            read_f32_file(a.debug_qsa_value_cache_prefix_f32_file);
+    }
+    if (has_hc_attn_combine_override) {
+        a.debug_hc_attn_combine_f32 = read_f32_file(a.debug_hc_attn_combine_f32_file);
+        if (a.debug_hc_attn_combine_f32.size() != 10240) {
+            throw std::runtime_error("HC attention combine override must contain 10240 F32 values");
+        }
+    }
+    if (has_hc_inject_override) {
+        a.debug_hc_inject_f32 = read_f32_file(a.debug_hc_inject_f32_file);
+        if (a.debug_hc_inject_f32.size() != 4) {
+            throw std::runtime_error("HC inject override must contain 4 F32 values");
+        }
+    }
+    if (has_layer_input_residual_override) {
+        a.debug_layer_input_residual_f32 = read_f32_file(a.debug_layer_input_residual_f32_file);
+        if (a.debug_layer_input_residual_f32.size() != 10240) {
+            throw std::runtime_error("layer input residual override must contain 10240 F32 values");
+        }
+    }
+    if (!a.debug_layer8_after_attention_residual_f32_file.empty()) {
+        a.debug_layer8_after_attention_residual_f32 = read_f32_file(a.debug_layer8_after_attention_residual_f32_file);
+    }
+    if (!a.debug_layer8_hc_ffn_mix_f32_file.empty()) {
+        a.debug_layer8_hc_ffn_mix_f32 = read_f32_file(a.debug_layer8_hc_ffn_mix_f32_file);
+    }
+    if (!a.debug_router_cpu_activation_f32_file.empty()) {
+        a.debug_router_cpu_activation_f32 = read_f32_file(a.debug_router_cpu_activation_f32_file);
+    }
+    if (!a.debug_routed_moe_output_f32_file.empty()) {
+        a.debug_routed_moe_output = read_f32_file(a.debug_routed_moe_output_f32_file);
+    }
+    if (has_routed_moe_output_all_positions_override) {
+        a.debug_routed_moe_output_all_positions =
+            read_f32_file(a.debug_routed_moe_output_all_positions_f32_file);
+    }
+    if (!a.debug_moe_routes_file.empty()) {
+        a.debug_moe_routes = read_moe_routes_file(a.debug_moe_routes_file);
+    }
+    if (has_layer8_output_override) {
+        a.debug_hc_residual = read_f32_file(a.debug_layer8_output_f32_file);
+    }
+    if (has_layer_output_all_positions_override) {
+        a.debug_layer_output_all_positions_f32 = read_f32_file(
+            a.debug_layer_output_all_positions_f32_file);
+        a.debug_hc_residual = a.debug_layer_output_all_positions_f32;
+    }
+    if (has_final_residual_override) {
+        a.debug_final_residual_f32 = read_f32_file(a.debug_final_residual_f32_file);
+    }
+    if (has_layer14_gdn_core_override) {
+        a.debug_layer14_gdn_core_f32 = read_f32_file(a.debug_layer14_gdn_core_f32_file);
+    }
+    if (has_layer14_gdn_norm_override) {
+        a.debug_layer14_gdn_norm_output_f32 = read_f32_file(a.debug_layer14_gdn_norm_output_f32_file);
+    }
+    if (has_layer9_gdn_state_override) {
+        a.debug_layer9_gdn_state_f32 = read_f32_file(a.debug_layer9_gdn_state_f32_file);
+    }
+    if (has_layer9_gdn_conv_state_override) {
+        a.debug_layer9_gdn_conv_state_f32 = read_f32_file(a.debug_layer9_gdn_conv_state_f32_file);
     }
     if (a.state_trace_path.empty() != a.forced_input_tokens.empty()) {
         throw std::runtime_error("--state-trace and --forced-input-tokens must be used together");
     }
+    if (a.state_trace_path.empty() && a.state_trace_position != -1) {
+        throw std::runtime_error("--state-trace-position requires --state-trace");
+    }
+    if ((a.debug_moe_ids.empty() && !a.debug_moe_weights.empty()) ||
+        ((!a.debug_moe_ids.empty() || !a.debug_moe_routes_file.empty() ||
+          !a.debug_router_cpu_activation_f32_file.empty() ||
+          !a.debug_routed_moe_output_f32_file.empty() ||
+          !a.debug_routed_moe_output_all_positions_f32_file.empty() ||
+          !a.debug_ffn_output.empty() ||
+          !a.debug_hc_residual.empty()) &&
+         a.state_trace_path.empty())) {
+        throw std::runtime_error("debug MoE/FFN overrides require --state-trace");
+    }
+    if (!a.debug_moe_routes_file.empty() &&
+        (!a.debug_moe_ids.empty() || !a.debug_moe_weights.empty())) {
+        throw std::runtime_error("choose a single-position or all-position MoE route override");
+    }
+    if (has_layer8_output_override && has_layer_output_all_positions_override) {
+        throw std::runtime_error("choose a single-position or all-position layer output override");
+    }
     if (!a.state_trace_path.empty() &&
         (!a.extended_parity_trace.empty() ||
          static_cast<int>(a.forced_input_tokens.size()) != a.generate ||
-         a.forced_input_tokens.front() != a.start_token)) {
+         a.forced_input_tokens.front() != a.start_token || a.state_trace_position < -1 ||
+         a.state_trace_position >= a.generate)) {
         throw std::runtime_error("state trace requires a forced input for every generated position and cannot be combined with extended parity tracing");
     }
     if (a.model.empty()) throw std::runtime_error("--model が必要です");
@@ -860,6 +1539,10 @@ int main(int argc, char** argv) {
             std::cerr << "expert-cache=" << qrt.tuning.expert_cache_mib
                       << " MiB slots=" << qrt.expert_cache_slots
                       << " fused=" << (qrt.fused_experts ? "true" : "false") << "\n";
+            const bool head_q8_k = wd::lowbit_q6_k_head_q8_k_eligible(qrt.output);
+            std::cerr << "output-head q8_k=" << (head_q8_k ? "on" : "off")
+                      << " (WARODECODE_HEAD_Q8_K="
+                      << (wd::lowbit_head_q8_k_enabled() ? "1" : "0") << ")\n";
 
             if (args.load_only) {
                 std::cout << "{\"engine\":\"warodecode-qwen38\",\"gpu\":\"" << prop.name
@@ -877,12 +1560,84 @@ int main(int argc, char** argv) {
                           << ",\"decode_state_initialized\":true"
                           << ",\"ple\":" << (qrt.ple_table ? "true" : "false")
                           << ",\"fused_experts\":" << (qrt.fused_experts ? "true" : "false")
+                          << ",\"head_q8_k\":" << (head_q8_k ? "true" : "false")
                           << ",\"kernel_family\":\"" << kernel_plan.family << "\"}\n";
                 return 0;
             }
 
             if (args.start_token >= qrt.vocab) {
                 throw std::runtime_error("--start-token がQwen3.8語彙数以上です");
+            }
+            if (!args.debug_attention_output_f32.empty() &&
+                args.debug_attention_output_f32.size() != static_cast<size_t>(qrt.layout.hidden)) {
+                throw std::runtime_error("attention output override must match hidden size");
+            }
+            if (!args.debug_layer8_after_attention_residual_f32.empty() &&
+                args.debug_layer8_after_attention_residual_f32.size() !=
+                    static_cast<size_t>(qrt.layout.hidden) * qrt.layout.hc_count) {
+                throw std::runtime_error("layer-8 after-attention residual override must match HC width");
+            }
+            if (!args.debug_layer8_hc_ffn_mix_f32.empty() &&
+                args.debug_layer8_hc_ffn_mix_f32.size() != static_cast<size_t>(qrt.layout.hidden)) {
+                throw std::runtime_error("layer-8 HC FFN mix override must match hidden size");
+            }
+            const size_t hc_width = static_cast<size_t>(qrt.layout.hidden) * qrt.layout.hc_count;
+            if (!args.debug_hc_residual.empty() &&
+                (args.debug_layer_output_all_positions_f32_file.empty()
+                    ? args.debug_hc_residual.size() != hc_width
+                    : args.debug_hc_residual.size() != static_cast<size_t>(args.generate) * hc_width)) {
+                throw std::runtime_error("HC residual output override must match the selected position range");
+            }
+            if (!args.debug_router_cpu_activation_f32.empty() &&
+                args.debug_router_cpu_activation_f32.size() != static_cast<size_t>(qrt.layout.hidden)) {
+                throw std::runtime_error("CPU router activation override must match hidden size");
+            }
+            if (!args.debug_routed_moe_output.empty() &&
+                args.debug_routed_moe_output.size() != static_cast<size_t>(qrt.layout.hidden)) {
+                throw std::runtime_error("routed MoE output override must match hidden size");
+            }
+            if (!args.debug_routed_moe_output_all_positions.empty() &&
+                args.debug_routed_moe_output_all_positions.size() !=
+                    static_cast<size_t>(args.generate) * qrt.layout.hidden) {
+                throw std::runtime_error("all-position routed MoE output must match generated positions");
+            }
+            if (!args.debug_moe_ids.empty() &&
+                args.debug_moe_ids.size() != static_cast<size_t>(qrt.layout.experts_used)) {
+                throw std::runtime_error("debug MoE expert IDs must match top-k width");
+            }
+            if (!args.debug_moe_weights.empty() &&
+                args.debug_moe_weights.size() != static_cast<size_t>(qrt.layout.experts_used)) {
+                throw std::runtime_error("debug MoE weights must match top-k width");
+            }
+            for (const auto & route : args.debug_moe_routes) {
+                if (route.position >= args.generate ||
+                    route.expert_ids.size() != static_cast<size_t>(qrt.layout.experts_used) ||
+                    (!route.weights.empty() &&
+                     route.weights.size() != static_cast<size_t>(qrt.layout.experts_used))) {
+                    throw std::runtime_error("MoE route file row does not match generated positions/top-k width");
+                }
+            }
+            if (!args.debug_final_residual_f32.empty() && args.debug_final_residual_f32.size() !=
+                static_cast<size_t>(qrt.layout.hidden) * qrt.layout.hc_count) {
+                throw std::runtime_error("final residual override must match HC width");
+            }
+            if (!args.debug_layer14_gdn_core_f32.empty() && args.debug_layer14_gdn_core_f32.size() !=
+                static_cast<size_t>(qrt.layout.ssm_state_size) * qrt.layout.ssm_dt_rank) {
+                throw std::runtime_error("layer-14 GDN core override must match value width");
+            }
+            if (!args.debug_layer14_gdn_norm_output_f32.empty() && args.debug_layer14_gdn_norm_output_f32.size() !=
+                static_cast<size_t>(qrt.layout.ssm_state_size) * qrt.layout.ssm_dt_rank) {
+                throw std::runtime_error("layer-14 GDN norm output override must match value width");
+            }
+            if (!args.debug_layer9_gdn_state_f32.empty() && args.debug_layer9_gdn_state_f32.size() !=
+                static_cast<size_t>(qrt.layout.ssm_state_size) * qrt.layout.ssm_state_size * qrt.layout.ssm_dt_rank) {
+                throw std::runtime_error("layer-9 GDN state override must match recurrent state width");
+            }
+            const size_t gdn_conv_channels = static_cast<size_t>(qrt.layout.ssm_state_size) *
+                (2 * qrt.layout.ssm_group_count + qrt.layout.ssm_dt_rank);
+            if (!args.debug_layer9_gdn_conv_state_f32.empty() && args.debug_layer9_gdn_conv_state_f32.size() !=
+                static_cast<size_t>(qrt.layout.ssm_conv_kernel - 1) * gdn_conv_channels) {
+                throw std::runtime_error("layer-9 GDN convolution state override must match state width");
             }
             for (int token : args.forced_input_tokens) {
                 if (token >= qrt.vocab) throw std::runtime_error("forced input token is outside the Qwen3.8 vocabulary");
@@ -894,8 +1649,75 @@ int main(int argc, char** argv) {
             std::vector<std::pair<int, float>> top_logits;
             wd::Qwen38Trace trace;
             trace.use_f32_hc_layer0 = args.debug_f32_hc_layer0;
+            trace.debug_f32_hc_attn_0_8 = args.debug_f32_hc_attn_0_8;
+            trace.debug_f32_hc_ffn_0_8 = args.debug_f32_hc_ffn_0_8;
+            trace.debug_hc_q8_1_attn_from = args.debug_hc_q8_1_attn_from;
+            trace.debug_hc_q8_1_attn_through = args.debug_hc_q8_1_attn_through;
+            trace.debug_hc_q8_1_ffn_from = args.debug_hc_q8_1_ffn_from;
+            trace.debug_hc_q8_1_ffn_through = args.debug_hc_q8_1_ffn_through;
+            trace.debug_hc_q8_0_ffn_from = args.debug_hc_q8_0_ffn_from;
+            trace.debug_hc_q8_0_ffn_through = args.debug_hc_q8_0_ffn_through;
+            trace.debug_f32_hc_ffn_layer8 = args.debug_f32_hc_ffn_layer8;
+            trace.debug_f32_hc_head = args.debug_f32_hc_head;
+            trace.debug_layer0_hc_gate_f32_store = args.debug_layer0_hc_gate_f32_store;
+            trace.debug_layer0_hc_gate_f32_sigmoid = args.debug_layer0_hc_gate_f32_sigmoid;
+            trace.debug_hc_gate_q8_0_layer = args.debug_hc_gate_q8_0_layer;
+            trace.debug_hc_full_q8_0_layer = args.debug_hc_full_q8_0_layer;
+            trace.debug_qsa_q8_0_layer = args.debug_qsa_q8_0_layer;
+            trace.debug_qsa_v_q8_0_layer = args.debug_qsa_v_q8_0_layer;
+            trace.debug_hc_norm_f32_layer = args.debug_hc_norm_f32_layer;
+            trace.debug_hc_norm_f32 = args.debug_hc_norm_f32;
+            trace.debug_attention_output_f32_layer = args.debug_attention_output_f32_layer;
+            trace.debug_attention_output_f32 = args.debug_attention_output_f32;
+            trace.debug_attention_input_f32_layer = args.debug_attention_input_f32_layer;
+            trace.debug_attention_input_f32 = args.debug_attention_input_f32;
+            trace.debug_qsa_context_f32_layer = args.debug_qsa_context_f32_layer;
+            trace.debug_qsa_context_f32 = args.debug_qsa_context_f32;
+            trace.debug_qsa_pregate_f32_layer = args.debug_qsa_pregate_f32_layer;
+            trace.debug_qsa_pregate_f32 = args.debug_qsa_pregate_f32;
+            trace.debug_qsa_query_f32_layer = args.debug_qsa_query_f32_layer;
+            trace.debug_qsa_query_f32 = args.debug_qsa_query_f32;
+            trace.debug_qsa_key_store_f32_layer = args.debug_qsa_key_store_f32_layer;
+            trace.debug_qsa_key_store_f32 = args.debug_qsa_key_store_f32;
+            trace.debug_qsa_value_store_f32_layer = args.debug_qsa_value_store_f32_layer;
+            trace.debug_qsa_value_store_f32 = args.debug_qsa_value_store_f32;
+            trace.debug_qsa_key_cache_prefix_f32_layer = args.debug_qsa_key_cache_prefix_f32_layer;
+            trace.debug_qsa_key_cache_prefix_f32 = args.debug_qsa_key_cache_prefix_f32;
+            trace.debug_qsa_value_cache_prefix_f32_layer = args.debug_qsa_value_cache_prefix_f32_layer;
+            trace.debug_qsa_value_cache_prefix_f32 = args.debug_qsa_value_cache_prefix_f32;
+            trace.debug_hc_attn_combine_layer = args.debug_hc_attn_combine_layer;
+            trace.debug_hc_attn_combine_f32 = args.debug_hc_attn_combine_f32;
+            trace.debug_hc_inject_f32_layer = args.debug_hc_inject_f32_layer;
+            trace.debug_hc_inject_f32 = args.debug_hc_inject_f32;
+            trace.debug_layer_input_residual_layer = args.debug_layer_input_residual_layer;
+            trace.debug_layer_input_residual_f32 = args.debug_layer_input_residual_f32;
+            trace.debug_layer8_after_attention_residual_f32 = args.debug_layer8_after_attention_residual_f32;
+            trace.debug_layer8_hc_ffn_mix_f32 = args.debug_layer8_hc_ffn_mix_f32;
+            trace.debug_hc_residual_layer = args.debug_layer8_output_layer;
+            trace.debug_final_residual_f32 = args.debug_final_residual_f32;
+            trace.debug_layer14_gdn_core_f32 = args.debug_layer14_gdn_core_f32;
+            trace.debug_layer14_gdn_norm_output_f32 = args.debug_layer14_gdn_norm_output_f32;
+            trace.debug_layer9_gdn_state_f32 = args.debug_layer9_gdn_state_f32;
+            trace.debug_layer9_gdn_conv_state_f32 = args.debug_layer9_gdn_conv_state_f32;
+            trace.debug_layer9_gdn_state_layer = args.debug_layer9_gdn_state_layer;
+            trace.debug_layer9_gdn_conv_state_layer = args.debug_layer9_gdn_conv_state_layer;
+            trace.debug_moe_ids = args.debug_moe_ids;
+            trace.debug_moe_weights = args.debug_moe_weights;
+            trace.debug_moe_routes = args.debug_moe_routes;
+            trace.debug_router_cpu_activation_f32 = args.debug_router_cpu_activation_f32;
+            trace.debug_routed_moe_output = !args.debug_routed_moe_output_all_positions_f32_file.empty()
+                ? args.debug_routed_moe_output_all_positions : args.debug_routed_moe_output;
+            trace.debug_routed_moe_output_layer = 8;
+            trace.debug_routed_moe_output_all_positions =
+                !args.debug_routed_moe_output_all_positions_f32_file.empty();
+            trace.debug_ffn_output_layer = args.debug_ffn_output_layer;
+            trace.debug_ffn_output = args.debug_ffn_output;
+            trace.debug_hc_residual = args.debug_hc_residual;
+            trace.debug_hc_residual_all_positions =
+                !args.debug_layer_output_all_positions_f32_file.empty();
             trace.extended_parity = !args.extended_parity_trace.empty();
             trace.state_trace = !args.state_trace_path.empty();
+            trace.state_trace_position = args.state_trace_position;
             const double sec = decoder.run(
                 args.start_token, args.generate, &generated,
                 args.top_k > 0 ? &top_logits : nullptr, args.top_k,
@@ -927,6 +1749,8 @@ int main(int argc, char** argv) {
                       << ",\"mtp\":false"
                       << ",\"debug_f32_hc_layer0\":" << (args.debug_f32_hc_layer0 ? "true" : "false")
                       << ",\"cuda_graph\":false"
+                      << ",\"head_q8_k\":" << (head_q8_k ? "true" : "false")
+                      << ",\"head_q8_k_calls\":" << wd::lowbit_head_q8_k_launch_count()
                       << ",\"kernel_family\":\"" << kernel_plan.family << "\""
                       << ",\"token_ids\":[";
             for (size_t i = 0; i < generated.size(); ++i) {
@@ -1001,6 +1825,41 @@ int main(int argc, char** argv) {
                         std::cout << args.forced_input_tokens[i];
                     }
                     std::cout << ']';
+                    if (trace.state_trace_position >= 0) {
+                        std::cout << ",\"trace_position\":" << trace.state_trace_position;
+                    }
+                    std::cout << ",\"debug_injection_counts\":{\"moe_routes\":"
+                              << trace.debug_moe_route_override_count
+                              << ",\"routed_moe_outputs\":"
+                              << trace.debug_routed_moe_output_override_count
+                              << ",\"attention_outputs\":"
+                              << trace.debug_attention_output_override_count
+                              << ",\"attention_inputs\":"
+                              << trace.debug_attention_input_override_count
+                              << ",\"qsa_contexts\":"
+                              << trace.debug_qsa_context_override_count
+                              << ",\"qsa_pregates\":"
+                              << trace.debug_qsa_pregate_override_count
+                              << ",\"qsa_queries\":"
+                              << trace.debug_qsa_query_override_count
+                              << ",\"qsa_key_stores\":"
+                              << trace.debug_qsa_key_store_override_count
+                              << ",\"qsa_value_stores\":"
+                              << trace.debug_qsa_value_store_override_count
+                              << ",\"qsa_key_cache_prefixes\":"
+                              << trace.debug_qsa_key_cache_prefix_override_count
+                              << ",\"qsa_value_cache_prefixes\":"
+                              << trace.debug_qsa_value_cache_prefix_override_count
+                              << ",\"hc_attention_residuals\":"
+                              << trace.debug_hc_attn_combine_override_count
+                              << ",\"hc_injects\":"
+                              << trace.debug_hc_inject_override_count
+                              << ",\"hc_norms\":"
+                              << trace.debug_hc_norm_override_count
+                              << ",\"layer_inputs\":"
+                              << trace.debug_layer_input_residual_override_count
+                              << ",\"layer_outputs\":"
+                              << trace.debug_hc_output_override_count << '}';
                 }
                 std::cout << ",\"vectors\":[";
                 for (size_t i = 0; i < trace.extended_vectors.size(); ++i) {

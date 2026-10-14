@@ -27,6 +27,15 @@ g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_tuning_test.cpp -o /tmp
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/qwen38_trace_test.cpp -o /tmp/warodecode-qwen38-trace-test
 /tmp/warodecode-qwen38-trace-test
 
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Isrc tests/issue1_residual_accum_test.cpp -o /tmp/warodecode-issue1-residual-accum-test
+/tmp/warodecode-issue1-residual-accum-test >/dev/null
+
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Isrc tests/issue1_ffn_precision_test.cpp -o /tmp/warodecode-issue1-ffn-precision-test
+/tmp/warodecode-issue1-ffn-precision-test >/dev/null
+
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Isrc tests/issue1_ffn_ablation_test.cpp -o /tmp/warodecode-issue1-ffn-ablation-test
+/tmp/warodecode-issue1-ffn-ablation-test
+
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic tests/model_profile_test.cpp -o /tmp/warodecode-model-profile-test
 /tmp/warodecode-model-profile-test tests/qwen38-fixture/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-00001-of-00002.gguf >/dev/null
 
@@ -51,6 +60,9 @@ assert m['arch'] == 'qwen4exp', m
 assert m['shards'] == 2, m
 assert m['quant'] == 'iq3e', m
 PY2
+
+# nvcc が無くても CUDA カーネルの構文・型を検査できる (CI で実行する)
+bash tests/qwen38_cuda_syntax_check.sh
 
 rm -rf tests/qwen38-fixture
 

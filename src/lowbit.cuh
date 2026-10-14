@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -548,6 +549,40 @@ __global__ void q8_0_gather_row_kernel(
     out[i] = __float2half(d * static_cast<float>(q));
 }
 
+// Same gather, F32 output. ggml dequantises the embedding row into F32 and never
+// rounds it, so the half round trip in the F16 form is a real (and, because the
+// embedding seeds every position, systematic) error source.
+__global__ void q8_0_gather_row_f32_kernel(
+        const uint8_t * __restrict__ w,
+        int cols,
+        int row,
+        float * __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= cols) return;
+    const int block = i >> 5;
+    const int lane = i & 31;
+    const int blocks_per_row = cols >> 5;
+    const uint8_t * p = w +
+        (static_cast<size_t>(row) * blocks_per_row + block) * 34u;
+    const float d = lowbit_half(p);
+    const int8_t q = *reinterpret_cast<const int8_t *>(p + 2 + lane);
+    out[i] = d * static_cast<float>(q);
+}
+
+inline void launch_q8_0_gather_row_f32(
+        const LowBitMatrix & w,
+        int row,
+        float * out,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (w.type != GgmlType::Q8_0 || w.cols <= 0 || w.cols % 32 != 0 ||
+        row < 0 || row >= w.rows || out == nullptr) {
+        throw std::runtime_error("invalid Q8_0 embedding row gather (f32)");
+    }
+    q8_0_gather_row_f32_kernel<<<(w.cols + threads - 1) / threads, threads, 0, stream>>>(
+        w.data, w.cols, row, out);
+}
+
 inline void launch_q8_0_gather_row(
         const LowBitMatrix & w,
         int row,
@@ -561,6 +596,27 @@ inline void launch_q8_0_gather_row(
     q8_0_gather_row_kernel<<<(w.cols + threads - 1) / threads, threads, 0, stream>>>(
         w.data, w.cols, row, out);
 }
+
+// ---------------------------------------------------------------------------
+// Q6_K x Q8_K, the vec_dot pair llama.cpp uses for the output head.
+//
+// Q6_K's vec_dot_type is Q8_K, so the CPU reference widens the F16 activation to
+// F32, quantises it exactly like quantize_row_q8_K_ref and only then takes the
+// integer dot product:
+//   lowbit_copy_half_to_f32_kernel -> launch_q8_k_quantize_f32 -> GEMV
+// The F16-activation q6_k_gemv_kernel rounds the activation instead and drifts by
+// roughly a percent per projection, which the argmax over the vocab-sized head
+// sees directly. The definitions follow the Q8_K activation quantiser below;
+// they are declared here because launch_lowbit_gemv_float dispatches to them.
+// ---------------------------------------------------------------------------
+inline bool lowbit_head_q8_k_enabled();
+inline bool lowbit_q6_k_head_q8_k_eligible(const LowBitMatrix & weights);
+inline void launch_q6_k_head_gemv_q8_k_f32(
+        const LowBitMatrix & weights,
+        const __half * activation,
+        float * output,
+        cudaStream_t stream,
+        int threads = 256);
 
 inline void launch_lowbit_gemv_half(
         const LowBitMatrix & w,
@@ -598,6 +654,14 @@ inline void launch_lowbit_gemv_float(
     if (threads < 32 || threads % 32 != 0) {
         throw std::runtime_error("low-bit GEMV threads must be a multiple of 32");
     }
+    // Q6_K is the Qwen3.8 output head, whose vec_dot_type in ggml is Q8_K.
+    // llama.cpp widens the head activation to F32, quantises it to Q8_K and takes
+    // the integer dot product, so route the Q6_K case through that pipeline when
+    // WARODECODE_HEAD_Q8_K is on and the geometry supports it.
+    if (lowbit_q6_k_head_q8_k_eligible(w)) {
+        launch_q6_k_head_gemv_q8_k_f32(w, x, y, stream, threads);
+        return;
+    }
     const int warps = threads / 32;
     const int blocks = (w.rows + warps - 1) / warps;
 
@@ -614,6 +678,806 @@ inline void launch_lowbit_gemv_float(
     } else {
         throw std::runtime_error("unsupported low-bit GEMV type");
     }
+}
+
+// ---------------------------------------------------------------------------
+// ggml-compatible activation quantisation for the low-bit GEMV kernels below.
+//
+// llama.cpp's CPU reference quantises the activation to the weight type's
+// vec_dot_type before every matmul, then takes an integer dot product:
+//   IQ2_S, IQ3_S, Q6_K, IQ2_XXS -> Q8_K (256-value blocks, int8 quants + F32
+//                                  block scale + 16 per-16-value integer sums)
+//   IQ4_NL, Q8_0                -> Q8_0 (32-value blocks, int8 quants + F16
+//                                  block scale)
+// The kernels above take an F16 activation and therefore round the activation
+// before multiplying, which drifts from the CPU oracle by roughly a percent per
+// projection. The kernels in this section consume the quantised activation
+// instead and reproduce ggml's integer dot product and scale application order.
+// ---------------------------------------------------------------------------
+
+// ggml quantize_row_q8_K: one warp per 256-value block, each lane owning eight
+// values. ggml picks "max" as the signed value at the position of the largest
+// magnitude, so its iscale = -127/max may be negative. Reducing |x| instead only
+// flips the sign of iscale, of every quantised value and of d = 1/iscale
+// together, which leaves every downstream product bit-identical.
+__global__ void q8_k_quantize_f32_kernel(
+        const float * __restrict__ x,
+        int8_t * __restrict__ quantized,
+        float * __restrict__ scales,
+        int16_t * __restrict__ bsums,
+        int blocks) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int block = blockIdx.x * warps_per_block + warp_in_block;
+    if (block >= blocks) return;
+
+    const int base = lane << 3;
+    const float * src = x + static_cast<size_t>(block) * 256u;
+    int8_t * dst = quantized + static_cast<size_t>(block) * 256u;
+
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        amax = fmaxf(amax, fabsf(src[base + j]));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, offset));
+    }
+    amax = __shfl_sync(0xffffffffu, amax, 0);
+
+    if (amax == 0.0f) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) dst[base + j] = 0;
+        if (lane == 0) {
+            scales[block] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) bsums[static_cast<size_t>(block) * 16u + j] = 0;
+        }
+        return;
+    }
+
+    // ggml stores MIN(127, nearest_int(iscale*x)). |iscale*x| never exceeds 127
+    // so the clamp cannot fire, but it is kept for parity with the reference.
+    const float iscale = __fdiv_rn(-127.0f, amax);
+    int partial = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int q = min(127, __float2int_rn(__fmul_rn(src[base + j], iscale)));
+        dst[base + j] = static_cast<int8_t>(q);
+        partial += q;
+    }
+
+    // bsums[j] is the integer sum of values 16j..16j+15, i.e. of lanes 2j, 2j+1.
+    const int pair_lo = __shfl_sync(0xffffffffu, partial, (lane & 15) << 1);
+    const int pair_hi = __shfl_sync(0xffffffffu, partial, ((lane & 15) << 1) + 1);
+    if (lane == 0) scales[block] = __fdiv_rn(1.0f, iscale);
+    if (lane < 16) {
+        bsums[static_cast<size_t>(block) * 16u + lane] = static_cast<int16_t>(pair_lo + pair_hi);
+    }
+}
+
+inline void launch_q8_k_quantize_f32(
+        const float * input,
+        int elements,
+        int8_t * quantized,
+        float * scales,
+        int16_t * bsums,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (elements <= 0 || elements % 256 != 0) {
+        throw std::runtime_error("Q8_K quantisation requires a positive multiple of 256 elements");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("Q8_K quantisation threads must be a multiple of 32");
+    }
+    const int blocks = elements / 256;
+    const int warps = threads / 32;
+    q8_k_quantize_f32_kernel<<<(blocks + warps - 1) / warps, threads, 0, stream>>>(
+        input, quantized, scales, bsums, blocks);
+}
+
+// ggml ggml_vec_dot_iq2_s_q8_K in warp form. The IQ2_S unpack (grid index,
+// sign bits, 4-bit group scales) is the same as iq2_s_gemv_kernel above; only
+// the activation changed. ggml accumulates an int32 bsum per 256-value
+// superblock as sum_i ls_i * sumi_i with ls_i = 1 + 2*scale4_i, applies the F32
+// scale d = fp16(weight_d) * activation_d once per superblock and multiplies the
+// total by 0.125. The AVX2 kernel keeps eight int32 lanes alive, each covering
+// four consecutive values, and reduces them with hsum_float_8 at the end, so the
+// four-value chunks are reduced separately here too and the closing float tree
+// matches hsum_float_8.
+template <bool OUT_F32>
+__global__ void iq2_s_q8_k_gemv_kernel(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        void * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const int superblocks_per_row = cols >> 8; // 256 values per IQ2_S block
+    const size_t row_stride = static_cast<size_t>(superblocks_per_row) * 82u;
+    const uint8_t * row_ptr = w + static_cast<size_t>(row) * row_stride;
+
+    const int group = lane >> 3; // which of the four 8-value grids of a 32-value block
+    const int lane8 = lane & 7;
+    float accumulator = 0.0f;
+
+    for (int sb = 0; sb < superblocks_per_row; ++sb) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(sb) * 82u;
+        const float d_w = lowbit_half(blk);
+        const uint8_t * qs = blk + 2;
+        const uint8_t * qh = qs + 64;
+        const uint8_t * scales = qh + 8;
+        const uint8_t * signs = qs + 32;
+        const int8_t * a = x_qs + (sb << 8);
+
+        int bsum = 0;
+#pragma unroll
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const uint8_t scale_byte = scales[ib32];
+            const int ls = group < 2
+                ? 1 + 2 * static_cast<int>(scale_byte & 0x0f)
+                : 1 + 2 * static_cast<int>(scale_byte >> 4);
+
+            const uint16_t grid_index = static_cast<uint16_t>(
+                static_cast<uint16_t>(qs[ib32 * 4 + group]) |
+                (static_cast<uint16_t>(
+                    (static_cast<uint16_t>(qh[ib32]) << (8 - 2 * group)) & 0x300u)));
+            int qv = static_cast<int>(iq2s_grid_value(grid_index, lane8));
+            if (signs[ib32 * 4 + group] & (1u << lane8)) qv = -qv;
+
+            bsum += static_cast<int>(a[(ib32 << 5) + lane]) * qv * ls;
+        }
+
+        // Sum the four values of every 4-value chunk: lane 4m then holds chunk m,
+        // which is exactly the int32 lane the AVX2 kernel feeds to its FMA.
+        bsum += __shfl_down_sync(0xffffffffu, bsum, 2);
+        bsum += __shfl_down_sync(0xffffffffu, bsum, 1);
+        if ((lane & 3) == 0) {
+            accumulator = fmaf(d_w * x_d[sb], static_cast<float>(bsum), accumulator);
+        }
+    }
+
+    const float v0 = __shfl_sync(0xffffffffu, accumulator, 0);
+    const float v1 = __shfl_sync(0xffffffffu, accumulator, 4);
+    const float v2 = __shfl_sync(0xffffffffu, accumulator, 8);
+    const float v3 = __shfl_sync(0xffffffffu, accumulator, 12);
+    const float v4 = __shfl_sync(0xffffffffu, accumulator, 16);
+    const float v5 = __shfl_sync(0xffffffffu, accumulator, 20);
+    const float v6 = __shfl_sync(0xffffffffu, accumulator, 24);
+    const float v7 = __shfl_sync(0xffffffffu, accumulator, 28);
+    if (lane == 0) {
+        // hsum_float_8(accumf): (a4+a0, a5+a1, a6+a2, a7+a3) then a tree.
+        const float r0 = __fadd_rn(v4, v0);
+        const float r1 = __fadd_rn(v5, v1);
+        const float r2 = __fadd_rn(v6, v2);
+        const float r3 = __fadd_rn(v7, v3);
+        const float s0 = __fadd_rn(r0, r2);
+        const float s1 = __fadd_rn(r1, r3);
+        const float value = 0.125f * __fadd_rn(s0, s1);
+        if constexpr (OUT_F32) {
+            static_cast<float *>(y)[row] = value;
+        } else {
+            static_cast<__half *>(y)[row] = __float2half(value);
+        }
+    }
+}
+
+inline void launch_iq2_s_gemv_q8_k_f32(
+        const LowBitMatrix & weights,
+        const int8_t * activation,
+        const float * activation_scales,
+        float * output,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (weights.type != GgmlType::IQ2_S || weights.rows <= 0 ||
+        weights.cols <= 0 || weights.cols % 256 != 0) {
+        throw std::runtime_error("IQ2_S x Q8_K GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("IQ2_S x Q8_K GEMV threads must be a multiple of 32");
+    }
+    const int warps = threads / 32;
+    const int blocks = (weights.rows + warps - 1) / warps;
+    iq2_s_q8_k_gemv_kernel<true><<<blocks, threads, 0, stream>>>(
+        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+}
+
+inline void launch_iq2_s_gemv_q8_k_half(
+        const LowBitMatrix & weights,
+        const int8_t * activation,
+        const float * activation_scales,
+        __half * output,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (weights.type != GgmlType::IQ2_S || weights.rows <= 0 ||
+        weights.cols <= 0 || weights.cols % 256 != 0) {
+        throw std::runtime_error("IQ2_S x Q8_K GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("IQ2_S x Q8_K GEMV threads must be a multiple of 32");
+    }
+    const int warps = threads / 32;
+    const int blocks = (weights.rows + warps - 1) / warps;
+    iq2_s_q8_k_gemv_kernel<false><<<blocks, threads, 0, stream>>>(
+        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+}
+
+// ggml ggml_vec_dot_iq3_s_q8_K in warp form, consuming the same ggml-exact Q8_K
+// activation as iq2_s_q8_k_gemv_kernel above. The IQ3_S unpack (two 4-value
+// halves per 32-value block, 9-bit grid index, one sign byte per 8 values and a
+// packed pair of 4-bit group scales) is the same as iq3_s_gemv_kernel; only the
+// activation changed. ggml accumulates an int32 bsum per 256-value superblock as
+// sum_i ls_i * sumi_i with ls_i = 1 + 2*scale4_i, applies the F32 scale
+// d = fp16(weight_d) * activation_d once per superblock and returns
+// hsum_float_8(accumf) with no further factor (IQ2_S ends with 0.125, IQ3_S does
+// not). The AVX2 kernel keeps eight int32 lanes alive, each covering four
+// consecutive values, and reduces them with hsum_float_8 at the end, so the
+// four-value chunks are reduced separately here too and the closing float tree
+// matches hsum_float_8.
+template <bool OUT_F32>
+__global__ void iq3_s_q8_k_gemv_kernel(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        void * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const int superblocks_per_row = cols >> 8; // 256 values per IQ3_S block
+    const size_t row_stride = static_cast<size_t>(superblocks_per_row) * 110u;
+    const uint8_t * row_ptr = w + static_cast<size_t>(row) * row_stride;
+
+    const int group = lane >> 3; // which of the four 8-value grids of a 32-value block
+    const int lane8 = lane & 7;
+    float accumulator = 0.0f;
+
+    for (int sb = 0; sb < superblocks_per_row; ++sb) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(sb) * 110u;
+        const float d_w = lowbit_half(blk);
+        const uint8_t * qs = blk + 2;
+        const uint8_t * qh = qs + 64;
+        const uint8_t * signs = qh + 8;
+        const uint8_t * scales = signs + 32;
+        const int8_t * a = x_qs + (sb << 8);
+
+        int bsum = 0;
+#pragma unroll
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const uint8_t * qs32 = qs + ib32 * 8;
+            const uint8_t qh32 = qh[ib32];
+            const uint8_t scale_byte = scales[ib32 >> 1];
+            const int ls = (ib32 & 1) ? 1 + 2 * static_cast<int>(scale_byte >> 4)
+                                      : 1 + 2 * static_cast<int>(scale_byte & 0x0f);
+
+            uint16_t grid_index;
+            int grid_lane;
+            if (lane8 < 4) {
+                grid_index = static_cast<uint16_t>(qs32[2 * group])
+                    | static_cast<uint16_t>(
+                        (static_cast<uint16_t>(qh32) << (8 - 2 * group)) & 0x100u);
+                grid_lane = lane8;
+            } else {
+                grid_index = static_cast<uint16_t>(qs32[2 * group + 1])
+                    | static_cast<uint16_t>(
+                        (static_cast<uint16_t>(qh32) << (7 - 2 * group)) & 0x100u);
+                grid_lane = lane8 - 4;
+            }
+
+            int qv = static_cast<int>(iq3s_grid_value(grid_index, grid_lane));
+            if (signs[ib32 * 4 + group] & (1u << lane8)) qv = -qv;
+
+            bsum += static_cast<int>(a[(ib32 << 5) + lane]) * qv * ls;
+        }
+
+        // Sum the four values of every 4-value chunk: lane 4m then holds chunk m,
+        // which is exactly the int32 lane the AVX2 kernel feeds to its FMA.
+        bsum += __shfl_down_sync(0xffffffffu, bsum, 2);
+        bsum += __shfl_down_sync(0xffffffffu, bsum, 1);
+        if ((lane & 3) == 0) {
+            accumulator = fmaf(d_w * x_d[sb], static_cast<float>(bsum), accumulator);
+        }
+    }
+
+    const float v0 = __shfl_sync(0xffffffffu, accumulator, 0);
+    const float v1 = __shfl_sync(0xffffffffu, accumulator, 4);
+    const float v2 = __shfl_sync(0xffffffffu, accumulator, 8);
+    const float v3 = __shfl_sync(0xffffffffu, accumulator, 12);
+    const float v4 = __shfl_sync(0xffffffffu, accumulator, 16);
+    const float v5 = __shfl_sync(0xffffffffu, accumulator, 20);
+    const float v6 = __shfl_sync(0xffffffffu, accumulator, 24);
+    const float v7 = __shfl_sync(0xffffffffu, accumulator, 28);
+    if (lane == 0) {
+        // hsum_float_8(accumf): (a4+a0, a5+a1, a6+a2, a7+a3) then a tree. ggml
+        // applies no closing factor for IQ3_S, unlike IQ2_S' 0.125.
+        const float r0 = __fadd_rn(v4, v0);
+        const float r1 = __fadd_rn(v5, v1);
+        const float r2 = __fadd_rn(v6, v2);
+        const float r3 = __fadd_rn(v7, v3);
+        const float s0 = __fadd_rn(r0, r2);
+        const float s1 = __fadd_rn(r1, r3);
+        const float value = __fadd_rn(s0, s1);
+        if constexpr (OUT_F32) {
+            static_cast<float *>(y)[row] = value;
+        } else {
+            static_cast<__half *>(y)[row] = __float2half(value);
+        }
+    }
+}
+
+inline void launch_iq3_s_gemv_q8_k_f32(
+        const LowBitMatrix & weights,
+        const int8_t * activation,
+        const float * activation_scales,
+        float * output,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (weights.type != GgmlType::IQ3_S || weights.rows <= 0 ||
+        weights.cols <= 0 || weights.cols % 256 != 0) {
+        throw std::runtime_error("IQ3_S x Q8_K GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("IQ3_S x Q8_K GEMV threads must be a multiple of 32");
+    }
+    const int warps = threads / 32;
+    const int blocks = (weights.rows + warps - 1) / warps;
+    iq3_s_q8_k_gemv_kernel<true><<<blocks, threads, 0, stream>>>(
+        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+}
+
+inline void launch_iq3_s_gemv_q8_k_half(
+        const LowBitMatrix & weights,
+        const int8_t * activation,
+        const float * activation_scales,
+        __half * output,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (weights.type != GgmlType::IQ3_S || weights.rows <= 0 ||
+        weights.cols <= 0 || weights.cols % 256 != 0) {
+        throw std::runtime_error("IQ3_S x Q8_K GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("IQ3_S x Q8_K GEMV threads must be a multiple of 32");
+    }
+    const int warps = threads / 32;
+    const int blocks = (weights.rows + warps - 1) / warps;
+    iq3_s_q8_k_gemv_kernel<false><<<blocks, threads, 0, stream>>>(
+        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+}
+
+// ggml kvalues_iq4nl as integers: ggml keeps the table as int8_t and negates the
+// Q8_0 activation rather than the codebook, which is the same product.
+__device__ __forceinline__ int iq4_nl_lut_value(uint8_t q) {
+    constexpr int8_t lut[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+           1,   13,  25,  38,  53,  69,  89, 113,
+    };
+    return static_cast<int>(lut[q & 0x0f]);
+}
+
+// ggml ggml_vec_dot_iq4_nl_q8_0 in warp form, consuming the ggml-exact Q8_0
+// activation (int8 quants + F16 block scale) instead of an F16 activation.
+// ggml sums the two halves of every 32-value block as integers, applies
+// d = fp16(activation_d) * fp16(weight_d) once per block, and the AVX2 kernel
+// keeps even and odd blocks in two separate eight-lane float accumulators that
+// are added before hsum_float_8. Both details are reproduced here: the 4-value
+// chunks stay apart, even and odd blocks use separate accumulators, and the
+// closing tree matches hsum_float_8. ggml falls back to a scalar tail for an odd
+// block count, so the launchers require a multiple of 64 columns.
+template <bool OUT_F32>
+__global__ void iq4_nl_q8_0_act_gemv_kernel(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const __half * __restrict__ x_scales,
+        void * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const int blocks_per_row = cols >> 5;
+    const size_t row_stride = static_cast<size_t>(blocks_per_row) * 18u;
+    const uint8_t * row_ptr = w + static_cast<size_t>(row) * row_stride;
+
+    float acc_even = 0.0f;
+    float acc_odd = 0.0f;
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(b) * 18u;
+        const float d = lowbit_half(blk) * __half2float(x_scales[b]);
+        const uint8_t packed = blk[2 + (lane & 15)];
+        const uint8_t q = lane < 16 ? (packed & 0x0f) : (packed >> 4);
+        int prod = static_cast<int>(x_qs[(b << 5) + lane]) * iq4_nl_lut_value(q);
+
+        prod += __shfl_down_sync(0xffffffffu, prod, 2);
+        prod += __shfl_down_sync(0xffffffffu, prod, 1);
+        if ((lane & 3) == 0) {
+            if (b & 1) {
+                acc_odd = fmaf(d, static_cast<float>(prod), acc_odd);
+            } else {
+                acc_even = fmaf(d, static_cast<float>(prod), acc_even);
+            }
+        }
+    }
+
+    const float e0 = __shfl_sync(0xffffffffu, acc_even, 0);
+    const float e1 = __shfl_sync(0xffffffffu, acc_even, 4);
+    const float e2 = __shfl_sync(0xffffffffu, acc_even, 8);
+    const float e3 = __shfl_sync(0xffffffffu, acc_even, 12);
+    const float e4 = __shfl_sync(0xffffffffu, acc_even, 16);
+    const float e5 = __shfl_sync(0xffffffffu, acc_even, 20);
+    const float e6 = __shfl_sync(0xffffffffu, acc_even, 24);
+    const float e7 = __shfl_sync(0xffffffffu, acc_even, 28);
+    const float o0 = __shfl_sync(0xffffffffu, acc_odd, 0);
+    const float o1 = __shfl_sync(0xffffffffu, acc_odd, 4);
+    const float o2 = __shfl_sync(0xffffffffu, acc_odd, 8);
+    const float o3 = __shfl_sync(0xffffffffu, acc_odd, 12);
+    const float o4 = __shfl_sync(0xffffffffu, acc_odd, 16);
+    const float o5 = __shfl_sync(0xffffffffu, acc_odd, 20);
+    const float o6 = __shfl_sync(0xffffffffu, acc_odd, 24);
+    const float o7 = __shfl_sync(0xffffffffu, acc_odd, 28);
+    if (lane == 0) {
+        const float v0 = __fadd_rn(e0, o0);
+        const float v1 = __fadd_rn(e1, o1);
+        const float v2 = __fadd_rn(e2, o2);
+        const float v3 = __fadd_rn(e3, o3);
+        const float v4 = __fadd_rn(e4, o4);
+        const float v5 = __fadd_rn(e5, o5);
+        const float v6 = __fadd_rn(e6, o6);
+        const float v7 = __fadd_rn(e7, o7);
+        const float r0 = __fadd_rn(v4, v0);
+        const float r1 = __fadd_rn(v5, v1);
+        const float r2 = __fadd_rn(v6, v2);
+        const float r3 = __fadd_rn(v7, v3);
+        const float s0 = __fadd_rn(r0, r2);
+        const float s1 = __fadd_rn(r1, r3);
+        const float value = __fadd_rn(s0, s1);
+        if constexpr (OUT_F32) {
+            static_cast<float *>(y)[row] = value;
+        } else {
+            static_cast<__half *>(y)[row] = __float2half(value);
+        }
+    }
+}
+
+inline void launch_iq4_nl_gemv_q8_0_f32(
+        const LowBitMatrix & weights,
+        const int8_t * activation,
+        const __half * activation_scales,
+        float * output,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (weights.type != GgmlType::IQ4_NL || weights.rows <= 0 ||
+        weights.cols <= 0 || weights.cols % 64 != 0) {
+        throw std::runtime_error("IQ4_NL x Q8_0 GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("IQ4_NL x Q8_0 GEMV threads must be a multiple of 32");
+    }
+    const int warps = threads / 32;
+    const int blocks = (weights.rows + warps - 1) / warps;
+    iq4_nl_q8_0_act_gemv_kernel<true><<<blocks, threads, 0, stream>>>(
+        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+}
+
+inline void launch_iq4_nl_gemv_q8_0_half(
+        const LowBitMatrix & weights,
+        const int8_t * activation,
+        const __half * activation_scales,
+        __half * output,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (weights.type != GgmlType::IQ4_NL || weights.rows <= 0 ||
+        weights.cols <= 0 || weights.cols % 64 != 0) {
+        throw std::runtime_error("IQ4_NL x Q8_0 GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("IQ4_NL x Q8_0 GEMV threads must be a multiple of 32");
+    }
+    const int warps = threads / 32;
+    const int blocks = (weights.rows + warps - 1) / warps;
+    iq4_nl_q8_0_act_gemv_kernel<false><<<blocks, threads, 0, stream>>>(
+        weights.data, activation, activation_scales, output, weights.rows, weights.cols);
+}
+
+// ---------------------------------------------------------------------------
+// Q6_K x Q8_K output head (definitions for the forward declarations above).
+// ---------------------------------------------------------------------------
+
+inline bool lowbit_env_flag(const char * name, bool default_on) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return default_on;
+    return v[0] != '0';
+}
+
+inline bool lowbit_head_q8_k_enabled() {
+    static const bool enabled = lowbit_env_flag("WARODECODE_HEAD_Q8_K", true);
+    return enabled;
+}
+
+// __half2float is exact, so this is bit-identical to q38_hc_copy_half_to_f32_kernel
+// in qwen38_hc.cuh. That kernel cannot be referenced from here because
+// qwen38_hc.cuh already includes this header.
+__global__ void lowbit_copy_half_to_f32_kernel(
+        const __half * __restrict__ input,
+        float * __restrict__ output,
+        int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) output[i] = __half2float(input[i]);
+}
+
+// ggml ggml_vec_dot_q6_K_q8_K (AVX2 branch) in warp form. It unpacks the 6-bit
+// codes into four 32-value chunks per 128-value half of the superblock, folds two
+// neighbouring products into an int16 with vpmaddubsw, multiplies each 4-value
+// group by its 16-value scale with vpmaddwd, subtracts the q6_K -32 offset
+// through the Q8_K 16-value integer sums and keeps eight int32 lanes alive until
+// hsum_float_8. Those eight int32 lanes become eight float lanes that are only
+// combined at the very end, so this kernel keeps the same lane assignment: warp
+// lane l owns byte l of every 32-value chunk, the 4-value reduction leaves the
+// AVX lanes on lanes 0,4,...,28, and the closing tree is hsum_float_8.
+template <bool OUT_F32>
+__global__ void q6_k_q8_k_gemv_kernel(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const float * __restrict__ x_d,
+        const int16_t * __restrict__ x_bsums,
+        void * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const int superblocks_per_row = cols >> 8;
+    const size_t row_stride = static_cast<size_t>(superblocks_per_row) * 210u;
+    const uint8_t * row_ptr = w + static_cast<size_t>(row) * row_stride;
+
+    // get_scale_shuffle(is) repeats scales[2*is] over the low 16 values of the
+    // 32-value chunk and scales[2*is+1] over the high 16, so the scale a lane
+    // needs depends only on which half of the chunk it sits in.
+    const int scale_select = lane >> 4;
+    float accumulator = 0.0f;
+
+    for (int sb = 0; sb < superblocks_per_row; ++sb) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(sb) * 210u;
+        const uint8_t * ql = blk;
+        const uint8_t * qh = blk + 128;
+        const int8_t * scales = reinterpret_cast<const int8_t *>(blk + 192);
+        const float d_w = lowbit_half(blk + 208);
+        const int8_t * a = x_qs + static_cast<size_t>(sb) * 256u;
+
+        int sumi = 0;
+#pragma unroll
+        for (int is = 0; is < 8; ++is) {
+            const int half = is >> 2;
+            const int sub = is & 3;
+            // q4_0..q4_3: ql supplies the low nibble of one of the two 32-byte
+            // planes, qh the two upper code bits, one bit pair per plane.
+            const uint8_t ql_byte = ql[(half << 6) + ((sub & 1) ? 32 : 0) + lane];
+            const uint8_t qh_byte = qh[(half << 5) + lane];
+            const int v = (sub < 2)
+                ? ((static_cast<int>(ql_byte) & 0x0f) |
+                   ((static_cast<int>(qh_byte >> (2 * sub)) & 0x03) << 4))
+                : ((static_cast<int>(ql_byte) >> 4) |
+                   ((static_cast<int>(qh_byte >> (2 * sub)) & 0x03) << 4));
+            const int scale = scales[(is << 1) + scale_select];
+            sumi += v * static_cast<int>(a[(is << 5) + lane]) * scale;
+        }
+
+        // vpmaddwd folds the four products of one AVX lane into a single int32.
+        // Integer addition is exact and associative, so only the float split has
+        // to line up; lanes 4m..4m+3 all carry the same scale and collapse onto
+        // lane 4m.
+        sumi += __shfl_down_sync(0xffffffffu, sumi, 2);
+        sumi += __shfl_down_sync(0xffffffffu, sumi, 1);
+        if ((lane & 3) == 0) {
+            const int m = lane >> 2;
+            const int16_t * bsums = x_bsums + static_cast<size_t>(sb) * 16u;
+            // ggml folds the q6_K -32 offset into the Q8_K sums:
+            // q8sclsub[m] = (bsums[2m]*scales[2m] + bsums[2m+1]*scales[2m+1]) << 5,
+            // subtracted from the integer dot before the F32 scale is applied.
+            const int32_t correction = static_cast<int32_t>(static_cast<uint32_t>(
+                static_cast<int32_t>(bsums[m << 1]) * static_cast<int32_t>(scales[m << 1]) +
+                static_cast<int32_t>(bsums[(m << 1) + 1]) *
+                    static_cast<int32_t>(scales[(m << 1) + 1])) << 5);
+            accumulator = fmaf(
+                __fmul_rn(d_w, x_d[sb]),
+                static_cast<float>(sumi - correction),
+                accumulator);
+        }
+    }
+
+    const float v0 = __shfl_sync(0xffffffffu, accumulator, 0);
+    const float v1 = __shfl_sync(0xffffffffu, accumulator, 4);
+    const float v2 = __shfl_sync(0xffffffffu, accumulator, 8);
+    const float v3 = __shfl_sync(0xffffffffu, accumulator, 12);
+    const float v4 = __shfl_sync(0xffffffffu, accumulator, 16);
+    const float v5 = __shfl_sync(0xffffffffu, accumulator, 20);
+    const float v6 = __shfl_sync(0xffffffffu, accumulator, 24);
+    const float v7 = __shfl_sync(0xffffffffu, accumulator, 28);
+    if (lane == 0) {
+        // hsum_float_8(acc): (a4+a0, a5+a1, a6+a2, a7+a3) then a tree.
+        const float r0 = __fadd_rn(v4, v0);
+        const float r1 = __fadd_rn(v5, v1);
+        const float r2 = __fadd_rn(v6, v2);
+        const float r3 = __fadd_rn(v7, v3);
+        const float value = __fadd_rn(__fadd_rn(r0, r2), __fadd_rn(r1, r3));
+        if constexpr (OUT_F32) {
+            static_cast<float *>(y)[row] = value;
+        } else {
+            static_cast<__half *>(y)[row] = __float2half(value);
+        }
+    }
+}
+
+inline void launch_q6_k_gemv_q8_k_f32(
+        const LowBitMatrix & weights,
+        const int8_t * activation,
+        const float * activation_scales,
+        const int16_t * activation_sums,
+        float * output,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (weights.type != GgmlType::Q6_K || weights.rows <= 0 ||
+        weights.cols <= 0 || weights.cols % 256 != 0) {
+        throw std::runtime_error("Q6_K x Q8_K GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("Q6_K x Q8_K GEMV threads must be a multiple of 32");
+    }
+    const int warps = threads / 32;
+    const int blocks = (weights.rows + warps - 1) / warps;
+    q6_k_q8_k_gemv_kernel<true><<<blocks, threads, 0, stream>>>(
+        weights.data, activation, activation_scales, activation_sums,
+        output, weights.rows, weights.cols);
+}
+
+// The three-stage head pipeline needs a few kilobytes of device scratch, but it
+// runs once per decoded token, so the buffers are allocated once and kept for the
+// process lifetime. Growing them could free memory an earlier launch on this
+// stream still reads, so the stream is drained first.
+struct LowBitHeadQ8KScratch {
+    float * activation = nullptr;
+    int8_t * quants = nullptr;
+    float * scales = nullptr;
+    int16_t * sums = nullptr;
+    int cols = 0;
+};
+
+inline LowBitHeadQ8KScratch & lowbit_head_q8_k_scratch() {
+    static LowBitHeadQ8KScratch scratch;
+    return scratch;
+}
+
+inline unsigned long long & lowbit_head_q8_k_launch_ref() {
+    static unsigned long long launches = 0;
+    return launches;
+}
+
+// Number of output-head projections that ran through the Q8_K path. Reported by
+// the CLI so an on-device run can confirm the new path is live.
+inline unsigned long long lowbit_head_q8_k_launch_count() {
+    return lowbit_head_q8_k_launch_ref();
+}
+
+inline void lowbit_head_q8_k_release(LowBitHeadQ8KScratch & scratch) {
+    if (scratch.activation) cudaFree(scratch.activation);
+    if (scratch.quants) cudaFree(scratch.quants);
+    if (scratch.scales) cudaFree(scratch.scales);
+    if (scratch.sums) cudaFree(scratch.sums);
+    scratch.activation = nullptr;
+    scratch.quants = nullptr;
+    scratch.scales = nullptr;
+    scratch.sums = nullptr;
+    scratch.cols = 0;
+}
+
+inline void lowbit_head_q8_k_reserve(int cols, cudaStream_t stream) {
+    LowBitHeadQ8KScratch & scratch = lowbit_head_q8_k_scratch();
+    if (scratch.cols >= cols) return;
+    if (scratch.activation) {
+        const cudaError_t e = stream ? cudaStreamSynchronize(stream) : cudaDeviceSynchronize();
+        if (e != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("Q8_K head scratch drain failed: ") + cudaGetErrorString(e));
+        }
+        lowbit_head_q8_k_release(scratch);
+    }
+    const size_t blocks = static_cast<size_t>(cols) / 256u;
+    cudaError_t e = cudaMalloc(
+        reinterpret_cast<void **>(&scratch.activation), static_cast<size_t>(cols) * sizeof(float));
+    if (e == cudaSuccess) {
+        e = cudaMalloc(
+            reinterpret_cast<void **>(&scratch.quants), static_cast<size_t>(cols) * sizeof(int8_t));
+    }
+    if (e == cudaSuccess) {
+        e = cudaMalloc(
+            reinterpret_cast<void **>(&scratch.scales), blocks * sizeof(float));
+    }
+    if (e == cudaSuccess) {
+        e = cudaMalloc(
+            reinterpret_cast<void **>(&scratch.sums), blocks * 16u * sizeof(int16_t));
+    }
+    if (e != cudaSuccess) {
+        lowbit_head_q8_k_release(scratch);
+        throw std::runtime_error(
+            std::string("cudaMalloc Q8_K head scratch failed: ") + cudaGetErrorString(e));
+    }
+    scratch.cols = cols;
+}
+
+inline bool lowbit_q6_k_head_q8_k_eligible(const LowBitMatrix & weights) {
+    if (!lowbit_head_q8_k_enabled()) return false;
+    return weights.type == GgmlType::Q6_K && weights.rows > 0 &&
+           weights.cols > 0 && weights.cols % 256 == 0;
+}
+
+// Widen the F16 head activation to F32, quantise it exactly like
+// quantize_row_q8_K_ref and take the Q6_K x Q8_K integer dot product into F32
+// logits. WARODECODE_HEAD_Q8_K=0 restores the legacy F16-activation GEMV.
+// Same Q6_K x Q8_K head GEMV, but fed the caller's F32 activation: the CPU
+// quantises its F32 head input, so avoiding the F16 round trip removes a
+// ~2.6e-4 perturbation of every Q8_K block scale (and the code flips it causes).
+inline void launch_q6_k_head_gemv_q8_k_from_f32(
+        const LowBitMatrix & weights,
+        const float * activation,
+        float * output,
+        cudaStream_t stream,
+        int threads) {
+    if (!lowbit_q6_k_head_q8_k_eligible(weights)) {
+        throw std::runtime_error("Q6_K x Q8_K output head path is not available for this matrix");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("Q6_K x Q8_K GEMV threads must be a multiple of 32");
+    }
+    lowbit_head_q8_k_reserve(weights.cols, stream);
+    LowBitHeadQ8KScratch & scratch = lowbit_head_q8_k_scratch();
+    launch_q8_k_quantize_f32(
+        activation, weights.cols, scratch.quants, scratch.scales,
+        scratch.sums, stream, threads);
+    launch_q6_k_gemv_q8_k_f32(
+        weights, scratch.quants, scratch.scales, scratch.sums, output, stream, threads);
+    ++lowbit_head_q8_k_launch_ref();
+}
+
+inline void launch_q6_k_head_gemv_q8_k_f32(
+        const LowBitMatrix & weights,
+        const __half * activation,
+        float * output,
+        cudaStream_t stream,
+        int threads) {
+    if (!lowbit_q6_k_head_q8_k_eligible(weights)) {
+        throw std::runtime_error("Q6_K x Q8_K output head path is not available for this matrix");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("Q6_K x Q8_K GEMV threads must be a multiple of 32");
+    }
+    lowbit_head_q8_k_reserve(weights.cols, stream);
+    LowBitHeadQ8KScratch & scratch = lowbit_head_q8_k_scratch();
+    lowbit_copy_half_to_f32_kernel<<<(weights.cols + 255) / 256, 256, 0, stream>>>(
+        activation, scratch.activation, weights.cols);
+    launch_q8_k_quantize_f32(
+        scratch.activation, weights.cols, scratch.quants, scratch.scales,
+        scratch.sums, stream, threads);
+    launch_q6_k_gemv_q8_k_f32(
+        weights, scratch.quants, scratch.scales, scratch.sums, output, stream, threads);
+    ++lowbit_head_q8_k_launch_ref();
 }
 
 } // namespace wd

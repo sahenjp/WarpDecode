@@ -15,6 +15,20 @@ add_executable(warodecode-qwen38-trace-test tests/qwen38_trace_test.cpp)
 target_include_directories(warodecode-qwen38-trace-test PRIVATE src)
 target_compile_options(warodecode-qwen38-trace-test PRIVATE -O2 -Wall -Wextra -Wpedantic)
 
+# Issue #1 residual-lifetime regression: F32 residual must beat the F16
+# round-trip lifetime over a 48-layer accumulation. Host-only, no GPU.
+add_executable(warodecode-issue1-residual-accum-test tests/issue1_residual_accum_test.cpp)
+target_include_directories(warodecode-issue1-residual-accum-test PRIVATE src)
+target_compile_options(warodecode-issue1-residual-accum-test PRIVATE -O2 -Wall -Wextra -Wpedantic)
+
+add_executable(warodecode-issue1-ffn-precision-test tests/issue1_ffn_precision_test.cpp)
+target_include_directories(warodecode-issue1-ffn-precision-test PRIVATE src)
+target_compile_options(warodecode-issue1-ffn-precision-test PRIVATE -O2 -Wall -Wextra -Wpedantic)
+
+add_executable(warodecode-issue1-ffn-ablation-test tests/issue1_ffn_ablation_test.cpp)
+target_include_directories(warodecode-issue1-ffn-ablation-test PRIVATE src)
+target_compile_options(warodecode-issue1-ffn-ablation-test PRIVATE -O2 -Wall -Wextra -Wpedantic)
+
 if(WARODECODE_BUILD_ENGINE)
   include(CheckLanguage)
   check_language(CUDA)
@@ -63,6 +77,30 @@ if(WARODECODE_BUILD_ENGINE)
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
   )
   set_target_properties(warodecode-qwen38-moe-cuda-test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+  add_executable(warodecode-issue1-moe-precision-cuda-test tests/issue1_moe_precision_cuda_test.cu)
+  target_include_directories(warodecode-issue1-moe-precision-cuda-test PRIVATE src)
+  target_compile_options(warodecode-issue1-moe-precision-cuda-test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  )
+  set_target_properties(warodecode-issue1-moe-precision-cuda-test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+  # GDN / HC kernel tests were previously orphaned (present in tests/ but not
+  # registered here), which let the F32 residual API change break the HC test
+  # unnoticed. Keep them in the normal build so regressions surface.
+  add_executable(warodecode-qwen38-gdn-cuda-test tests/qwen38_gdn_cuda_test.cu)
+  target_include_directories(warodecode-qwen38-gdn-cuda-test PRIVATE src)
+  target_compile_options(warodecode-qwen38-gdn-cuda-test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  )
+  set_target_properties(warodecode-qwen38-gdn-cuda-test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+  add_executable(warodecode-qwen38-hc-cuda-test tests/qwen38_hc_cuda_test.cu)
+  target_include_directories(warodecode-qwen38-hc-cuda-test PRIVATE src)
+  target_compile_options(warodecode-qwen38-hc-cuda-test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  )
+  set_target_properties(warodecode-qwen38-hc-cuda-test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
   add_executable(warodecode-qwen38-qsa-cuda-test tests/qwen38_qsa_cuda_test.cu)
   target_include_directories(warodecode-qwen38-qsa-cuda-test PRIVATE src)

@@ -43,6 +43,56 @@ Q         終了
 
 設定は `~/.config/warodecode/tui.conf` に保存します。
 
+## Qwen3.8-Flash-Next (qwen4exp) の CPU オラクル一致
+
+CUDAエンジンは llama.cpp (`6fcaa16f4b360649933a54d1f91ad40ed35c0e11`) のCPU greedy出力と
+**64/64トークン完全一致**します (Issue #1)。
+
+| 項目 | 値 |
+|---|---|
+| モデル | Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf (85.9 GB) |
+| 一致 | **64/64トークン** (独立に2回再現) |
+| 速度 (L4, batch=1, ctx=128) | **3.20 tok/s** |
+| 速度 (F16高速パス基準) | 2.38 tok/s → **1.34倍** |
+
+再現 (Colab L4 + モデルが必要):
+
+```bash
+python3 tools/issue1_parity_check.py
+```
+
+### 一致させるために必要だったこと
+
+batch=1で1e-7単位まで一致させるには、llama.cppのCPU実装と同じ**演算順・同じ丸め**を再現する必要があります。
+差が残ると活性の量子化コードが反転し、層ごとに増幅します。実際に効いた修正:
+
+1. **量子化重みは活性も量子化する** — ggmlのper-typeルール (Q8_0/IQ4_NL→Q8_0, IQ2_S/IQ3_S/Q6_K→Q8_K, BF16→BF16)
+2. **`--use_fast_math` の超越関数はオラクルと一致しない** — device `expf` は `__expf` (MUFU, ~5e-7) に、
+   `/` も近似除算になる。SiLUはggmlのAVX2多項式、sigmoid/exp/softplusはglibcのアルゴリズム移植で一致させた
+   (`src/warodecode_q38_glibc_trig.hpp`, `src/qwen38_exact_math.cuh`)
+3. **IMRoPE** — glibcの `sinf`/`cosf` 移植 + `theta *= theta_scale` の逐次乗算 + FMA形の回転
+4. **F32テンソルをhalfに落とさない** — HC γ/inject、GDNのβ/α/norm、PLE norms、QSA norms、
+   共有エキスパートgateなど、F32の重みをhalf化すると必ず相対5e-4の系統誤差が入る
+5. **F32 GEMVは `ggml_vec_dot_f32` のAVX2順序** (4×8アキュムレータ + F32x8還元) で縮約する
+6. **MoEルータ重み** — 全512 expertのsoftmax → 8レーンdouble和 → 逆数乗算 → top-k → double和 → clamp → 真の除算
+7. **QSA attention** — max先行 → 全要素exp → double行和 → **確率のF16丸め** → 4×8アキュムレータ
+8. **スコアドットのqはF16に丸める** — KVキャッシュがF16なのでCPUは `ggml_cpu_fp32_to_fp16(q)` してから内積する
+
+現状、position 1で **L0〜L7 がbit一致**、次の障壁はL8です。
+
+### ホスト検証ハーネス
+
+オラクルとの一致は、pinned llama.cppを実際にビルドして比較するハーネスで確認できます
+(いずれも第1引数にllama.cppのチェックアウトを渡します):
+
+```bash
+bash tests/qwen38_rope_host_check.sh      /path/to/llama.cpp   # IMRoPE
+bash tests/qwen38_router_host_check.sh    /path/to/llama.cpp   # MoEルータ重み
+bash tests/qwen38_shexp_gate_host_check.sh /path/to/llama.cpp  # 共有エキスパートgate
+bash tests/qwen38_exact_math_host_check.sh /path/to/llama.cpp  # 超越関数
+bash tests/qwen38_cuda_syntax_check.sh                          # nvcc無しのCUDA構文検査 (CIで実行)
+```
+
 ## GPU対応方針
 
 | Compute Capability | 代表GPU | 目標hot path |

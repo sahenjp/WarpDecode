@@ -85,7 +85,7 @@ int main() {
         check(cudaMemcpy(d_v, v_cache.data(), v_cache.size() * sizeof(__half), cudaMemcpyHostToDevice));
 
         wd::q38_qsa_sparse_attention_kernel<<<heads, 256>>>(
-            d_q, d_gate, d_k, d_v, nullptr, d_out,
+            d_q, d_gate, d_k, d_v, nullptr, d_out, nullptr,
             0, 4, 0, 0, heads, kv_heads, head_dim, 1.0f);
         check(cudaGetLastError());
         check(cudaDeviceSynchronize());
