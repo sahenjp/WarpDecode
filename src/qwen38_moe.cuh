@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -124,10 +125,414 @@ inline bool q38_moe_f32_mid_enabled() {
 // the originals), so the values are bit-identical - only the launch geometry and
 // the launch count change. The weight pointers of the layer travel in one small
 // pinned H2D copy (Q38MoeExpertPtrTable).
+// Default ON since the transfer path stopped dominating: on A100 with the
+// 20000 MiB cache and the pread+DMA staging this is +2.2% (7.624 -> 7.793 tok/s)
+// at parity 64/64, and it interacts strongly with the staging (skipping the
+// transfer entirely takes the same binary from 7.79 to 9.68 tok/s), so the
+// launch-count reduction is now visible. Set WARODECODE_MOE_FUSED_GRID=0 to go
+// back to the per-expert launches.
 inline bool q38_moe_fused_grid_enabled() {
-    static const bool enabled = q38_moe_env_flag("WARODECODE_MOE_FUSED_GRID", false);
+    static const bool enabled = q38_moe_env_flag("WARODECODE_MOE_FUSED_GRID", true);
     return enabled;
 }
+
+// Task R: how many prefix groups one expert-batched layer pass runs in.
+//
+// The batched pass acquires all k expert slots and only then launches its five
+// kernels, so every pread() and every DMA of the layer completes before the
+// first expert GEMV starts: the transfer is fully exposed, and the consumer
+// stream waits for the last miss of the layer (measured on the A100: 25 ms of
+// the MoE region against 16 ms for the serial loop, which overlaps expert j's
+// DMA with expert j-1's kernels).
+//
+// Splitting the pass into prefix groups [0,g1), [g1,g2), ... keeps the
+// accumulation order the kernels already use (j ascending inside
+// q38_moe_weighted_accum_experts_f32_kernel), so the result stays bit-identical
+// to a single group: group g+1's acquire (pread + DMA) is issued after group
+// g's kernels were launched and therefore overlaps them, while group g+1's
+// kernels still wait for group g's, exactly like the serial loop.
+//
+// WARODECODE_MOE_BATCH_GROUPS=n (default 1 = the unsplit pass).
+inline int q38_moe_batch_groups(int k) {
+    static const int configured = [] {
+        const char * v = std::getenv("WARODECODE_MOE_BATCH_GROUPS");
+        if (v == nullptr || v[0] == '\0') return 1;
+        const long n = std::strtol(v, nullptr, 10);
+        return n > 1 ? static_cast<int>(std::min<long>(n, 8)) : 1;
+    }();
+    if (k <= 1 || configured <= 1) return 1;
+    return configured > k ? k : configured;
+}
+
+// Experts in group g of a k-expert prefix split: every group gets the floor and
+// the first k % groups get one extra, so the counts sum to k.
+inline int q38_moe_group_count(int k, int groups, int g) {
+    return k / groups + (g < k % groups ? 1 : 0);
+}
+
+// The router's F32-logits GEMV is the one projection of the MoE region that ggml
+// computes with a plain F32 dot (vec_dot_type == F32 for a non-quantised
+// ffn_gate_inp), so its accumulation order is fixed by ggml's AVX2 visit order
+// and cannot be changed without changing which experts get selected.
+// src/matrix.cuh::dense_f32_gemv_avx2_kernel reproduces that order with one
+// thread per row, which for the router's [512, 2560] F32 matrix means 512
+// threads in 2 blocks, each walking its own row with uncoalesced 4-byte loads
+// (neighbouring lanes read 10 KB apart). Measured on the A100 it costs ~100+ us
+// per layer, i.e. several ms per token, for 5.2 MB of weights.
+//
+// The twin below keeps the accumulation *bit* for bit: the AVX2 order has 32
+// independent accumulators sum[j][l] over elements i + j*8 + l (i stepping by
+// 32), so one warp owns a row and lane t owns the single accumulator j*8+l = t,
+// running exactly the same FMA chain over the same elements in the same order.
+// Only the *placement* changes, so the result is identical; the loads become
+// coalesced because the lanes walk the row together, and there are 8x more
+// blocks. q38_matrix_reduce_avx2() is reproduced with the shuffles that
+// implement exactly its pairing, so the reduction is identical as well.
+//
+// WARODECODE_ROUTER_F32_WARP=0 goes back to the one-thread-per-row kernel.
+inline bool q38_moe_router_f32_warp_enabled() {
+    static const bool enabled = q38_moe_env_flag("WARODECODE_ROUTER_F32_WARP", true);
+    return enabled;
+}
+
+__global__ void q38_router_gemv_f32_warp_kernel(
+        const float * __restrict__ w,
+        const float * __restrict__ x,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int row_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + row_in_block;
+    if (row >= rows) return;
+    const float * row_ptr = w + static_cast<size_t>(row) * cols;
+
+    float s = 0.0f;
+    const int np = cols & ~31;
+    for (int i = 0; i < np; i += 32) {
+        s = __fmaf_rn(row_ptr[i + lane], x[i + lane], s);
+    }
+
+    // q38_matrix_reduce_avx2(), which pairs
+    //   sum[0][l] += sum[2][l]; sum[1][l] += sum[3][l];
+    //   sum[0][l] += sum[1][l];
+    //   t0[k] = sum[0][k] + sum[0][k+4];
+    //   h0 = t0[0] + t0[1]; h1 = t0[2] + t0[3]; return h0 + h1;
+    // Lane t holds sum[t >> 3][t & 7], so lane l needs sum[2][l] from lane l+16,
+    // then sum[1][l] from lane l+8, and so on. Every shuffle is executed by all
+    // 32 lanes (the warp never diverges before this point).
+    float other = __shfl_down_sync(0xffffffffu, s, 16);
+    if (lane < 16) s = s + other;
+    other = __shfl_down_sync(0xffffffffu, s, 8);
+    if (lane < 8) s = s + other;
+    other = __shfl_down_sync(0xffffffffu, s, 4);
+    if (lane < 4) s = s + other;
+    other = __shfl_down_sync(0xffffffffu, s, 1);
+    if (lane == 0 || lane == 2) s = s + other;
+    other = __shfl_down_sync(0xffffffffu, s, 2);
+    float result = s + other;
+
+    if (lane == 0) {
+        // ggml's leftover tail, the non-fused "sumf += x[i]*y[i]" chain. The
+        // router is 2560 wide (a multiple of 32), so this never runs for the
+        // model; it is kept for the same generality the reference kernel has.
+        for (int c = np; c < cols; ++c) {
+            result = __fadd_rn(result, __fmul_rn(row_ptr[c], x[c]));
+        }
+        y[row] = result;
+    }
+}
+
+inline void launch_q38_router_gemv_f32(
+        const GpuMatrix & w,
+        const float * x,
+        float * y,
+        cudaStream_t stream,
+        int threads = 256) {
+    if (!matrix_has_f32_weights(w)) {
+        throw std::runtime_error("router F32 warp GEMV requires an F32 dense matrix");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("router F32 warp GEMV threads must be a multiple of 32");
+    }
+    const int warps = threads / 32;
+    const int blocks = (w.rows + warps - 1) / warps;
+    q38_router_gemv_f32_warp_kernel<<<blocks, threads, 0, stream>>>(
+        w.dense_f32.data, x, y, w.rows, w.cols);
+}
+
+// ---------------------------------------------------------------------------
+// Task S: MoE-region kernel-level attribution (WARODECODE_MOE_PROFILE).
+//
+// Task Q decomposed the MoE region by differencing whole runs and was left with
+// "expert kernel execution, no I/O, five launches per layer" = 64.5 ms/token on
+// the A100 at 20000 MiB. The Task G microbenchmark measures those same five
+// launches at 179 us/layer = 8.6 ms/token on the L4 (tests/moe_fused_grid_bench.cu),
+// so 64.5 ms cannot be the sum of the five kernels: the region either spends its
+// time in the launches around them (router selection, its device-to-host sync,
+// the shared expert, the F16 mirrors, the five-way finish) or in idle gaps
+// between launches.
+//
+// This profiler brackets every launch of the region with its own event pair,
+// exactly like the Task J HC profiler and the Task P attention profiler. Two
+// numbers are reported per site and token:
+//
+//   dev_ms  - the GPU-timeline width of the bracket. A host stall inside the
+//             bracket is included, because the GPU is idle while the host
+//             prepares the next launch; that is the point.
+//   host_ms - the host wall time of the same bracket. dev_ms - host_ms is the
+//             time the GPU was doing work the host did not wait for, host_ms -
+//             dev_ms is the time the host spent inside the bracket while the GPU
+//             had nothing queued (the thing only removing host work can fix).
+//
+// The difference between a parent site and the sum of its children is the launch
+// gap plus any uninstrumented launch.
+//
+// Enabled by WARODECODE_MOE_PROFILE=1. With the switch off the class is empty
+// and every hook is one predictable branch, so the default decode path is
+// unchanged bit for bit.
+// ---------------------------------------------------------------------------
+enum Q38MoeSite : int {
+    kQ38MoeSiteStageTotal = 0,   // the whole kQwen38StageMoe bracket
+    kQ38MoeSiteRoutedTotal,      // one layer's routed-expert runner
+    kQ38MoeSiteRouter,           // router GEMV + top-k + D2H + stream sync
+    kQ38MoeSiteRouterQuant,      //   the router activation Q8_0 quantisation
+    kQ38MoeSiteRouterGemv,       //   the router logits GEMV
+    kQ38MoeSiteRouterTopk,       //   the single-threaded softmax + top-k kernel
+    kQ38MoeSiteRouterD2h,        //   the two device-to-host copies of ids/weights
+    kQ38MoeSiteRouterSync,       //   the cudaStreamSynchronize that closes it
+    kQ38MoeSiteAccumZero,        // cudaMemsetAsync of the routed accumulator
+    kQ38MoeSiteRxQuant,          // Q8_K quantisation of the routed activation
+    kQ38MoeSiteAcquire,          // the k cache acquires of one layer
+    kQ38MoeSitePtrH2d,           // the expert pointer-table H2D copy
+    kQ38MoeSiteBatchTotal,       // the five expert-batched launches together
+    kQ38MoeSiteGateUpGemv,       // 1/5 gate+up GEMV (grid.y = k)
+    kQ38MoeSiteSilu,             // 2/5 SiLU(gate)*up
+    kQ38MoeSiteQ8Quant,          // 3/5 Q8_0 activation quantisation
+    kQ38MoeSiteDownGemv,         // 4/5 down GEMV
+    kQ38MoeSiteAccum,            // 5/5 weighted accumulation
+    kQ38MoeSiteCapture,          // optional selected-expert trace copy
+    kQ38MoeSiteLoopTotal,        // the per-expert loop (WARODECODE_MOE_FUSED_GRID=0)
+    kQ38MoeSiteFinish,           // q38_finish_moe()
+    kQ38MoeSiteShared,           // the shared expert
+    kQ38MoeSiteSharedGate,       //   its sigmoid gate dot product
+    kQ38MoeSiteMirror,           // the F16 mirrors + add_shared + finish_moe_f32
+    kQ38MoeSiteCount
+};
+
+inline const char * q38_moe_site_name(int site) {
+    switch (site) {
+        case kQ38MoeSiteStageTotal: return "moe.stage_total";
+        case kQ38MoeSiteRoutedTotal: return "moe.routed_total";
+        case kQ38MoeSiteRouter: return "moe.router_select";
+        case kQ38MoeSiteRouterQuant: return "moe.router.act_quant";
+        case kQ38MoeSiteRouterGemv: return "moe.router.gemv";
+        case kQ38MoeSiteRouterTopk: return "moe.router.topk";
+        case kQ38MoeSiteRouterD2h: return "moe.router.d2h";
+        case kQ38MoeSiteRouterSync: return "moe.router.sync";
+        case kQ38MoeSiteAccumZero: return "moe.accum_zero";
+        case kQ38MoeSiteRxQuant: return "moe.rx_quant";
+        case kQ38MoeSiteAcquire: return "moe.acquire";
+        case kQ38MoeSitePtrH2d: return "moe.ptr_h2d";
+        case kQ38MoeSiteBatchTotal: return "moe.batch_total";
+        case kQ38MoeSiteGateUpGemv: return "moe.batch.gate_up";
+        case kQ38MoeSiteSilu: return "moe.batch.silu";
+        case kQ38MoeSiteQ8Quant: return "moe.batch.q8_quant";
+        case kQ38MoeSiteDownGemv: return "moe.batch.down";
+        case kQ38MoeSiteAccum: return "moe.batch.accum";
+        case kQ38MoeSiteCapture: return "moe.batch.capture";
+        case kQ38MoeSiteLoopTotal: return "moe.loop_total";
+        case kQ38MoeSiteFinish: return "moe.finish";
+        case kQ38MoeSiteShared: return "moe.shared";
+        case kQ38MoeSiteSharedGate: return "moe.shared.gate";
+        case kQ38MoeSiteMirror: return "moe.mirror";
+        default: return "unknown";
+    }
+}
+
+struct Q38MoeSiteStat {
+    unsigned long long calls = 0;
+    double total_ms = 0.0;
+    double total_host_ms = 0.0;
+    unsigned long long overflow = 0;
+    unsigned long long elapsed_fail = 0;
+    unsigned long long recorded = 0;
+};
+
+class Q38MoeKernelProfiler {
+public:
+    // One token has 48 layers and every instrumented site fires at most once per
+    // layer (the per-expert loop path is bracketed as a whole), so 128 slots per
+    // site cover a token with room for a prefix-split pass. A site that runs out
+    // reports it in the "dropped" column instead of silently losing samples.
+    static constexpr int kCap = 128;
+
+    static Q38MoeKernelProfiler & instance() {
+        static Q38MoeKernelProfiler profiler;
+        return profiler;
+    }
+
+    bool enabled() const { return enabled_; }
+
+    void mark_begin(int site, cudaStream_t stream) {
+        if (!enabled_) return;
+        if (site < 0 || site >= kQ38MoeSiteCount) return;
+        // A nested bracket stays one interval: only the outermost pair records.
+        if (depth_[site]++ != 0) return;
+        host_begin_[site] = std::chrono::steady_clock::now();
+        if (trace_enabled_ && trace_lines_ < 120) {
+            ++trace_lines_;
+            std::fprintf(stderr, "[moe-profile-trace] begin %s depth=%d slot=%d\n",
+                         q38_moe_site_name(site), depth_[site] - 1, written_[site]);
+        }
+        const int slot = written_[site];
+        if (slot >= kCap) {
+            ++overflow_[site];
+            return;
+        }
+        if (cudaEventRecord(start_[index(site, slot)], stream) != cudaSuccess) {
+            ++overflow_[site];
+            return;
+        }
+        pending_start_[site] = start_[index(site, slot)];
+    }
+
+    void mark_end(int site, cudaStream_t stream) {
+        if (!enabled_) return;
+        if (site < 0 || site >= kQ38MoeSiteCount) return;
+        if (depth_[site] <= 0) return;
+        if (--depth_[site] != 0) return;
+        const auto stop_host = std::chrono::steady_clock::now();
+        host_ms_[site] += std::chrono::duration<double, std::milli>(
+                              stop_host - host_begin_[site]).count();
+        const int slot = written_[site];
+        if (slot >= kCap || pending_start_[site] == nullptr) {
+            ++overflow_[site];
+            pending_start_[site] = nullptr;
+            return;
+        }
+        if (cudaEventRecord(stop_[index(site, slot)], stream) != cudaSuccess) {
+            ++overflow_[site];
+            pending_start_[site] = nullptr;
+            return;
+        }
+        start_[index(site, slot)] = pending_start_[site];
+        pending_start_[site] = nullptr;
+        ++written_[site];
+    }
+
+    // Called once per decode token, after the stream synchronise: every recorded
+    // event is complete there, so cudaEventElapsedTime() cannot return
+    // cudaErrorNotReady.
+    void flush_token() {
+        if (!enabled_) return;
+        for (int s = 0; s < kQ38MoeSiteCount; ++s) {
+            Q38MoeSiteStat & stat = stats_[s];
+            const unsigned long long pending = written_[s];
+            for (int i = 0; i < written_[s]; ++i) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, start_[index(s, i)], stop_[index(s, i)]) == cudaSuccess) {
+                    stat.total_ms += static_cast<double>(ms);
+                    ++stat.calls;
+                } else {
+                    ++stat.elapsed_fail;
+                }
+            }
+            stat.recorded += pending;
+            stat.total_host_ms += host_ms_[s];
+            stat.overflow += overflow_[s];
+            host_ms_[s] = 0.0;
+            written_[s] = 0;
+            depth_[s] = 0;
+            pending_start_[s] = nullptr;
+        }
+        ++tokens_;
+    }
+
+    void print_summary() const {
+        if (!enabled_ || tokens_ == 0) return;
+        const double div = static_cast<double>(tokens_);
+        std::fprintf(stderr, "[moe-profile] tokens=%llu unit=ms_per_token\n",
+                     static_cast<unsigned long long>(tokens_));
+        for (int s = 0; s < kQ38MoeSiteCount; ++s) {
+            const Q38MoeSiteStat & stat = stats_[s];
+            // Nothing at all happened for this site: skip it. Everything else is
+            // printed, including the failure modes, so "the hook never ran",
+            // "the bracket never closed" and "the events were not readable" stay
+            // distinguishable in the output.
+            if (stat.recorded == 0 && stat.overflow == 0 && stat.elapsed_fail == 0 &&
+                stat.total_host_ms == 0.0) {
+                continue;
+            }
+            std::fprintf(stderr,
+                         "[moe-profile] %-20s dev=%9.4f host=%9.4f gap=%9.4f calls/token=%.2f"
+                         " recorded=%llu dropped=%llu evfail=%llu\n",
+                         q38_moe_site_name(s), stat.total_ms / div, stat.total_host_ms / div,
+                         (stat.total_host_ms - stat.total_ms) / div,
+                         static_cast<double>(stat.calls) / div,
+                         static_cast<unsigned long long>(stat.recorded),
+                         static_cast<unsigned long long>(stat.overflow),
+                         static_cast<unsigned long long>(stat.elapsed_fail));
+        }
+    }
+
+private:
+    Q38MoeKernelProfiler() {
+        const char * v = std::getenv("WARODECODE_MOE_PROFILE");
+        enabled_ = v != nullptr && v[0] != '\0' && v[0] != '0';
+        const char * t = std::getenv("WARODECODE_MOE_PROFILE_TRACE");
+        trace_enabled_ = t != nullptr && t[0] != '\0' && t[0] != '0';
+        if (!enabled_) return;
+        for (size_t i = 0; i < start_.size(); ++i) {
+            if (cudaEventCreate(&start_[i]) != cudaSuccess ||
+                cudaEventCreate(&stop_[i]) != cudaSuccess) {
+                enabled_ = false;
+                return;
+            }
+        }
+    }
+
+    ~Q38MoeKernelProfiler() { print_summary(); }
+
+    Q38MoeKernelProfiler(const Q38MoeKernelProfiler &) = delete;
+    Q38MoeKernelProfiler & operator=(const Q38MoeKernelProfiler &) = delete;
+
+    static size_t index(int site, int slot) {
+        return static_cast<size_t>(site) * static_cast<size_t>(kCap) + static_cast<size_t>(slot);
+    }
+
+    bool enabled_ = false;
+    bool trace_enabled_ = false;
+    int trace_lines_ = 0;
+    unsigned long long tokens_ = 0;
+    std::array<cudaEvent_t, static_cast<size_t>(kQ38MoeSiteCount) * kCap> start_{};
+    std::array<cudaEvent_t, static_cast<size_t>(kQ38MoeSiteCount) * kCap> stop_{};
+    int written_[kQ38MoeSiteCount] = {};
+    int overflow_[kQ38MoeSiteCount] = {};
+    int depth_[kQ38MoeSiteCount] = {};
+    cudaEvent_t pending_start_[kQ38MoeSiteCount] = {};
+    double host_ms_[kQ38MoeSiteCount] = {};
+    std::chrono::steady_clock::time_point host_begin_[kQ38MoeSiteCount] = {};
+    Q38MoeSiteStat stats_[kQ38MoeSiteCount] = {};
+};
+
+// RAII bracket for one region of a MoE layer.
+class Q38MoeKernelScope {
+public:
+    Q38MoeKernelScope(int site, cudaStream_t stream) : site_(site), stream_(stream) {
+        Q38MoeKernelProfiler::instance().mark_begin(site_, stream_);
+    }
+    ~Q38MoeKernelScope() {
+        Q38MoeKernelProfiler::instance().mark_end(site_, stream_);
+    }
+    Q38MoeKernelScope(const Q38MoeKernelScope &) = delete;
+    Q38MoeKernelScope & operator=(const Q38MoeKernelScope &) = delete;
+
+private:
+    int site_;
+    cudaStream_t stream_;
+};
 
 struct Qwen38MoeLayerTensors {
     const TensorInfo * router = nullptr;
@@ -493,7 +898,189 @@ __global__ void q38_topk_softmax_kernel(
     }
     q38_moe_router_legacy(logits, n_experts, k, expert_scale, ids, weights);
 }
+
+// ---------------------------------------------------------------------------
+// Task S: block-parallel twin of q38_topk_softmax_kernel.
+//
+// The reference runs the whole router on one thread: 512 logits scanned for the
+// max, 512 AVX2-order exponentials, 64 eight-lane sums accumulated into a double
+// in order, then k rungs of a 512-wide descending argsort. That one thread is
+// the entire GPU for the launch, which is why the router path costs more than
+// the five expert-batched launches of the layer together.
+//
+// Every step is reproduced with the same arithmetic:
+//   max    - fmaxf is associative and commutative, so a reduction tree returns
+//            the same value the ascending scan does;
+//   exp    - elementwise, neither order nor associativity involved;
+//   sum    - q38_moe_softmax_lane_sum() over each group of eight is independent,
+//            so only the ordered double accumulation over the group sums has to
+//            stay on one thread (64 adds, the same ones the reference makes);
+//   select - the ascending scan with a strict ">" keeps the lowest index of the
+//            maximum among the not-yet-taken experts. A combine rule of "higher
+//            value wins, equal value falls to the lower index" is the same total
+//            order over (value, index) and never promotes a NaN, so the
+//            reduction tree selects the same pair the scan does;
+//   norm   - the same double sum, the same fmaxf clamp against the F16 minimum,
+//            the same __fdiv_rn per element and the same __fmul_rn w_scale.
+// WARODECODE_ROUTER_TOPK_PARALLEL=0 restores the one-thread kernel.
+// ---------------------------------------------------------------------------
+constexpr int kQ38RouterTopkThreads = 512;
+
+__device__ __forceinline__ void q38_router_keep_better(
+        float & value,
+        int & index,
+        float other_value,
+        int other_index) {
+    if (other_value > value || (other_value == value && other_index < index)) {
+        value = other_value;
+        index = other_index;
+    }
+}
+
+__global__ void q38_topk_softmax_parallel_kernel(
+        const float * __restrict__ logits,
+        int n_experts,
+        int k,
+        float expert_scale,
+        int * __restrict__ ids,
+        float * __restrict__ weights) {
+    __shared__ float probs[Q38_MOE_ROUTER_MAX_EXPERTS];
+    __shared__ double group_sums[Q38_MOE_ROUTER_MAX_EXPERTS / 8];
+    __shared__ float red_value[kQ38RouterTopkThreads];
+    __shared__ int red_index[kQ38RouterTopkThreads];
+    __shared__ int taken_ids[Q38_MOE_ROUTER_KMAX];
+    __shared__ float top_values[Q38_MOE_ROUTER_KMAX];
+
+    const int tid = threadIdx.x;
+    if (blockIdx.x != 0) return;
+    if (k <= 0 || k > Q38_MOE_ROUTER_KMAX) return;
+    if (n_experts <= 0 || n_experts > Q38_MOE_ROUTER_MAX_EXPERTS) return;
+    // n_experts is a multiple of 8 here (the launcher only takes this path under
+    // the same condition the reference's exact branch uses), so the reference's
+    // scalar tail over n_experts & 7 can never run.
+    if (n_experts % 8 != 0) return;
+
+    float local_max = -INFINITY;
+    for (int e = tid; e < n_experts; e += blockDim.x) {
+        local_max = fmaxf(local_max, logits[e]);
+    }
+    red_value[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) red_value[tid] = fmaxf(red_value[tid], red_value[tid + stride]);
+        __syncthreads();
+    }
+    const float max_v = red_value[0];
+    __syncthreads();
+
+    // dp[i] = ggml_v_expf(x[i] - max), the subtraction its own IEEE step.
+    for (int e = tid; e < n_experts; e += blockDim.x) {
+        probs[e] = q38_exact_avx2_exp_f32(__fsub_rn(logits[e], max_v));
+    }
+    __syncthreads();
+
+    const int groups = n_experts / 8;
+    for (int g = tid; g < groups; g += blockDim.x) {
+        group_sums[g] = static_cast<double>(q38_moe_softmax_lane_sum(probs + g * 8));
+    }
+    __syncthreads();
+    if (tid == 0) {
+        double sum = 0.0;
+        for (int g = 0; g < groups; ++g) sum += group_sums[g];
+        group_sums[0] = sum;
+    }
+    __syncthreads();
+    const double sum_total = group_sums[0];
+
+    // ggml_vec_scale_f32 starts from -INFINITY, so a row whose exponents all
+    // underflowed stays -INFINITY rather than turning into NaN.
+    if (sum_total == 0.0) {
+        for (int e = tid; e < n_experts; e += blockDim.x) probs[e] = -INFINITY;
+    } else {
+        const float inv = static_cast<float>(1.0 / sum_total);
+        for (int e = tid; e < n_experts; e += blockDim.x) probs[e] = __fmul_rn(probs[e], inv);
+    }
+    __syncthreads();
+
+    for (int j = 0; j < k; ++j) {
+        // Start below every probability so a row that is all -INFINITY still
+        // resolves, and read the value back through the chosen id exactly like
+        // the reference: best_id stays 0 when nothing beats -INFINITY.
+        float best = -INFINITY;
+        int best_id = 0;
+        for (int e = tid; e < n_experts; e += blockDim.x) {
+            bool taken = false;
+            for (int m = 0; m < j; ++m) {
+                if (taken_ids[m] == e) {
+                    taken = true;
+                    break;
+                }
+            }
+            if (taken) continue;
+            if (probs[e] > best) {
+                best = probs[e];
+                best_id = e;
+            }
+        }
+        red_value[tid] = best;
+        red_index[tid] = best_id;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                q38_router_keep_better(red_value[tid], red_index[tid],
+                                       red_value[tid + stride], red_index[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            ids[j] = red_index[0];
+            top_values[j] = probs[red_index[0]];
+            taken_ids[j] = red_index[0];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        double wsum = 0.0;
+        for (int j = 0; j < k; ++j) wsum += static_cast<double>(top_values[j]);
+        const float wsum_f32 = fmaxf(static_cast<float>(wsum), 6.103515625e-5f);
+        for (int j = 0; j < k; ++j) {
+            weights[j] = __fdiv_rn(top_values[j], wsum_f32);
+        }
+        if (expert_scale != 0.0f && expert_scale != 1.0f) {
+            for (int j = 0; j < k; ++j) weights[j] = __fmul_rn(weights[j], expert_scale);
+        }
+    }
+}
 #endif  // __CUDACC__
+
+// Host-side pick between the one-thread router and its block-parallel twin. The
+// parallel kernel reimplements the exact branch only, so anything the reference
+// would send to q38_moe_router_legacy() keeps the one-thread kernel.
+inline bool q38_moe_router_topk_parallel_enabled() {
+    static const bool enabled = q38_moe_env_flag("WARODECODE_ROUTER_TOPK_PARALLEL", true);
+    return enabled;
+}
+
+inline void q38_launch_topk_softmax(
+        const float * logits,
+        int n_experts,
+        int k,
+        float expert_scale,
+        int * ids,
+        float * weights,
+        cudaStream_t stream) {
+    if (q38_moe_router_topk_parallel_enabled() &&
+        q38_moe_exact_router_enabled() &&
+        n_experts > 0 && n_experts <= Q38_MOE_ROUTER_MAX_EXPERTS && n_experts % 8 == 0 &&
+        k > 0 && k <= Q38_MOE_ROUTER_KMAX) {
+        q38_topk_softmax_parallel_kernel<<<1, kQ38RouterTopkThreads, 0, stream>>>(
+            logits, n_experts, k, expert_scale, ids, weights);
+        return;
+    }
+    q38_topk_softmax_kernel<<<1, 1, 0, stream>>>(
+        logits, n_experts, k, expert_scale, ids, weights);
+}
 __global__ void q38_silu_mul_kernel(
         const __half * __restrict__ gate,
         const __half * __restrict__ up,
@@ -1008,12 +1595,61 @@ __global__ void q38_moe_gate_dot_f32_avx2_kernel(
     *out = acc;
 }
 
+// Warp-parallel twin of the one-thread gate dot above (WARODECODE_SHEXP_GATE_WARP).
+//
+// q38_moe_reduce_avx2() is the same reduction tree the router GEMV uses, over
+// the same 32 accumulators sum[j][l] for elements i + j*8 + l. Assigning
+// accumulator j*8+l to lane t and having the lane run that accumulator's own FMA
+// chain therefore reproduces the dot bit for bit, while the row is walked
+// coalesced instead of one thread reading 10 KB with strided 4-byte loads.
+// The one-thread launch measures ~108 us per layer for n = 2560 on the A100
+// (~5 ms/token) because a single thread is the whole GPU for that launch.
+inline bool q38_moe_gate_dot_f32_warp_enabled() {
+    static const bool enabled = q38_moe_env_flag("WARODECODE_SHEXP_GATE_WARP", true);
+    return enabled;
+}
+
+__global__ void q38_moe_gate_dot_f32_avx2_warp_kernel(
+        const float * __restrict__ w,
+        const float * __restrict__ x,
+        float * __restrict__ out,
+        int n) {
+    const int lane = threadIdx.x & 31;
+    if (blockIdx.x != 0 || (threadIdx.x >> 5) != 0) return;
+
+    float s = 0.0f;
+    const int np = n & ~31;
+    for (int i = 0; i < np; i += 32) {
+        s = __fmaf_rn(w[i + lane], x[i + lane], s);
+    }
+    // q38_moe_reduce_avx2() in the lane layout above (see the router GEMV twin
+    // for the pairing: lane t holds sum[t >> 3][t & 7]).
+    float other = __shfl_down_sync(0xffffffffu, s, 16);
+    if (lane < 16) s = s + other;
+    other = __shfl_down_sync(0xffffffffu, s, 8);
+    if (lane < 8) s = s + other;
+    other = __shfl_down_sync(0xffffffffu, s, 4);
+    if (lane < 4) s = s + other;
+    other = __shfl_down_sync(0xffffffffu, s, 1);
+    if (lane == 0 || lane == 2) s = s + other;
+    other = __shfl_down_sync(0xffffffffu, s, 2);
+    float acc = s + other;
+    if (lane == 0) {
+        for (int c = np; c < n; ++c) acc = __fadd_rn(acc, __fmul_rn(w[c], x[c]));
+        *out = acc;
+    }
+}
+
 inline void q38_moe_gate_dot_f32_avx2(
         const float * weights,
         const float * x,
         float * out,
         int n,
         cudaStream_t stream) {
+    if (q38_moe_gate_dot_f32_warp_enabled()) {
+        q38_moe_gate_dot_f32_avx2_warp_kernel<<<1, 32, 0, stream>>>(weights, x, out, n);
+        return;
+    }
     q38_moe_gate_dot_f32_avx2_kernel<<<1, 1, 0, stream>>>(weights, x, out, n);
 }
 
@@ -1314,17 +1950,27 @@ public:
 
     // Weight-pointer table of one batched layer: filled in pinned host memory
     // and copied to the device once per layer.
-    Q38MoeExpertPtrTable * host_expert_ptr_table() {
+    // Task R: the pointer table of a layer is uploaded once per expert group,
+    // and cudaMemcpyAsync() from pinned host memory reads the source while the
+    // stream is still draining the previous group. One shared staging table
+    // would therefore be rewritten by the next group before its predecessor's
+    // H2D had read it (observed as wrong experts and, when a torn 8-byte
+    // pointer reached the device, an illegal memory access). Each group gets
+    // its own host and device table instead.
+    static constexpr int kTableSlots = 8;
+    Q38MoeExpertPtrTable * host_expert_ptr_table(int slot = 0) {
         if (!h_expert_ptr_table_) {
-            host_alloc(reinterpret_cast<void **>(&h_expert_ptr_table_), sizeof(Q38MoeExpertPtrTable));
+            host_alloc(reinterpret_cast<void **>(&h_expert_ptr_table_),
+                       sizeof(Q38MoeExpertPtrTable) * kTableSlots);
         }
-        return h_expert_ptr_table_;
+        return h_expert_ptr_table_ + (slot % kTableSlots);
     }
-    Q38MoeExpertPtrTable * expert_ptr_table() {
+    Q38MoeExpertPtrTable * expert_ptr_table(int slot = 0) {
         if (!d_expert_ptr_table_) {
-            alloc(reinterpret_cast<void **>(&d_expert_ptr_table_), sizeof(Q38MoeExpertPtrTable));
+            alloc(reinterpret_cast<void **>(&d_expert_ptr_table_),
+                  sizeof(Q38MoeExpertPtrTable) * kTableSlots);
         }
-        return d_expert_ptr_table_;
+        return d_expert_ptr_table_ + (slot % kTableSlots);
     }
     int * h_ids() const { return h_ids_; }
     float * h_weights() const { return h_weights_; }
@@ -1570,6 +2216,7 @@ inline void q38_select_experts(
     if (router.rows != scratch.n_experts() || router.cols != scratch.hidden()) {
         throw std::runtime_error("Qwen3.8 router matrix geometry mismatch");
     }
+    Q38MoeKernelScope profile_scope(kQ38MoeSiteRouter, stream);
 
     constexpr int threads = 256;
     const int hidden = scratch.hidden();
@@ -1593,9 +2240,9 @@ inline void q38_select_experts(
         launch_matrix_gemv_float(router, x, scratch.d_logits(), stream);
     }
 
-    q38_topk_softmax_kernel<<<1, 1, 0, stream>>>(
+    q38_launch_topk_softmax(
         scratch.d_logits(), scratch.n_experts(), scratch.k(), expert_scale,
-        scratch.d_ids(), scratch.d_weights());
+        scratch.d_ids(), scratch.d_weights(), stream);
 
     cudaError_t e = cudaMemcpyAsync(
         scratch.h_ids(), scratch.d_ids(), static_cast<size_t>(scratch.k()) * sizeof(int),
@@ -1620,6 +2267,7 @@ inline void q38_select_experts_f32_input(
     if (router.rows != scratch.n_experts() || router.cols != scratch.hidden()) {
         throw std::runtime_error("Qwen3.8 router matrix geometry mismatch");
     }
+    Q38MoeKernelScope profile_scope(kQ38MoeSiteRouter, stream);
 
     if (q38_moe_router_q8_0_enabled() && q38_moe_router_q8_0_compatible(router, scratch)) {
         // The F32 router input can be quantised in place, exactly like ggml.
@@ -1630,9 +2278,9 @@ inline void q38_select_experts_f32_input(
     } else {
         launch_matrix_gemv_f32_input(router, x, scratch.d_logits(), stream);
     }
-    q38_topk_softmax_kernel<<<1, 1, 0, stream>>>(
+    q38_launch_topk_softmax(
         scratch.d_logits(), scratch.n_experts(), scratch.k(), expert_scale,
-        scratch.d_ids(), scratch.d_weights());
+        scratch.d_ids(), scratch.d_weights(), stream);
 
     cudaError_t e = cudaMemcpyAsync(
         scratch.h_ids(), scratch.d_ids(), static_cast<size_t>(scratch.k()) * sizeof(int),
@@ -1661,32 +2309,53 @@ inline void q38_moe_select_experts_f32_x(
     if (router.rows != scratch.n_experts() || router.cols != scratch.hidden()) {
         throw std::runtime_error("Qwen3.8 router matrix geometry mismatch");
     }
+    Q38MoeKernelScope profile_scope(kQ38MoeSiteRouter, stream);
 
-    if (q38_moe_router_q8_0_enabled() && q38_moe_router_q8_0_compatible(router, scratch)) {
-        // The F32 router input is quantised in place, exactly like ggml.
-        q38_moe_quantize_activation_q8_0(
-            x, scratch.hidden(), scratch.q8_0_values(), scratch.q8_0_scales(), stream);
-        q38_moe_gemv_q8_0_exact(
-            router.low, scratch.q8_0_values(), scratch.q8_0_scales(), scratch.d_logits(), stream);
-    } else if (q38_moe_router_f32_enabled() && matrix_has_f32_weights(router)) {
-        launch_matrix_gemv_f32_weights(router, x, scratch.d_logits(), stream);
-    } else {
-        launch_matrix_gemv_f32_input(router, x, scratch.d_logits(), stream);
+    {
+        Q38MoeKernelScope quant_scope(kQ38MoeSiteRouterQuant, stream);
+        if (q38_moe_router_q8_0_enabled() && q38_moe_router_q8_0_compatible(router, scratch)) {
+            // The F32 router input is quantised in place, exactly like ggml.
+            q38_moe_quantize_activation_q8_0(
+                x, scratch.hidden(), scratch.q8_0_values(), scratch.q8_0_scales(), stream);
+            q38_moe_gemv_q8_0_exact(
+                router.low, scratch.q8_0_values(), scratch.q8_0_scales(), scratch.d_logits(), stream);
+        } else {
+            Q38MoeKernelScope gemv_scope(kQ38MoeSiteRouterGemv, stream);
+            if (q38_moe_router_f32_enabled() && matrix_has_f32_weights(router)) {
+                if (q38_moe_router_f32_warp_enabled()) {
+                    launch_q38_router_gemv_f32(router, x, scratch.d_logits(), stream);
+                } else {
+                    launch_matrix_gemv_f32_weights(router, x, scratch.d_logits(), stream);
+                }
+            } else {
+                launch_matrix_gemv_f32_input(router, x, scratch.d_logits(), stream);
+            }
+        }
     }
 
-    q38_topk_softmax_kernel<<<1, 1, 0, stream>>>(
-        scratch.d_logits(), scratch.n_experts(), scratch.k(), expert_scale,
-        scratch.d_ids(), scratch.d_weights());
+    {
+        Q38MoeKernelScope topk_scope(kQ38MoeSiteRouterTopk, stream);
+        q38_topk_softmax_kernel<<<1, 1, 0, stream>>>(
+            scratch.d_logits(), scratch.n_experts(), scratch.k(), expert_scale,
+            scratch.d_ids(), scratch.d_weights());
+    }
 
-    cudaError_t e = cudaMemcpyAsync(
-        scratch.h_ids(), scratch.d_ids(), static_cast<size_t>(scratch.k()) * sizeof(int),
-        cudaMemcpyDeviceToHost, stream);
-    if (e != cudaSuccess) throw std::runtime_error(std::string("copy F32-x router expert ids failed: ") + cudaGetErrorString(e));
-    e = cudaMemcpyAsync(
-        scratch.h_weights(), scratch.d_weights(), static_cast<size_t>(scratch.k()) * sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    if (e != cudaSuccess) throw std::runtime_error(std::string("copy F32-x router expert weights failed: ") + cudaGetErrorString(e));
-    e = cudaStreamSynchronize(stream);
+    cudaError_t e = cudaSuccess;
+    {
+        Q38MoeKernelScope d2h_scope(kQ38MoeSiteRouterD2h, stream);
+        e = cudaMemcpyAsync(
+            scratch.h_ids(), scratch.d_ids(), static_cast<size_t>(scratch.k()) * sizeof(int),
+            cudaMemcpyDeviceToHost, stream);
+        if (e != cudaSuccess) throw std::runtime_error(std::string("copy F32-x router expert ids failed: ") + cudaGetErrorString(e));
+        e = cudaMemcpyAsync(
+            scratch.h_weights(), scratch.d_weights(), static_cast<size_t>(scratch.k()) * sizeof(float),
+            cudaMemcpyDeviceToHost, stream);
+        if (e != cudaSuccess) throw std::runtime_error(std::string("copy F32-x router expert weights failed: ") + cudaGetErrorString(e));
+    }
+    {
+        Q38MoeKernelScope sync_scope(kQ38MoeSiteRouterSync, stream);
+        e = cudaStreamSynchronize(stream);
+    }
     if (e != cudaSuccess) throw std::runtime_error(std::string("F32-x router selection sync failed: ") + cudaGetErrorString(e));
 }
 
@@ -1714,6 +2383,7 @@ inline void q38_finish_moe(
         Qwen38MoeScratch & scratch,
         OutT * out,
         cudaStream_t stream) {
+    Q38MoeKernelScope profile_scope(kQ38MoeSiteFinish, stream);
     const int hidden = scratch.hidden();
     constexpr int threads = 256;
     const int blocks = (hidden + threads - 1) / threads;
@@ -2598,11 +3268,13 @@ inline bool q38_moe_fused_grid_candidate(
 inline void q38_moe_upload_expert_ptr_table(
         const Q38MoeExpertPtrTable & table,
         Qwen38MoeScratch & scratch,
-        cudaStream_t stream) {
-    Q38MoeExpertPtrTable * host = scratch.host_expert_ptr_table();
+        cudaStream_t stream,
+        int slot = 0) {
+    Q38MoeKernelScope profile_scope(kQ38MoeSitePtrH2d, stream);
+    Q38MoeExpertPtrTable * host = scratch.host_expert_ptr_table(slot);
     *host = table;
     const cudaError_t e = cudaMemcpyAsync(
-        scratch.expert_ptr_table(), host, sizeof(Q38MoeExpertPtrTable),
+        scratch.expert_ptr_table(slot), host, sizeof(Q38MoeExpertPtrTable),
         cudaMemcpyHostToDevice, stream);
     if (e != cudaSuccess) {
         throw std::runtime_error(
@@ -2626,22 +3298,27 @@ inline void q38_moe_run_batched_experts(
         int k,
         __half * selected_output_trace,
         Qwen38MoeScratch & scratch,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const float * weights) {
+    Q38MoeKernelScope profile_scope(kQ38MoeSiteBatchTotal, stream);
     const int hidden = scratch.hidden();
     const int ffn = scratch.expert_ffn();
     constexpr int threads = 256;
 
     bool launched = false;
-    if (gate_up_type == GgmlType::IQ2_S) {
-        launched = launch_iq2_s_gemv_q8_k_experts_f32(
-            device_table->gate_up, gate_up_experts, gate_up_rows, hidden,
-            scratch.rx_q8k_values(), scratch.rx_q8k_scales(),
-            scratch.rx_batch_gate_up(), stream, threads);
-    } else {
-        launched = launch_iq3_s_gemv_q8_k_experts_f32(
-            device_table->gate_up, gate_up_experts, gate_up_rows, hidden,
-            scratch.rx_q8k_values(), scratch.rx_q8k_scales(),
-            scratch.rx_batch_gate_up(), stream, threads);
+    {
+        Q38MoeKernelScope launch_scope(kQ38MoeSiteGateUpGemv, stream);
+        if (gate_up_type == GgmlType::IQ2_S) {
+            launched = launch_iq2_s_gemv_q8_k_experts_f32(
+                device_table->gate_up, gate_up_experts, gate_up_rows, hidden,
+                scratch.rx_q8k_values(), scratch.rx_q8k_scales(),
+                scratch.rx_batch_gate_up(), stream, threads);
+        } else {
+            launched = launch_iq3_s_gemv_q8_k_experts_f32(
+                device_table->gate_up, gate_up_experts, gate_up_rows, hidden,
+                scratch.rx_q8k_values(), scratch.rx_q8k_scales(),
+                scratch.rx_batch_gate_up(), stream, threads);
+        }
     }
     if (!launched) {
         throw std::runtime_error("expert-batched gate/up GEMV needs the DP4A kernels");
@@ -2650,29 +3327,44 @@ inline void q38_moe_run_batched_experts(
     // SiLU(gate) * up for every expert. The routed call site applies SiLU with
     // inv_hc = 1.0f, so that is the factor the batched kernel gets.
     const int ffn_blocks = (ffn + threads - 1) / threads;
-    q38_moe_silu_scale_mul_experts_kernel<<<dim3(ffn_blocks, k), threads, 0, stream>>>(
-        scratch.rx_batch_gate_up(), scratch.rx_batch_act(), ffn, 1.0f);
+    {
+        Q38MoeKernelScope launch_scope(kQ38MoeSiteSilu, stream);
+        q38_moe_silu_scale_mul_experts_kernel<<<dim3(ffn_blocks, k), threads, 0, stream>>>(
+            scratch.rx_batch_gate_up(), scratch.rx_batch_act(), ffn, 1.0f);
+    }
 
     const int q8_blocks_per_expert = ffn / 32;
     const int q8_blocks = (q8_blocks_per_expert + (threads / 32) - 1) / (threads / 32);
-    q38_moe_q8_0_quantize_experts_kernel<<<dim3(q8_blocks, k), threads, 0, stream>>>(
-        scratch.rx_batch_act(), scratch.rx_batch_q8_0_values(),
-        scratch.rx_batch_q8_0_scales(), ffn);
+    {
+        Q38MoeKernelScope launch_scope(kQ38MoeSiteQ8Quant, stream);
+        q38_moe_q8_0_quantize_experts_kernel<<<dim3(q8_blocks, k), threads, 0, stream>>>(
+            scratch.rx_batch_act(), scratch.rx_batch_q8_0_values(),
+            scratch.rx_batch_q8_0_scales(), ffn);
+    }
 
-    launched = launch_iq4_nl_gemv_q8_0_experts_f32(
-        device_table->down, k, hidden, ffn, scratch.rx_batch_q8_0_values(),
-        scratch.rx_batch_q8_0_scales(), scratch.rx_batch_down(), stream, threads);
+    {
+        Q38MoeKernelScope launch_scope(kQ38MoeSiteDownGemv, stream);
+        launched = launch_iq4_nl_gemv_q8_0_experts_f32(
+            device_table->down, k, hidden, ffn, scratch.rx_batch_q8_0_values(),
+            scratch.rx_batch_q8_0_scales(), scratch.rx_batch_down(), stream, threads);
+    }
     if (!launched) {
         throw std::runtime_error("expert-batched down GEMV needs the DP4A kernels");
     }
 
     const int hidden_blocks = (hidden + threads - 1) / threads;
     if constexpr (CaptureSelectedOutput) {
+        Q38MoeKernelScope launch_scope(kQ38MoeSiteCapture, stream);
         q38_moe_capture_experts_kernel<<<dim3(hidden_blocks, k), threads, 0, stream>>>(
             scratch.rx_batch_down(), selected_output_trace, hidden);
     }
-    q38_moe_weighted_accum_experts_f32_kernel<<<hidden_blocks, threads, 0, stream>>>(
-        scratch.rx_batch_down(), scratch.d_weights(), scratch.d_accum(), hidden, k);
+    // "weights" is the group's slice of the layer's top-k weights, so a prefix
+    // split accumulates the same per-element rounded sequence in the same order.
+    {
+        Q38MoeKernelScope launch_scope(kQ38MoeSiteAccum, stream);
+        q38_moe_weighted_accum_experts_f32_kernel<<<hidden_blocks, threads, 0, stream>>>(
+            scratch.rx_batch_down(), weights, scratch.d_accum(), hidden, k);
+    }
 }
 
 // Batched twin of q38_moe_run_routed_experts_q8_act_separate(). Returns false
@@ -2691,35 +3383,57 @@ inline bool q38_moe_try_run_routed_experts_q8_act_separate_batched(
         __half * selected_output_trace,
         cudaStream_t stream) {
     const int k = scratch.k();
+    const int groups = q38_moe_batch_groups(k);
 
-    Q38MoeExpertPtrTable table{};
-    GgmlType gate_up_type = GgmlType::F32;
-    for (int j = 0; j < k; ++j) {
-        const int expert = scratch.h_ids()[j];
-        auto w = cache.acquire(layer, expert, gate_exps, up_exps, down_exps, stream);
-        if (!q38_moe_gate_up_q8_k_type(w.gate.type) ||
-            !q38_moe_gate_up_q8_k_type(w.up.type) ||
-            w.down.type != GgmlType::IQ4_NL) {
-            throw std::runtime_error("Qwen3.8 routed expert low-bit type changed inside a layer");
-        }
-        // The batched kernels are dispatched once per layer, so the per-expert
-        // type checks above become one type check for the whole batch.
-        if (j == 0) {
-            gate_up_type = w.gate.type;
-        } else if (w.gate.type != gate_up_type || w.up.type != gate_up_type) {
-            throw std::runtime_error("Qwen3.8 routed expert types differ inside a layer");
-        }
-        if ((reinterpret_cast<uintptr_t>(w.down.data) & 1u) != 0) return false;
-        table.gate_up[2 * j] = w.gate.data;
-        table.gate_up[2 * j + 1] = w.up.data;
-        table.down[j] = w.down.data;
+    // The routed activation is shared by every expert of the layer, so it is
+    // quantised once however many groups the layer runs in.
+    {
+        Q38MoeKernelScope quant_scope(kQ38MoeSiteRxQuant, stream);
+        q38_moe_quantize_routed_x(x, scratch, stream);
     }
 
-    q38_moe_quantize_routed_x(x, scratch, stream);
-    q38_moe_upload_expert_ptr_table(table, scratch, stream);
-    q38_moe_run_batched_experts<CaptureSelectedOutput>(
-        scratch.expert_ptr_table(), gate_up_type, 2 * k, scratch.expert_ffn(), k,
-        selected_output_trace, scratch, stream);
+    GgmlType gate_up_type = GgmlType::F32;
+    int start = 0;
+    for (int g = 0; g < groups; ++g) {
+        const int count = q38_moe_group_count(k, groups, g);
+        Q38MoeExpertPtrTable table{};
+        Q38MoeKernelScope acquire_scope(kQ38MoeSiteAcquire, stream);
+        for (int j = 0; j < count; ++j) {
+            const int expert = scratch.h_ids()[start + j];
+            auto w = cache.acquire(layer, expert, gate_exps, up_exps, down_exps, stream);
+            if (!q38_moe_gate_up_q8_k_type(w.gate.type) ||
+                !q38_moe_gate_up_q8_k_type(w.up.type) ||
+                w.down.type != GgmlType::IQ4_NL) {
+                throw std::runtime_error("Qwen3.8 routed expert low-bit type changed inside a layer");
+            }
+            // The batched kernels are dispatched once per group, so the
+            // per-expert type checks above become one type check per group.
+            if (start + j == 0) {
+                gate_up_type = w.gate.type;
+            } else if (w.gate.type != gate_up_type || w.up.type != gate_up_type) {
+                throw std::runtime_error("Qwen3.8 routed expert types differ inside a layer");
+            }
+            if ((reinterpret_cast<uintptr_t>(w.down.data) & 1u) != 0) {
+                // Abort the layer before any later group can add to a partially
+                // written accumulation: the caller falls back to the serial
+                // loop, which accumulates onto d_accum.
+                (void)cudaMemsetAsync(scratch.d_accum(), 0,
+                    static_cast<size_t>(scratch.hidden()) * sizeof(float), stream);
+                return false;
+            }
+            table.gate_up[2 * j] = w.gate.data;
+            table.gate_up[2 * j + 1] = w.up.data;
+            table.down[j] = w.down.data;
+        }
+        q38_moe_upload_expert_ptr_table(table, scratch, stream, g);
+        q38_moe_run_batched_experts<CaptureSelectedOutput>(
+            scratch.expert_ptr_table(g), gate_up_type, 2 * count, scratch.expert_ffn(), count,
+            selected_output_trace == nullptr
+                ? nullptr
+                : selected_output_trace + static_cast<size_t>(start) * scratch.hidden(),
+            scratch, stream, scratch.d_weights() + start);
+        start += count;
+    }
     return true;
 }
 
@@ -2735,30 +3449,47 @@ inline bool q38_moe_try_run_routed_experts_q8_act_fused_batched(
         __half * selected_output_trace,
         cudaStream_t stream) {
     const int k = scratch.k();
+    const int groups = q38_moe_batch_groups(k);
 
-    Q38MoeExpertPtrTable table{};
-    GgmlType gate_up_type = GgmlType::F32;
-    for (int j = 0; j < k; ++j) {
-        const int expert = scratch.h_ids()[j];
-        auto w = cache.acquire(layer, expert, gate_up_exps, down_exps, stream);
-        if (!q38_moe_gate_up_q8_k_type(w.gate_up.type) || w.down.type != GgmlType::IQ4_NL) {
-            throw std::runtime_error("Qwen3.8 fused expert low-bit type changed inside a layer");
-        }
-        if (j == 0) {
-            gate_up_type = w.gate_up.type;
-        } else if (w.gate_up.type != gate_up_type) {
-            throw std::runtime_error("Qwen3.8 fused expert types differ inside a layer");
-        }
-        if ((reinterpret_cast<uintptr_t>(w.down.data) & 1u) != 0) return false;
-        table.gate_up[j] = w.gate_up.data;
-        table.down[j] = w.down.data;
+    {
+        Q38MoeKernelScope quant_scope(kQ38MoeSiteRxQuant, stream);
+        q38_moe_quantize_routed_x(x, scratch, stream);
     }
 
-    q38_moe_quantize_routed_x(x, scratch, stream);
-    q38_moe_upload_expert_ptr_table(table, scratch, stream);
-    q38_moe_run_batched_experts<CaptureSelectedOutput>(
-        scratch.expert_ptr_table(), gate_up_type, k, 2 * scratch.expert_ffn(), k,
-        selected_output_trace, scratch, stream);
+    GgmlType gate_up_type = GgmlType::F32;
+    int start = 0;
+    for (int g = 0; g < groups; ++g) {
+        const int count = q38_moe_group_count(k, groups, g);
+        Q38MoeExpertPtrTable table{};
+        Q38MoeKernelScope acquire_scope(kQ38MoeSiteAcquire, stream);
+        for (int j = 0; j < count; ++j) {
+            const int expert = scratch.h_ids()[start + j];
+            auto w = cache.acquire(layer, expert, gate_up_exps, down_exps, stream);
+            if (!q38_moe_gate_up_q8_k_type(w.gate_up.type) || w.down.type != GgmlType::IQ4_NL) {
+                throw std::runtime_error("Qwen3.8 fused expert low-bit type changed inside a layer");
+            }
+            if (start + j == 0) {
+                gate_up_type = w.gate_up.type;
+            } else if (w.gate_up.type != gate_up_type) {
+                throw std::runtime_error("Qwen3.8 fused expert types differ inside a layer");
+            }
+            if ((reinterpret_cast<uintptr_t>(w.down.data) & 1u) != 0) {
+                (void)cudaMemsetAsync(scratch.d_accum(), 0,
+                    static_cast<size_t>(scratch.hidden()) * sizeof(float), stream);
+                return false;
+            }
+            table.gate_up[j] = w.gate_up.data;
+            table.down[j] = w.down.data;
+        }
+        q38_moe_upload_expert_ptr_table(table, scratch, stream, g);
+        q38_moe_run_batched_experts<CaptureSelectedOutput>(
+            scratch.expert_ptr_table(g), gate_up_type, count, 2 * scratch.expert_ffn(), count,
+            selected_output_trace == nullptr
+                ? nullptr
+                : selected_output_trace + static_cast<size_t>(start) * scratch.hidden(),
+            scratch, stream, scratch.d_weights() + start);
+        start += count;
+    }
     return true;
 }
 
@@ -2791,10 +3522,15 @@ inline void run_qwen38_routed_moe_fused(
         throw std::runtime_error("Qwen3.8 fused gate-up FFN width mismatch");
     }
 
+    Q38MoeKernelScope profile_scope(kQ38MoeSiteRoutedTotal, stream);
     if (!preselected) q38_moe_select_experts_input<XT>(router, x, scratch, expert_scale, stream);
 
-    cudaError_t e = cudaMemsetAsync(
-        scratch.d_accum(), 0, static_cast<size_t>(scratch.hidden()) * sizeof(float), stream);
+    cudaError_t e = cudaSuccess;
+    {
+        Q38MoeKernelScope zero_scope(kQ38MoeSiteAccumZero, stream);
+        e = cudaMemsetAsync(
+            scratch.d_accum(), 0, static_cast<size_t>(scratch.hidden()) * sizeof(float), stream);
+    }
     if (e != cudaSuccess) throw std::runtime_error(std::string("zero MoE accumulation failed: ") + cudaGetErrorString(e));
 
     const bool f32_mid = q38_moe_f32_mid_enabled();
@@ -2821,6 +3557,7 @@ inline void run_qwen38_routed_moe_fused(
     // half-input runner receives.
     const __half * legacy_x = q38_moe_legacy_half_activation(x, scratch, stream);
 
+    Q38MoeKernelScope loop_scope(kQ38MoeSiteLoopTotal, stream);
     for (int j = 0; j < scratch.k(); ++j) {
         const int expert = scratch.h_ids()[j];
         const float weight = scratch.h_weights()[j];
@@ -2907,10 +3644,15 @@ inline void run_qwen38_routed_moe_separate(
     if constexpr (CaptureSelectedOutput) {
         if (!selected_output_trace) throw std::runtime_error("selected expert trace buffer is null");
     }
+    Q38MoeKernelScope profile_scope(kQ38MoeSiteRoutedTotal, stream);
     if (!preselected) q38_moe_select_experts_input<XT>(router, x, scratch, expert_scale, stream);
 
-    cudaError_t e = cudaMemsetAsync(
-        scratch.d_accum(), 0, static_cast<size_t>(scratch.hidden()) * sizeof(float), stream);
+    cudaError_t e = cudaSuccess;
+    {
+        Q38MoeKernelScope zero_scope(kQ38MoeSiteAccumZero, stream);
+        e = cudaMemsetAsync(
+            scratch.d_accum(), 0, static_cast<size_t>(scratch.hidden()) * sizeof(float), stream);
+    }
     if (e != cudaSuccess) throw std::runtime_error(std::string("zero MoE accumulation failed: ") + cudaGetErrorString(e));
 
     const bool f32_mid = q38_moe_f32_mid_enabled();
@@ -2944,6 +3686,7 @@ inline void run_qwen38_routed_moe_separate(
     // F16-activation GEMV kernels would have received.
     const __half * legacy_x = q38_moe_legacy_half_activation(x, scratch, stream);
 
+    Q38MoeKernelScope loop_scope(kQ38MoeSiteLoopTotal, stream);
     for (int j = 0; j < scratch.k(); ++j) {
         const int expert = scratch.h_ids()[j];
         const float weight = scratch.h_weights()[j];
@@ -3154,10 +3897,14 @@ inline void q38_moe_run_shared_expert_f32_input(
         const Qwen38SharedExpertWeights & shared,
         Qwen38MoeScratch & scratch,
         cudaStream_t stream) {
+    Q38MoeKernelScope shared_scope(kQ38MoeSiteShared, stream);
     q38_moe_check_shared_expert_geometry(shared, scratch);
 
-    q38_moe_shared_gate_dot(x, shared, scratch, stream);
-    sigmoid_scalar_kernel<<<1, 1, 0, stream>>>(scratch.d_shared_gate());
+    {
+        Q38MoeKernelScope gate_scope(kQ38MoeSiteSharedGate, stream);
+        q38_moe_shared_gate_dot(x, shared, scratch, stream);
+        sigmoid_scalar_kernel<<<1, 1, 0, stream>>>(scratch.d_shared_gate());
+    }
 
     const int threads = 256;
     const int ffn_blocks = (scratch.expert_ffn() + threads - 1) / threads;

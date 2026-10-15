@@ -427,6 +427,203 @@ struct Qwen38RunTiming {
 // Disabled by default: with WARODECODE_PROFILE unset (or "0") no event is ever
 // created, the pools stay empty and every hook is a single predictable branch
 // on enabled(), so the default decode path is unchanged.
+// Task T: WARODECODE_MOE_SELECT_SPLIT moves the routed-expert selection out of
+// the MoE runner into step() so the profiler can time it as its own sub-region.
+// The kernels, their order and their arguments are unchanged; only the call site
+// moves. Default OFF, so the default decode path is the one that was already
+// validated; the A/B runs it with the switch set.
+inline bool q38_moe_select_split_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("WARODECODE_MOE_SELECT_SPLIT");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+// Task T: WARODECODE_SELECT_POLL replaces the cudaStreamSynchronize that ends
+// the expert selection with an event-query spin (see
+// Qwen38Decoder::select_experts_polled). Default OFF.
+inline bool q38_select_poll_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("WARODECODE_SELECT_POLL");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+// Task T: WARODECODE_ROUTER_PARALLEL runs the exact router -> top-k chain on a
+// whole block instead of one thread.
+//
+// q38_topk_softmax_kernel() launches one block of one thread, and the exact
+// router then does everything on that single thread: a 512-element fmaxf fold, 512 bit-exact exp
+// evaluations, 64 chunk sums and k = 10 argsort rungs of 512 branchy comparisons
+// each. The stage profile attributes ~0.9 ms per layer (43 ms per token) to the
+// bracket that contains it, which is the largest single item inside the MoE
+// region and by far the largest per-layer host-observed stall.
+//
+// Every step below is the same operation in the same order-visible order, only
+// distributed over the block:
+//   - the max fold is fmaxf, which is order independent, so a reduction tree
+//     gives the identical value;
+//   - each exp is element-wise and uses the same q38_exact_avx2_exp_f32();
+//   - the chunk sums use the same q38_moe_softmax_lane_sum() per 8-lane chunk
+//     and are still accumulated in ascending chunk order by one thread, which is
+//     the reference's own order (a parallel double sum would round differently);
+//   - the normalization is one __fmul_rn per element with the same inv;
+//   - each argsort rung keeps the maximum with "strictly greater, lowest index
+//     wins" and skips the experts already taken, which a packed 64-bit atomicMax
+//     over (ordered float bits, ~index) reproduces exactly.
+// The row that underflows every exponent to zero is the one place where the
+// reference's "if (p > best)" scan keeps the initial id 0 for every rung; that
+// case is not reasoned about here at all, it simply calls the reference function
+// and returns, so the degenerate row is bit-identical by construction.
+template <int THREADS>
+__global__ void q38_router_exact_parallel_kernel(
+        const float * __restrict__ logits,
+        int n_experts,
+        int k,
+        float w_scale,
+        int * __restrict__ ids,
+        float * __restrict__ weights) {
+    __shared__ float probs[Q38_MOE_ROUTER_MAX_EXPERTS];
+    __shared__ float max_sh[THREADS];
+    __shared__ double chunk_sums[Q38_MOE_ROUTER_MAX_EXPERTS / 8];
+    __shared__ unsigned long long rung_key;
+    __shared__ int rung_taken[Q38_MOE_ROUTER_KMAX];
+    __shared__ float rung_top[Q38_MOE_ROUTER_KMAX];
+    __shared__ int degenerate;
+
+    const int t = threadIdx.x;
+    const int n = n_experts;
+    // The reference kernel's own dispatch: no output when k is out of range, the
+    // legacy formula when the exact router is off or the geometry does not fit,
+    // the exact chain otherwise.
+    if (blockIdx.x != 0 || k <= 0 || k > Q38_MOE_ROUTER_KMAX) return;
+    if (!(q38_moe_exact_router_on() && n > 0 && n <= Q38_MOE_ROUTER_MAX_EXPERTS && (n % 8) == 0)) {
+        if (t == 0) q38_moe_router_legacy(logits, n, k, w_scale, ids, weights);
+        return;
+    }
+
+    float local = -INFINITY;
+    for (int e = t; e < n; e += THREADS) local = fmaxf(local, logits[e]);
+    max_sh[t] = local;
+    __syncthreads();
+    for (int s = THREADS / 2; s > 0; s >>= 1) {
+        if (t < s) max_sh[t] = fmaxf(max_sh[t], max_sh[t + s]);
+        __syncthreads();
+    }
+    const float max_v = max_sh[0];
+    if (max_v == -INFINITY) {
+        // Every logit is -INFINITY: the difference below is +NaN and the
+        // reference has no meaningful answer either. Take its own path so the
+        // two agree by construction rather than by argument.
+        if (t == 0) q38_moe_router_exact(logits, n, k, w_scale, probs, ids, weights);
+        return;
+    }
+
+    for (int e = t; e < n; e += THREADS) {
+        probs[e] = q38_exact_avx2_exp_f32(__fsub_rn(logits[e], max_v));
+    }
+    if (t == 0) degenerate = 0;
+    __syncthreads();
+
+    const int chunks = n / 8;
+    for (int c = t; c < chunks; c += THREADS) {
+        chunk_sums[c] = static_cast<double>(q38_moe_softmax_lane_sum(probs + c * 8));
+    }
+    __syncthreads();
+    if (t == 0) {
+        double sum = 0.0;
+        for (int c = 0; c < chunks; ++c) sum += chunk_sums[c];
+        if (sum == 0.0) {
+            // ggml_vec_scale_f32 starts from -INFINITY, so an all-underflowed row
+            // stays -INFINITY. The reference's rung scan cannot reproduce that
+            // case with a maximum search, so hand it over untouched.
+            degenerate = 1;
+        } else {
+            const float inv = static_cast<float>(1.0 / sum);
+            for (int e = 0; e < n; ++e) probs[e] = __fmul_rn(probs[e], inv);
+            for (int j = 0; j < Q38_MOE_ROUTER_KMAX; ++j) rung_taken[j] = -1;
+        }
+    }
+    __syncthreads();
+    if (degenerate != 0) {
+        if (t == 0) q38_moe_router_exact(logits, n, k, w_scale, probs, ids, weights);
+        return;
+    }
+
+    for (int j = 0; j < k; ++j) {
+        if (t == 0) rung_key = 0ull;
+        __syncthreads();
+        unsigned long long key = 0ull;
+        for (int e = t; e < n; e += THREADS) {
+            bool taken = false;
+            for (int m = 0; m < j; ++m) {
+                if (rung_taken[m] == e) { taken = true; break; }
+            }
+            if (taken) continue;
+            const unsigned int u = __float_as_uint(probs[e]);
+            const unsigned int ordered = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+            const unsigned long long candidate =
+                (static_cast<unsigned long long>(ordered) << 32) |
+                static_cast<unsigned long long>(~static_cast<unsigned int>(e));
+            if (candidate > key) key = candidate;
+        }
+        if (key != 0ull) atomicMax(&rung_key, key);
+        __syncthreads();
+        if (t == 0) {
+            const unsigned int low = static_cast<unsigned int>(rung_key & 0xFFFFFFFFull);
+            const int chosen = static_cast<int>(~low);
+            rung_taken[j] = chosen;
+            // The value is read back through the id, exactly like the reference
+            // (ggml_get_rows selects the cell, it does not invent one).
+            rung_top[j] = probs[chosen];
+            ids[j] = chosen;
+        }
+        __syncthreads();
+    }
+
+    if (t == 0) {
+        double wsum = 0.0;
+        for (int j = 0; j < k; ++j) wsum += static_cast<double>(rung_top[j]);
+        const float wsum_f32 = fmaxf(static_cast<float>(wsum), 6.103515625e-5f);
+        for (int j = 0; j < k; ++j) {
+            weights[j] = __fdiv_rn(rung_top[j], wsum_f32);
+        }
+        if (w_scale != 0.0f && w_scale != 1.0f) {
+            for (int j = 0; j < k; ++j) weights[j] = __fmul_rn(weights[j], w_scale);
+        }
+    }
+}
+
+inline bool q38_router_parallel_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("WARODECODE_ROUTER_PARALLEL");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+// Drop-in replacement for the one-thread exact-router kernel. With the switch
+// off, or for a geometry the parallel path does not cover, it launches the
+// reference kernel, so the only difference between the two is who computes the
+// same arithmetic.
+inline void launch_q38_topk_router(
+        const float * logits,
+        int n_experts,
+        int k,
+        float w_scale,
+        int * ids,
+        float * weights,
+        cudaStream_t stream) {
+    if (!q38_router_parallel_enabled()) {
+        q38_topk_softmax_kernel<<<1, 1, 0, stream>>>(logits, n_experts, k, w_scale, ids, weights);
+        return;
+    }
+    q38_router_exact_parallel_kernel<256><<<1, 256, 0, stream>>>(
+        logits, n_experts, k, w_scale, ids, weights);
+}
+
 class Qwen38StageProfiler {
 public:
     // Upper bound of one stage's repeats inside a single token. The longest
@@ -457,6 +654,25 @@ public:
                 return;
             }
         }
+        // Task T: the cuts that split the MoE region. A failed creation only
+        // drops that cut, never the stage profile.
+        for (int i = 0; i < kLayerCap; ++i) {
+            for (int c = 0; c < kMoeCutCount; ++c) moe_cut_ev_[i][c] = nullptr;
+            for (int c = 0; c < kMoeCutCount; ++c) {
+                if (cudaEventCreate(&moe_cut_ev_[i][c]) != cudaSuccess) moe_cut_ev_[i][c] = nullptr;
+            }
+        }
+        {
+            const char * p = std::getenv("WARODECODE_SELECT_PROBE");
+            select_probe_ = p != nullptr && p[0] != '\0' && p[0] != '0';
+        }
+        if (select_probe_) {
+            for (int i = 0; i < kLayerCap; ++i) {
+                for (int c = 0; c < kSelPieceCount; ++c) {
+                    if (cudaEventCreate(&select_ev_[i][c]) != cudaSuccess) select_ev_[i][c] = nullptr;
+                }
+            }
+        }
         totals_.layer_device_ms.assign(kLayerCap, 0.0);
         totals_.layer_host_ms.assign(kLayerCap, 0.0);
     }
@@ -469,6 +685,14 @@ public:
         for (cudaEvent_t e : stop_) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : layer_start_) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : layer_stop_) if (e) cudaEventDestroy(e);
+        for (int i = 0; i < kLayerCap; ++i) {
+            for (int c = 0; c < kMoeCutCount; ++c) {
+                if (moe_cut_ev_[i][c]) cudaEventDestroy(moe_cut_ev_[i][c]);
+            }
+            for (int c = 0; c < kSelPieceCount; ++c) {
+                if (select_ev_[i][c]) cudaEventDestroy(select_ev_[i][c]);
+            }
+        }
     }
 
     bool enabled() const { return enabled_; }
@@ -480,9 +704,26 @@ public:
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    // Task T: thread CPU time on the same monotonic scale as host_now().
+    // host_ms - cpu_ms of a region is the time its thread was not running, so a
+    // 40 ms region with 2 ms of CPU time is a wait, not work. CLOCK_THREAD_CPUTIME_ID
+    // is POSIX/Linux; everywhere else this degrades to the wall clock (so the
+    // difference stays 0 and the report simply says nothing).
+    static double cpu_now() {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+        struct timespec ts;
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+            return static_cast<double>(ts.tv_sec) * 1000.0 +
+                static_cast<double>(ts.tv_nsec) / 1000000.0;
+        }
+#endif
+        return host_now();
+    }
+
     void mark_begin(int stage, cudaStream_t stream) {
         if (!enabled_) return;
         host_begin_[static_cast<size_t>(stage)] = host_now();
+        cpu_begin_[static_cast<size_t>(stage)] = cpu_now();
         if (pending_[stage]) {
             // A previous begin never saw its end (aborted run). Drop it instead of
             // pairing it with the wrong stop event.
@@ -505,6 +746,8 @@ public:
         if (!enabled_) return;
         totals_.stage[static_cast<size_t>(stage)].host_ms +=
             host_now() - host_begin_[static_cast<size_t>(stage)];
+        totals_.stage[static_cast<size_t>(stage)].cpu_ms +=
+            cpu_now() - cpu_begin_[static_cast<size_t>(stage)];
         if (!pending_[stage]) {
             ++unmatched_[stage];
             return;
@@ -532,13 +775,80 @@ public:
         if (layer + 1 > layer_count_) layer_count_ = layer + 1;
     }
 
+    // -----------------------------------------------------------------------
+    // Task T: split one layer's kQwen38StageMoe region into three sub-regions.
+    // The region is the one bracket whose host wall clock (120 ms/token) is far
+    // above the sum of the launches inside it, so "which side waits here" has to
+    // be measured rather than inferred from the stage total.
+    //
+    //   moe_region_begin()        - right after mark_begin(kQwen38StageMoe)
+    //   moe_region_cut(0)         - after the router + top-k + id readback sync
+    //   moe_region_cut(1)         - after the routed expert runner
+    //   moe_region_end()          - right after mark_end(kQwen38StageMoe)
+    //
+    // Each sub-region accumulates wall clock and thread CPU time of the same
+    // span; flush_token() adds the device interval between the two cut events.
+    // -----------------------------------------------------------------------
+    void moe_region_begin(int layer) {
+        if (!enabled_ || layer < 0 || layer >= kLayerCap) return;
+        moe_mark_wall_[static_cast<size_t>(layer)] = host_now();
+        moe_mark_cpu_[static_cast<size_t>(layer)] = cpu_now();
+        // The Moe stage's begin already ran, so written_ is the slot the stop
+        // event will land in.
+        moe_slot_[static_cast<size_t>(layer)] = written_[kQwen38StageMoe];
+        moe_cuts_[static_cast<size_t>(layer)] = 0;
+    }
+
+    void moe_region_cut(int sub, int layer, cudaStream_t stream) {
+        if (!enabled_ || layer < 0 || layer >= kLayerCap) return;
+        if (sub < 0 || sub >= kMoeCutCount) return;
+        const double wall = host_now();
+        const double cpu = cpu_now();
+        totals_.moe_sub_host_ms[static_cast<size_t>(sub)] += wall - moe_mark_wall_[static_cast<size_t>(layer)];
+        totals_.moe_sub_cpu_ms[static_cast<size_t>(sub)] += cpu - moe_mark_cpu_[static_cast<size_t>(layer)];
+        ++totals_.moe_sub_calls[static_cast<size_t>(sub)];
+        moe_mark_wall_[static_cast<size_t>(layer)] = wall;
+        moe_mark_cpu_[static_cast<size_t>(layer)] = cpu;
+        cudaEvent_t ev = moe_cut_ev_[layer][sub];
+        if (ev != nullptr && cudaEventRecord(ev, stream) == cudaSuccess) {
+            moe_cuts_[static_cast<size_t>(layer)] = sub + 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task T: piece-level device brackets inside the expert selection. The MoE
+    // region's [select] sub-region carries ~0.9 ms/layer on the device timeline
+    // while the operations it contains (activation quantisation, router GEMV,
+    // top-k, two 40-byte readbacks, one wait) are each tens of microseconds in a
+    // standalone probe, so the bracket is split into five spans and each is
+    // accumulated separately. Enabled by WARODECODE_SELECT_PROBE=1 only.
+    // -----------------------------------------------------------------------
+    bool select_probe_enabled() const { return select_probe_; }
+
+    void select_piece(int piece, int layer, cudaStream_t stream) {
+        if (!select_probe_ || layer < 0 || layer >= kLayerCap) return;
+        if (piece < 0 || piece >= kSelPieceCount) return;
+        cudaEvent_t ev = select_ev_[layer][piece];
+        if (ev != nullptr) (void)cudaEventRecord(ev, stream);
+    }
+
+    void moe_region_end(int layer) {
+        if (!enabled_ || layer < 0 || layer >= kLayerCap) return;
+        const double wall = host_now();
+        const double cpu = cpu_now();
+        totals_.moe_sub_host_ms[2] += wall - moe_mark_wall_[static_cast<size_t>(layer)];
+        totals_.moe_sub_cpu_ms[2] += cpu - moe_mark_cpu_[static_cast<size_t>(layer)];
+        ++totals_.moe_sub_calls[2];
+    }
+
     // Marks the profiled token as decode (true) or prefill (false). run() owns
     // the phase, step() only reports its own wall time.
     void set_decode_phase(bool decode) { decode_phase_ = decode; }
 
-    void note_token_host(double host_ms) {
+    void note_token_host(double host_ms, double cpu_ms) {
         if (!enabled_) return;
         totals_.token_host_ms += host_ms;
+        totals_.token_cpu_ms += cpu_ms;
         ++totals_.tokens;
         if (decode_phase_) ++totals_.phases;
     }
@@ -550,6 +860,54 @@ public:
     void flush_token() {
         if (!enabled_) return;
         const double flush_start = host_now();
+        // Task T: the device side of the MoE sub-regions. Every cut is complete
+        // here (flush_token runs after the closing cudaStreamSynchronize), so the
+        // elapsed reads cannot return cudaErrorNotReady.
+        for (int l = 0; l < kLayerCap; ++l) {
+            const int cuts = moe_cuts_[static_cast<size_t>(l)];
+            if (cuts < 1) continue;
+            const int slot = moe_slot_[static_cast<size_t>(l)];
+            if (slot < 0 || slot >= kStageCap) continue;
+            cudaEvent_t begin_ev = start_[index(kQwen38StageMoe, slot)];
+            cudaEvent_t stop_ev = stop_[index(kQwen38StageMoe, slot)];
+            cudaEvent_t cut0 = moe_cut_ev_[l][0];
+            cudaEvent_t cut1 = moe_cut_ev_[l][1];
+            float ms = 0.0f;
+            if (cut0 != nullptr && cudaEventElapsedTime(&ms, begin_ev, cut0) == cudaSuccess) {
+                totals_.moe_sub_device_ms[0] += static_cast<double>(ms);
+            }
+            cudaEvent_t tail_from = cut0;
+            if (cuts >= 2 && cut0 != nullptr && cut1 != nullptr) {
+                if (cudaEventElapsedTime(&ms, cut0, cut1) == cudaSuccess) {
+                    totals_.moe_sub_device_ms[1] += static_cast<double>(ms);
+                }
+                tail_from = cut1;
+            }
+            if (tail_from != nullptr && cudaEventElapsedTime(&ms, tail_from, stop_ev) == cudaSuccess) {
+                totals_.moe_sub_device_ms[2] += static_cast<double>(ms);
+            }
+            moe_cuts_[static_cast<size_t>(l)] = 0;
+            // Task T: the five spans of the selection bracket. They are read here
+            // (before the next token re-records the same events) and summed into
+            // a per-token total.
+            if (select_probe_ && cuts >= 1) {
+                cudaEvent_t chain[kSelPieceCount + 1];
+                chain[0] = begin_ev;
+                for (int c = 0; c < kSelPieceCount; ++c) chain[c + 1] = select_ev_[l][c];
+                bool complete = true;
+                for (int c = 0; c <= kSelPieceCount; ++c) {
+                    if (chain[c] == nullptr) complete = false;
+                }
+                if (complete) {
+                    for (int c = 0; c < kSelPieceCount + 1; ++c) {
+                        float ms = 0.0f;
+                        if (cudaEventElapsedTime(&ms, chain[c], c == kSelPieceCount ? cut0 : chain[c + 1]) == cudaSuccess) {
+                            totals_.select_piece_dev_ms[c] += static_cast<double>(ms);
+                        }
+                    }
+                }
+            }
+        }
         for (int s = 0; s < kQwen38StageCount; ++s) {
             Qwen38StageSample & sample = totals_.stage[static_cast<size_t>(s)];
             for (int i = 0; i < written_[s]; ++i) {
@@ -594,7 +952,18 @@ private:
     int overflow_[kQwen38StageCount] = {};
     bool pending_[kQwen38StageCount] = {};
     double host_begin_[kQwen38StageCount] = {};
+    double cpu_begin_[kQwen38StageCount] = {};
     double layer_host_begin_[kLayerCap] = {};
+    // Task T: MoE region cuts, one event pair per layer (two cuts each).
+    static constexpr int kMoeCutCount = 2;
+    static constexpr int kSelPieceCount = 4;
+    cudaEvent_t moe_cut_ev_[kLayerCap][kMoeCutCount]{};
+    cudaEvent_t select_ev_[kLayerCap][kSelPieceCount]{};
+    bool select_probe_ = false;
+    double moe_mark_wall_[kLayerCap] = {};
+    double moe_mark_cpu_[kLayerCap] = {};
+    int moe_slot_[kLayerCap] = {};
+    int moe_cuts_[kLayerCap] = {};
     int layer_count_ = 0;
     Qwen38ProfileTotals totals_;
 };
@@ -639,6 +1008,11 @@ public:
         if (e != cudaSuccess) throw std::runtime_error("cudaMallocHost Qwen3.8 token failed");
         e = cudaMallocHost(reinterpret_cast<void **>(&host_has_nonfinite_), sizeof(int));
         if (e != cudaSuccess) throw std::runtime_error("cudaMallocHost Qwen3.8 validation flag failed");
+        e = cudaEventCreateWithFlags(&select_done_, cudaEventDisableTiming);
+        if (e != cudaSuccess) {
+            select_done_ = nullptr;
+            throw std::runtime_error("cudaEventCreate Qwen3.8 selection event failed");
+        }
     }
 
     Qwen38Decoder(const Qwen38Decoder &) = delete;
@@ -650,11 +1024,124 @@ public:
         if (has_nonfinite_) cudaFree(has_nonfinite_);
         if (host_next_token_) cudaFreeHost(host_next_token_);
         if (host_has_nonfinite_) cudaFreeHost(host_has_nonfinite_);
+        if (select_done_) cudaEventDestroy(select_done_);
     }
 
     void clear() {
         state_.clear();
         history_.clear();
+    }
+
+    // Task T: WARODECODE_SELECT_POLL=1 makes the expert selection wait for its
+    // own readback instead of for the whole decode stream.
+    //
+    // This is a deliberate, line-by-line mirror of qwen38_select_experts() and
+    // qwen38_moe_select_experts_f32_x() in src/qwen38_moe.cuh: the same router
+    // dispatch (Q8_0 activation -> exact Q8_0 GEMV, F32 weights -> F32 GEMV,
+    // otherwise the widening GEMV), the same top-k kernel, the same two pinned
+    // device->host copies to the same buffers. The only difference is the wait:
+    // the original ends with cudaStreamSynchronize(stream), which parks the
+    // thread in the driver until the whole stream has drained, while this one
+    // records an event right after the copies and polls cudaEventQuery.
+    //
+    // Why it can matter: the cudaStreamSynchronize drain is a blocking driver
+    // wait. If the driver parks the thread (or the thread is descheduled) the
+    // host loses far more time than the readback itself takes, and this happens
+    // once per trunk layer (48 times per token). The kernels, their order and
+    // their arguments are unchanged, so the selected experts are bit-identical.
+    //
+    // Default OFF: the switch is an A/B candidate, not the shipped path.
+    template <typename XT>
+    void select_experts_polled(
+            int layer,
+            const GpuMatrix & router,
+            const XT * x,
+            Qwen38MoeScratch & scratch,
+            float expert_scale,
+            cudaStream_t stream) {
+        constexpr int threads = 256;
+        const int hidden = scratch.hidden();
+        const int blocks = (hidden + threads - 1) / threads;
+        const bool q8_router = q38_moe_router_q8_0_enabled() &&
+            q38_moe_router_q8_0_compatible(router, scratch);
+        if (q8_router) {
+            if constexpr (std::is_same_v<XT, float>) {
+                q38_moe_quantize_activation_q8_0(
+                    x, hidden, scratch.q8_0_values(), scratch.q8_0_scales(), stream);
+            } else {
+                q38_hc_copy_half_to_f32_kernel<<<blocks, threads, 0, stream>>>(
+                    x, scratch.act_f32(), hidden);
+                q38_moe_quantize_activation_q8_0(
+                    scratch.act_f32(), hidden, scratch.q8_0_values(), scratch.q8_0_scales(), stream);
+            }
+            q38_moe_gemv_q8_0_exact(
+                router.low, scratch.q8_0_values(), scratch.q8_0_scales(), scratch.d_logits(), stream);
+        } else if (q38_moe_router_f32_enabled() && matrix_has_f32_weights(router)) {
+            if constexpr (std::is_same_v<XT, float>) {
+                launch_matrix_gemv_f32_weights(router, x, scratch.d_logits(), stream);
+            } else {
+                q38_hc_copy_half_to_f32_kernel<<<blocks, threads, 0, stream>>>(
+                    x, scratch.act_f32(), hidden);
+                launch_matrix_gemv_f32_weights(router, scratch.act_f32(), scratch.d_logits(), stream);
+            }
+        } else {
+            if constexpr (std::is_same_v<XT, float>) {
+                launch_matrix_gemv_f32_input(router, x, scratch.d_logits(), stream);
+            } else {
+                launch_matrix_gemv_float(router, x, scratch.d_logits(), stream);
+            }
+        }
+        profile_.select_piece(0, layer, stream);
+        // Same router -> top-k -> readback chain; the only substitution is the
+        // one-thread exact router kernel for its parallel twin (WARODECODE_ROUTER_PARALLEL).
+        launch_q38_topk_router(
+            scratch.d_logits(), scratch.n_experts(), scratch.k(), expert_scale,
+            scratch.d_ids(), scratch.d_weights(), stream);
+        profile_.select_piece(1, layer, stream);
+        cudaError_t e = cudaMemcpyAsync(
+            scratch.h_ids(), scratch.d_ids(), static_cast<size_t>(scratch.k()) * sizeof(int),
+            cudaMemcpyDeviceToHost, stream);
+        if (e != cudaSuccess) {
+            throw std::runtime_error(std::string("copy expert ids failed: ") + cudaGetErrorString(e));
+        }
+        e = cudaMemcpyAsync(
+            scratch.h_weights(), scratch.d_weights(), static_cast<size_t>(scratch.k()) * sizeof(float),
+            cudaMemcpyDeviceToHost, stream);
+        if (e != cudaSuccess) {
+            throw std::runtime_error(std::string("copy expert weights failed: ") + cudaGetErrorString(e));
+        }
+        profile_.select_piece(2, layer, stream);
+        if (!q38_select_poll_enabled()) {
+            // Reference wait: the same cudaStreamSynchronize the shipped
+            // selection uses, so the probe path can be measured on its own.
+            e = cudaStreamSynchronize(stream);
+            if (e != cudaSuccess) {
+                throw std::runtime_error(std::string("expert selection sync failed: ") + cudaGetErrorString(e));
+            }
+            profile_.select_piece(3, layer, stream);
+            return;
+        }
+        // Wait for the readback only. cudaEventQuery is non-blocking, so the
+        // thread never enters the driver's parked wait; the pause hint keeps the
+        // spin from flooding the store buffers.
+        e = cudaEventRecord(select_done_, stream);
+        if (e != cudaSuccess) {
+            throw std::runtime_error(std::string("record selection event failed: ") + cudaGetErrorString(e));
+        }
+        for (;;) {
+            e = cudaEventQuery(select_done_);
+            if (e == cudaSuccess) break;
+            if (e != cudaErrorNotReady) {
+                (void)cudaGetLastError();
+                throw std::runtime_error(std::string("selection wait failed: ") + cudaGetErrorString(e));
+            }
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            __asm__ __volatile__("yield");
+#endif
+        }
+        profile_.select_piece(3, layer, stream);
     }
 
     // MTP hook (src/qwen38_mtp.cuh): the speculative draft/verify loop drives
@@ -700,6 +1187,7 @@ public:
         // copy and the closing synchronise are measured as kQwen38StageSync.
         const bool profile_on = profile_.enabled();
         const double profile_token_start = profile_on ? Qwen38StageProfiler::host_now() : 0.0;
+        const double profile_token_cpu_start = profile_on ? Qwen38StageProfiler::cpu_now() : 0.0;
         profile_.mark_begin(kQwen38StageToken, stream);
         Qwen38HcF32DebugScratch & hc_f32_scratch = hc_f32_scratch_;
         bool f32_layer0_router_preselected = false;
@@ -2341,7 +2829,9 @@ public:
 
             // Router + expert cache staging + routed GEMV + shared expert. The
             // period covers the wait for a cache miss as well as the compute.
+            Q38MoeKernelProfiler::instance().mark_begin(kQ38MoeSiteStageTotal, stream);
             profile_.mark_begin(kQwen38StageMoe, stream);
+            profile_.moe_region_begin(il);
             bool experts_preselected = f32_layer0_router_preselected && il == 0;
             Qwen38Trace * debug_trace = active_trace_;
             const Qwen38MoeRouteOverride * route_override = nullptr;
@@ -2421,6 +2911,33 @@ public:
             const bool moe_f32_mid = q38_moe_f32_out_opt_in() && moe_f32_in &&
                 st.moe.moe_out_f32() != nullptr;
             float * moe_out_f32 = nullptr;
+            // Task T: run the routed-expert selection from here when asked to,
+            // so the profiler can measure it separately from the routed body.
+            // The kernels are exactly the ones the runner would call (same
+            // dispatch helper, same order); preselected=true only tells the
+            // runner that this already happened.
+            const bool select_poll = q38_select_poll_enabled();
+            const bool router_parallel = q38_router_parallel_enabled();
+            if ((q38_moe_select_split_enabled() || select_poll || router_parallel) && !experts_preselected &&
+                !(rt_.cpu_moe && rt_.cpu_moe->active_for(il))) {
+                if (select_poll || router_parallel || profile_.select_probe_enabled()) {
+                    if (moe_f32_in) {
+                        select_experts_polled<float>(
+                            il, layer.router, hc_f32_scratch.mixed(), st.moe, q.expert_weights_scale, stream);
+                    } else {
+                        select_experts_polled<__half>(
+                            il, layer.router, cur, st.moe, q.expert_weights_scale, stream);
+                    }
+                } else if (moe_f32_in) {
+                    q38_moe_select_experts_input<float>(
+                        layer.router, hc_f32_scratch.mixed(), st.moe, q.expert_weights_scale, stream);
+                } else {
+                    q38_moe_select_experts_input<__half>(
+                        layer.router, cur, st.moe, q.expert_weights_scale, stream);
+                }
+                experts_preselected = true;
+            }
+            profile_.moe_region_cut(0, il, stream);
             if (rt_.cpu_moe && rt_.cpu_moe->active_for(il)) {
                 // Task N: routed experts on the CPU over the GGUF mapping. The
                 // CPU GEMV chain consumes the same Q8_K/Q8_0 activations and
@@ -2507,6 +3024,7 @@ public:
                         q.expert_weights_scale, stream, experts_preselected);
                 }
             }
+            profile_.moe_region_cut(1, il, stream);
             if (trace && trace->state_trace) {
                 trace->add_extended("layer" + std::to_string(il) + ".ffn.selected_expert_outputs",
                     copy_half(stream, selected_output_trace,
@@ -2655,6 +3173,7 @@ public:
                 // Keep the legacy output contract: mirror the routed sum into the
                 // half buffer and add the shared expert there, exactly like the
                 // F16 path does, so the traces and the combine are unchanged.
+                Q38MoeKernelScope mirror_scope(kQ38MoeSiteMirror, stream);
                 q38_float_to_half_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
                     st.moe.d_accum(), st.moe_out, q.hidden);
                 q38_float_to_half_kernel<<<(q.hidden + 255) / 256, 256, 0, stream>>>(
@@ -2731,6 +3250,8 @@ public:
                 trace->add_extended("layer0.final_moe_output", trace->ffn_out);
             }
             profile_.mark_end(kQwen38StageMoe, stream);
+            profile_.moe_region_end(il);
+            Q38MoeKernelProfiler::instance().mark_end(kQ38MoeSiteStageTotal, stream);
 
             profile_.mark_begin(kQwen38StageHcCombineFfn, stream);
             const bool moe_f32_boundary = q38_moe_f32_enabled() &&
@@ -2921,7 +3442,12 @@ public:
         profile_.flush_token();
         Q38HcKernelProfiler::instance().flush_token();
         Q38AttnKernelProfiler::instance().flush_token();
-        if (profile_on) profile_.note_token_host(Qwen38StageProfiler::host_now() - profile_token_start);
+        Q38MoeKernelProfiler::instance().flush_token();
+        if (profile_on) {
+            profile_.note_token_host(
+                Qwen38StageProfiler::host_now() - profile_token_start,
+                Qwen38StageProfiler::cpu_now() - profile_token_cpu_start);
+        }
         if (*host_has_nonfinite_) throw std::runtime_error("Qwen3.8 output logits contain NaN or infinity");
 
         if (trace && trace->state_trace) {
@@ -3233,6 +3759,7 @@ private:
     int * has_nonfinite_ = nullptr;
     int * host_next_token_ = nullptr;
     int * host_has_nonfinite_ = nullptr;
+    cudaEvent_t select_done_ = nullptr;
     std::vector<int> history_;
     std::string trace_context_;
 };

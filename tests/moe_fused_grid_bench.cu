@@ -385,7 +385,8 @@ int main() {
     ck(cudaMemset(scratch.d_accum(), 0, static_cast<size_t>(hidden) * sizeof(float)), "memset");
     q38_moe_upload_expert_ptr_table(table, scratch, stream);
     q38_moe_run_batched_experts<false>(
-        scratch.expert_ptr_table(), GgmlType::IQ2_S, 2 * k, ffn, k, nullptr, scratch, stream);
+        scratch.expert_ptr_table(), GgmlType::IQ2_S, 2 * k, ffn, k, nullptr, scratch, stream,
+        scratch.d_weights());
     ck(cudaStreamSynchronize(stream), "sync");
     const std::vector<uint8_t> accum_batched_e2e =
         read_bytes(scratch.d_accum(), static_cast<size_t>(hidden) * sizeof(float));

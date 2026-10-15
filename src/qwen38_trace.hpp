@@ -167,20 +167,58 @@ inline const char * qwen38_stage_name(int stage) {
 struct Qwen38StageSample {
     double device_ms = 0.0;   // sum of the flushed event intervals
     double host_ms = 0.0;     // sum of the host wall time of the same regions
+    // Task T: CPU time of the same regions, taken from
+    // CLOCK_THREAD_CPUTIME_ID. host_ms - cpu_ms is the time the region's thread
+    // was not running (descheduled, or blocked inside a driver call that does
+    // not burn CPU): it separates "the host is doing work" from "the host is
+    // waiting for something".
+    double cpu_ms = 0.0;
     uint64_t calls = 0;       // flushed event intervals
     uint64_t unmatched = 0;   // recorded starts without a matching stop
     uint64_t overflow = 0;    // intervals dropped because the pool was full
 };
+
+// Task T: the kQwen38StageMoe bracket split into three sub-regions by two cuts
+// recorded inside the region:
+//   [0] "select"  - the router GEMV, the top-k kernel, the device-to-host id and
+//                   weight copies and the cudaStreamSynchronize that waits for
+//                   all of them (one per layer per token).
+//   [1] "routed"  - the routed-expert runner itself (expert cache acquire + the
+//                   expert kernels + the routed weighted sum).
+//   [2] "shared"  - the shared expert plus the remainder of the region (the
+//                   selected-output copies and the F16/F32 mirrors).
+// Each sub-region carries a wall clock, a CPU clock and the device interval
+// between the two cut events, so a 90 ms region can be attributed to one side
+// instead of being one opaque number.
+static constexpr int kQwen38MoeSubCount = 3;
+
+inline const char * qwen38_moe_sub_name(int sub) {
+    switch (sub) {
+        case 0: return "select";
+        case 1: return "routed";
+        case 2: return "shared";
+        default: return "unknown";
+    }
+}
 
 struct Qwen38ProfileTotals {
     uint64_t tokens = 0;
     uint64_t phases = 0;      // tokens tagged as decode (not prefill)
     std::array<Qwen38StageSample, kQwen38StageCount> stage{};
     double token_host_ms = 0.0;   // host wall inside step(), D2H and sync included
+    double token_cpu_ms = 0.0;    // thread CPU time of the same span
     double flush_host_ms = 0.0;   // host cost of reading the events back
     std::vector<double> layer_device_ms;   // indexed by layer, shared by all tokens
     std::vector<double> layer_host_ms;
     uint64_t layer_calls = 0;
+    // Task T: the five device spans inside the [select] sub-region, in order:
+    // router (activation quantisation + router GEMV), top-k, readback copies,
+    // wait, tail. All zero unless WARODECODE_SELECT_PROBE=1.
+    std::array<double, 5> select_piece_dev_ms{};
+    std::array<double, kQwen38MoeSubCount> moe_sub_host_ms{};
+    std::array<double, kQwen38MoeSubCount> moe_sub_cpu_ms{};
+    std::array<double, kQwen38MoeSubCount> moe_sub_device_ms{};
+    std::array<uint64_t, kQwen38MoeSubCount> moe_sub_calls{};
 };
 
 // Serialises the totals as one JSON object of *per-token averages* for the
@@ -221,6 +259,16 @@ inline std::string qwen38_profile_json(const Qwen38ProfileTotals & t) {
         ? t.stage[kQwen38StageToken].device_ms - claimed_ms : 0.0;
     out += ",\"other_ms\":" + per_token(other_ms);
 
+    // Task T: the MoE region, split. All three sub-regions are inside moe_ms, so
+    // they sum to (almost) that value; host_ms minus cpu_ms is the part of the
+    // sub-region its thread spent not running.
+    for (int i = 0; i < kQwen38MoeSubCount; ++i) {
+        const std::string sub = qwen38_moe_sub_name(i);
+        out += ",\"moe_" + sub + "_dev_ms\":" + per_token(t.moe_sub_device_ms[static_cast<size_t>(i)]);
+        out += ",\"moe_" + sub + "_host_ms\":" + per_token(t.moe_sub_host_ms[static_cast<size_t>(i)]);
+        out += ",\"moe_" + sub + "_cpu_ms\":" + per_token(t.moe_sub_cpu_ms[static_cast<size_t>(i)]);
+    }
+
     out += "}";
     return out;
 }
@@ -254,11 +302,44 @@ inline std::string qwen38_profile_detail_json(const Qwen38ProfileTotals & t) {
     out += ",\"host_stage_sum_ms\":" + per_token(host_stage_sum);
     const double host_other = t.token_host_ms - host_stage_sum - t.flush_host_ms;
     out += ",\"host_other_ms\":" + per_token(host_other > 0.0 ? host_other : 0.0);
+    // Task T: wall clock versus thread CPU time of the token. A large
+    // host_total_ms - cpu_total_ms means the decode thread was not running for
+    // that long (descheduled, or parked inside a driver wait), which is a
+    // different problem from "the host is executing too many instructions".
+    double cpu_stage_sum = 0.0;
+    for (int s = 0; s < kQwen38StageCount; ++s) {
+        if (s == kQwen38StageToken) continue;
+        cpu_stage_sum += t.stage[static_cast<size_t>(s)].cpu_ms;
+    }
+    out += ",\"cpu_total_ms\":" + per_token(t.token_cpu_ms);
+    out += ",\"host_cpu_gap_ms\":" + per_token(
+        t.token_host_ms > t.token_cpu_ms ? t.token_host_ms - t.token_cpu_ms : 0.0);
+    out += ",\"cpu_stage_sum_ms\":" + per_token(cpu_stage_sum);
     for (int s = 0; s < kQwen38StageCount; ++s) {
         if (s == kQwen38StageToken) continue;
         out += ",\"host_";
         out += qwen38_stage_name(s);
         out += "_ms\":" + per_token(t.stage[static_cast<size_t>(s)].host_ms);
+    }
+    for (int s = 0; s < kQwen38StageCount; ++s) {
+        if (s == kQwen38StageToken) continue;
+        out += ",\"cpu_";
+        out += qwen38_stage_name(s);
+        out += "_ms\":" + per_token(t.stage[static_cast<size_t>(s)].cpu_ms);
+    }
+    static const char * const kPieceNames[5] = {
+        "router", "topk", "readback", "wait", "tail"};
+    for (int i = 0; i < 5; ++i) {
+        out += ",\"select_piece_";
+        out += kPieceNames[i];
+        out += "_dev_ms\":" + per_token(t.select_piece_dev_ms[static_cast<size_t>(i)]);
+    }
+    for (int i = 0; i < kQwen38MoeSubCount; ++i) {
+        const std::string sub = qwen38_moe_sub_name(i);
+        out += ",\"moe_" + sub + "_device_ms\":" + per_token(t.moe_sub_device_ms[static_cast<size_t>(i)]);
+        out += ",\"moe_" + sub + "_wall_ms\":" + per_token(t.moe_sub_host_ms[static_cast<size_t>(i)]);
+        out += ",\"moe_" + sub + "_thread_cpu_ms\":" + per_token(t.moe_sub_cpu_ms[static_cast<size_t>(i)]);
+        out += ",\"moe_" + sub + "_calls\":" + std::to_string(t.moe_sub_calls[static_cast<size_t>(i)]);
     }
 
     for (int s = 0; s < kQwen38StageCount; ++s) {

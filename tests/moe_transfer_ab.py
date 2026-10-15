@@ -33,6 +33,60 @@ GENERATE = 64
 CTX = 128
 
 
+def cases_q5(cache_mib: int) -> list[dict]:
+    """Task Q confirmation on the final tree: 4 cases only, short window."""
+    base = {"WARODECODE_EXPERT_CACHE_MIB": str(cache_mib)}
+    return [
+        {"name": "plain", "env": dict(base), "note": "baseline"},
+        {"name": "grid", "env": dict(base, WARODECODE_MOE_FUSED_GRID="1"),
+         "note": "expert-batched grid"},
+        {"name": "diag", "env": dict(base, WARODECODE_PROFILE="1",
+                                     WARODECODE_EXPERT_STATS="1",
+                                     WARODECODE_EXPERT_IO_TIMING="1"),
+         "note": "instrumented baseline"},
+        {"name": "diag-st4", "env": dict(base, WARODECODE_PROFILE="1",
+                                         WARODECODE_EXPERT_STATS="1",
+                                         WARODECODE_EXPERT_IO_TIMING="1",
+                                         WARODECODE_EXPERT_IO_STREAMS="4"),
+         "note": "instrumented, 4 copy streams"},
+    ]
+
+
+def cases_q4(cache_mib: int) -> list[dict]:
+    """Task Q final A/B: the multi-copy-stream fix (parity first) and the grid."""
+    base = {"WARODECODE_EXPERT_CACHE_MIB": str(cache_mib)}
+    return [
+        {"name": "plain", "env": dict(base), "note": "baseline"},
+        {"name": "st2", "env": dict(base, WARODECODE_EXPERT_IO_STREAMS="2"),
+         "note": "DMA over 2 copy streams (fixed wait)"},
+        {"name": "st4", "env": dict(base, WARODECODE_EXPERT_IO_STREAMS="4"),
+         "note": "DMA over 4 copy streams (fixed wait)"},
+        {"name": "st8", "env": dict(base, WARODECODE_EXPERT_IO_STREAMS="8"),
+         "note": "DMA over 8 copy streams"},
+        {"name": "grid", "env": dict(base, WARODECODE_MOE_FUSED_GRID="1"),
+         "note": "expert-batched grid (existing switch)"},
+        {"name": "st4grid", "env": dict(base, WARODECODE_MOE_FUSED_GRID="1",
+                                        WARODECODE_EXPERT_IO_STREAMS="4"),
+         "note": "grid + 4 copy streams"},
+        {"name": "diag", "env": dict(base, WARODECODE_PROFILE="1",
+                                     WARODECODE_EXPERT_STATS="1",
+                                     WARODECODE_EXPERT_IO_TIMING="1"),
+         "note": "instrumented baseline"},
+        {"name": "diag-st4", "env": dict(base, WARODECODE_PROFILE="1",
+                                         WARODECODE_EXPERT_STATS="1",
+                                         WARODECODE_EXPERT_IO_TIMING="1",
+                                         WARODECODE_EXPERT_IO_STREAMS="4"),
+         "note": "instrumented, 4 copy streams"},
+        {"name": "diag-c1536", "env": {"WARODECODE_EXPERT_CACHE_MIB": "1536",
+                                       "WARODECODE_PROFILE": "1",
+                                       "WARODECODE_EXPERT_STATS": "1"},
+         "note": "eviction-heavy parity check"},
+        {"name": "st4-c1536", "env": {"WARODECODE_EXPERT_CACHE_MIB": "1536",
+                                      "WARODECODE_EXPERT_IO_STREAMS": "4"},
+         "note": "eviction-heavy parity check with 4 streams"},
+    ]
+
+
 def cases_q3(cache_mib: int) -> list[dict]:
     """Task Q round 3: the clean A/B of the implemented switches.
 
@@ -199,7 +253,7 @@ def main() -> int:
     ap.add_argument("--extra-case-names", default="plain,base",
                     help="which case names to repeat at --extra-cache-mib")
     ap.add_argument("--skip-warm", action="store_true")
-    ap.add_argument("--matrix", default="default", choices=("default", "q3"))
+    ap.add_argument("--matrix", default="default", choices=("default", "q3", "q4", "q5"))
     args = ap.parse_args()
 
     if not args.skip_warm:
@@ -214,7 +268,11 @@ def main() -> int:
 
     ref = json.loads(pathlib.Path(args.ref).read_text())["token_ids"]
     records = []
-    if args.matrix == "q3":
+    if args.matrix == "q5":
+        matrix = cases_q5(args.cache_mib)
+    elif args.matrix == "q4":
+        matrix = cases_q4(args.cache_mib)
+    elif args.matrix == "q3":
         matrix = cases_q3(args.cache_mib)
     else:
         matrix = cases(args.cache_mib)
