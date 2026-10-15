@@ -81,6 +81,10 @@ bash tests/qwen38_hc_legacy_skip_host_check.sh
 # Task G: expert 統合 MoE の加算順序と index 対応が従来と bit 一致することを確認する
 bash tests/moe_fused_grid_host_check.sh
 
+# k-quant (Q2_K/Q3_K/Q4_K/Q5_K) の dequant が正しいインデックス/ビット対応で
+# 動くことを合成ブロックで確認する (dense パスの Q8_0 詰め直しに使う)
+bash tests/qwen38_kquant_host_check.sh
+
 # argmax をマルチブロック + 単調キー化しても、参照スキャンと同じトークン・同じ
 # non-finite 判定になることを確認する
 bash tests/qwen38_argmax_host_check.sh

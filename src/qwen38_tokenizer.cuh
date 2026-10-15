@@ -91,6 +91,12 @@ public:
         return &it->second.strs;
     }
 
+    const std::vector<double> * floats(const std::string & key) const {
+        auto it = values_.find(key);
+        if (it == values_.end() || it->second.kind != Value::Kind::FloatArray) return nullptr;
+        return &it->second.floats;
+    }
+
     const std::vector<int64_t> * ints(const std::string & key) const {
         auto it = values_.find(key);
         if (it == values_.end() || it->second.kind != Value::Kind::IntArray) return nullptr;
@@ -278,7 +284,7 @@ public:
     };
     // Pre types that this port implements; anything else is refused instead of
     // silently falling back to a different split rule.
-    enum class PreType { Qwen2, Qwen35, Gpt2 };
+    enum class PreType { Qwen2, Qwen35, Gpt2, LlamaBpe };
 
     explicit Qwen38Tokenizer(const std::string & gguf_path, bool verbose = false) {
         Qwen38GgufMeta meta(gguf_path);
@@ -286,9 +292,12 @@ public:
         const std::string * model = meta.string("tokenizer.ggml.model");
         if (model == nullptr) throw std::runtime_error("GGUFにtokenizer.ggml.modelがありません: " + gguf_path);
         model_ = *model;
-        if (model_ != "gpt2") {
-            throw std::runtime_error("未対応のトークナイザ種別です (gpt2 BPEのみ対応): " + model_);
+        if (model_ != "gpt2" && model_ != "llama") {
+            throw std::runtime_error(
+                "未対応のトークナイザ種別です: " + model_ +
+                "\n  対応: gpt2 (BPE) / llama (SentencePiece)");
         }
+        spm_ = (model_ == "llama");
         pre_ = meta.string("tokenizer.ggml.pre") ? *meta.string("tokenizer.ggml.pre") : std::string();
         if (pre_.empty() || pre_ == "qwen2" || pre_ == "megrez") {
             pre_type_ = PreType::Qwen2;
@@ -296,6 +305,9 @@ public:
             pre_type_ = PreType::Qwen35;
         } else if (pre_ == "gpt2") {
             pre_type_ = PreType::Gpt2;
+        } else if (pre_ == "llama-bpe") {
+            // Llama-3 系。qwen2 との違いは数字のまとめ方だけ (\p{N}{1,3} vs \p{N})。
+            pre_type_ = PreType::LlamaBpe;
         } else {
             throw std::runtime_error("未対応のtokenizer.ggml.preです: " + pre_);
         }
@@ -334,6 +346,14 @@ public:
         }
         merge_count_ = merges->size();
 
+        if (spm_) {
+            const std::vector<double> * sc = meta.floats("tokenizer.ggml.scores");
+            if (sc == nullptr) {
+                throw std::runtime_error("SentencePiece の tokenizer.ggml.scores がありません: " +
+                                         gguf_path);
+            }
+            scores_ = *sc;
+        }
         bos_id_ = static_cast<int32_t>(meta.integer_or("tokenizer.ggml.bos_token_id", -1));
         eos_id_ = static_cast<int32_t>(meta.integer_or("tokenizer.ggml.eos_token_id", -1));
         unk_id_ = static_cast<int32_t>(meta.integer_or("tokenizer.ggml.unknown_token_id", -1));
@@ -408,6 +428,132 @@ const std::string & architecture() const { return arch_; }
     // add_special  prepends BOS / appends EOS when the GGUF asks for it.
     // parse_special splits control / user-defined / unknown vocab entries out of
     // the raw text before BPE, so "<|im_start|>" becomes a single token.
+    // ---- SentencePiece (tokenizer.ggml.model == "llama") ----
+    //
+    // llama.cpp の llm_tokenizer_spm と同じ手順:
+    //   1. 空白を ▁ (U+2581) に置き換えて UTF-8 コードポイント単位の断片にする
+    //   2. 隣接する 2 断片の連結が語彙にある間、スコア最大の組から順に併合する
+    //   3. 残った断片を語彙で引き、引けなければ 1 バイトずつ <0xXX> に落とす
+    std::vector<int32_t> encode_spm(const std::string & text, bool add_special) const {
+        const std::string marked = spm_mark_spaces(" " + text);
+        std::vector<std::string> frags = spm_split_codepoints(marked);
+
+        std::vector<int> prev(frags.size()), next(frags.size());
+        std::vector<unsigned char> alive(frags.size(), 1);
+        for (size_t i = 0; i < frags.size(); ++i) {
+            prev[i] = static_cast<int>(i) - 1;
+            next[i] = static_cast<int>(i) + 1 < static_cast<int>(frags.size())
+                          ? static_cast<int>(i) + 1 : -1;
+        }
+
+        // スコア付きの最大ヒープ (連結した断片が語彙にあるものだけ積む)
+        struct Item { double score; int left; int right; };
+        struct Cmp { bool operator()(const Item & a, const Item & b) const { return a.score < b.score; } };
+        std::priority_queue<Item, std::vector<Item>, Cmp> queue;
+        auto try_push = [&](int left, int right) {
+            if (left < 0 || right < 0) return;
+            const std::string joined = frags[left] + frags[right];
+            auto it = token_to_id_.find(joined);
+            if (it == token_to_id_.end()) return;
+            const double score = it->second < static_cast<int>(scores_.size())
+                                     ? scores_[it->second] : 0.0;
+            queue.push({score, left, right});
+        };
+        for (size_t i = 0; i + 1 < frags.size(); ++i) try_push(static_cast<int>(i), static_cast<int>(i) + 1);
+        while (!queue.empty()) {
+            const Item item = queue.top();
+            queue.pop();
+            if (!alive[item.left] || !alive[item.right]) continue;
+            if (next[item.left] != item.right) continue;
+            frags[item.left] += frags[item.right];
+            alive[item.right] = 0;
+            next[item.left] = next[item.right];
+            if (next[item.left] >= 0) prev[next[item.left]] = item.left;
+            try_push(prev[item.left], item.left);
+            try_push(item.left, next[item.left]);
+        }
+
+        std::vector<int32_t> out;
+        if (add_special && bos_id_ >= 0 && add_bos_) out.push_back(bos_id_);
+        for (size_t i = 0; i < frags.size(); ++i) {
+            if (!alive[i]) continue;
+            auto it = token_to_id_.find(frags[i]);
+            if (it != token_to_id_.end()) {
+                out.push_back(it->second);
+                continue;
+            }
+            for (unsigned char byte : frags[i]) {
+                char name[8];
+                std::snprintf(name, sizeof(name), "<0x%02X>", byte);
+                auto bit = token_to_id_.find(name);
+                if (bit != token_to_id_.end()) {
+                    out.push_back(bit->second);
+                } else if (unk_id_ >= 0) {
+                    out.push_back(unk_id_);
+                }
+            }
+        }
+        return out;
+    }
+
+    static std::string spm_mark_spaces(const std::string & text) {
+        std::string out;
+        out.reserve(text.size() + 4);
+        for (size_t i = 0; i < text.size();) {
+            const unsigned char c = static_cast<unsigned char>(text[i]);
+            if (c == ' ') {
+                out += "\xe2\x96\x81";   // U+2581 LOWER ONE EIGHTH BLOCK
+                ++i;
+                continue;
+            }
+            size_t len = 1;
+            if (c >= 0xF0) len = 4; else if (c >= 0xE0) len = 3; else if (c >= 0xC0) len = 2;
+            out.append(text, i, len);
+            i += len;
+        }
+        return out;
+    }
+
+    static std::vector<std::string> spm_split_codepoints(const std::string & text) {
+        std::vector<std::string> out;
+        for (size_t i = 0; i < text.size();) {
+            const unsigned char c = static_cast<unsigned char>(text[i]);
+            size_t len = 1;
+            if (c >= 0xF0) len = 4; else if (c >= 0xE0) len = 3; else if (c >= 0xC0) len = 2;
+            out.push_back(text.substr(i, len));
+            i += len;
+        }
+        return out;
+    }
+
+    // SPM のデコード: ▁ を空白に戻し、<0xXX> はバイトとして復元する。
+    std::string decode_spm(const std::vector<int32_t> & tokens, bool skip_special) const {
+        std::string out;
+        for (int32_t id : tokens) {
+            if (id < 0 || id >= static_cast<int>(tokens_.size())) continue;
+            if (skip_special && is_special(id)) continue;
+            const std::string & piece = tokens_[id];
+            if (piece.size() == 6 && piece.compare(0, 3, "<0x") == 0 && piece[5] == '>') {
+                const int byte = std::strtol(piece.substr(3, 2).c_str(), nullptr, 16);
+                out.push_back(static_cast<char>(byte));
+                continue;
+            }
+            for (size_t i = 0; i < piece.size();) {
+                if (i + 2 < piece.size() &&
+                    static_cast<unsigned char>(piece[i]) == 0xE2 &&
+                    static_cast<unsigned char>(piece[i + 1]) == 0x96 &&
+                    static_cast<unsigned char>(piece[i + 2]) == 0x81) {
+                    out.push_back(' ');
+                    i += 3;
+                    continue;
+                }
+                out.push_back(piece[i]);
+                ++i;
+            }
+        }
+        return out;
+    }
+
     std::vector<int32_t> encode(const std::string & text, bool add_special, bool parse_special) const {
         std::vector<int32_t> output;
         std::vector<Fragment> fragments;
@@ -421,7 +567,13 @@ const std::string & architecture() const { return arch_; }
                 output.push_back(fragment.token);
                 continue;
             }
-            encode_text(text.substr(fragment.offset, fragment.length), output);
+            const std::string piece = text.substr(fragment.offset, fragment.length);
+            if (spm_) {
+                const std::vector<int32_t> ids = encode_spm(piece, /*add_special=*/false);
+                output.insert(output.end(), ids.begin(), ids.end());
+            } else {
+                encode_text(piece, output);
+            }
         }
         if (add_special && add_eos_ && eos_id_ >= 0) output.push_back(eos_id_);
         return output;
@@ -451,6 +603,7 @@ const std::string & architecture() const { return arch_; }
 
     // llama_detokenize(tokens, remove_special, special).
     std::string decode(const std::vector<int32_t> & tokens, bool skip_special) const {
+        if (spm_) return decode_spm(tokens, skip_special);
         std::string out;
         for (int32_t token : tokens) {
             if (skip_special && is_special(token)) continue;
@@ -688,6 +841,7 @@ static size_t utf8_len(char lead) {
             return;
         }
         const bool extended = pre_type_ == PreType::Qwen35;
+        const int digits_max = (pre_type_ == PreType::LlamaBpe) ? 3 : 1;
         const size_t offset_end = cpts.size();
         constexpr uint32_t kOutOfRange = 0xFFFFFFFFu;
 
@@ -748,9 +902,13 @@ static size_t utf8_len(char lead) {
                 }
             }
 
-            // \p{N}
+            // \p{N} (llama-bpe は \p{N}{1,3})
             if (is_number(flags)) {
-                ++pos;
+                int taken = 0;
+                while (taken < digits_max && is_number(get_flags(pos))) {
+                    ++pos;
+                    ++taken;
+                }
                 add_token(pos);
                 continue;
             }
@@ -1023,6 +1181,8 @@ static size_t utf8_len(char lead) {
     std::vector<std::string> tokens_;
     std::vector<int> token_types_;
     std::unordered_map<std::string, int32_t> token_to_id_;
+    bool spm_ = false;                     // tokenizer.ggml.model == "llama"
+    std::vector<double> scores_;           // tokenizer.ggml.scores (SPM only)
     std::unordered_map<std::string, int32_t> bpe_ranks_;
     size_t merge_count_ = 0;
     std::vector<int32_t> special_ids_;

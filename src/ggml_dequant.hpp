@@ -8,7 +8,11 @@
 // 量子化のままより重い (Q6_K の 2.4 倍) が、再量子化せず値も変えない。
 #include "gguf.hpp"
 
+// ホスト側の検査では CUDA が無いので、__half / __float2half は呼び出し側が用意する
+// (tests/gemv_kquant_dequant_host_test.cpp が最小の shim を置く)。
+#if defined(__CUDACC__)
 #include <cuda_fp16.h>
+#endif
 
 #include <cmath>
 #include <cstdint>
@@ -48,6 +52,12 @@ inline bool ggml_type_requantizable(GgmlType type) {
         case GgmlType::Q8_0:
         case GgmlType::Q6_K:
         case GgmlType::Q4_1:
+        case GgmlType::Q5_0:
+        case GgmlType::Q5_1:
+        case GgmlType::Q2_K:
+        case GgmlType::Q3_K:
+        case GgmlType::Q4_K:
+        case GgmlType::Q5_K:
             return true;
         default:
             return false;
@@ -61,6 +71,12 @@ inline int ggml_type_block_size(GgmlType type) {
         case GgmlType::Q8_0: return 32;
         case GgmlType::Q6_K: return 256;
         case GgmlType::Q4_1: return 32;
+        case GgmlType::Q5_0: return 32;
+        case GgmlType::Q5_1: return 32;
+        case GgmlType::Q2_K: return 256;
+        case GgmlType::Q3_K: return 256;
+        case GgmlType::Q4_K: return 256;
+        case GgmlType::Q5_K: return 256;
         default: return 0;
     }
 }
@@ -72,6 +88,12 @@ inline int ggml_type_block_bytes(GgmlType type) {
         case GgmlType::Q8_0: return 34;
         case GgmlType::Q6_K: return 210;
         case GgmlType::Q4_1: return 20;
+        case GgmlType::Q5_0: return 22;
+        case GgmlType::Q5_1: return 24;
+        case GgmlType::Q2_K: return 84;
+        case GgmlType::Q3_K: return 110;
+        case GgmlType::Q4_K: return 144;
+        case GgmlType::Q5_K: return 176;
         default: return 0;
     }
 }
@@ -179,6 +201,143 @@ inline float ggml_q4_1_value(const uint8_t * blk, int i) {
     return d * static_cast<float>(q) + m;
 }
 
+// block_q5_0: d + qh[4] + qs[16] (22 バイト)。5bit 目は qh のビット。
+inline float ggml_q5_0_value(const uint8_t * blk, int i) {
+    const float d = ggml_half_to_float(ggml_load_u16(blk));
+    uint32_t qh = 0;
+    std::memcpy(&qh, blk + 2, 4);
+    const uint8_t * qs = blk + 6;
+    const int j = i & 15;
+    const bool high = ((i >> 4) & 1) != 0;
+    const uint8_t xh = high
+        ? static_cast<uint8_t>((qh >> (j + 12)) & 0x10u)
+        : static_cast<uint8_t>(((qh >> j) << 4) & 0x10u);
+    const int x = ((high ? (qs[j] >> 4) : (qs[j] & 0x0F)) | xh) - 16;
+    return static_cast<float>(x) * d;
+}
+
+// block_q5_1: d + m + qh[4] + qs[16] (24 バイト)。
+inline float ggml_q5_1_value(const uint8_t * blk, int i) {
+    const float d = ggml_half_to_float(ggml_load_u16(blk));
+    const float m = ggml_half_to_float(ggml_load_u16(blk + 2));
+    uint32_t qh = 0;
+    std::memcpy(&qh, blk + 4, 4);
+    const uint8_t * qs = blk + 8;
+    const int j = i & 15;
+    const bool high = ((i >> 4) & 1) != 0;
+    const uint8_t xh = high
+        ? static_cast<uint8_t>((qh >> (j + 12)) & 0x10u)
+        : static_cast<uint8_t>(((qh >> j) << 4) & 0x10u);
+    const int x = (high ? (qs[j] >> 4) : (qs[j] & 0x0F)) | xh;
+    return static_cast<float>(x) * d + m;
+}
+
+// ---- k-quant (llama.cpp の ggml-quants.c の dequantize_row_* をホストへ写した) ----
+// すべて 256 値スーパーブロック。1 値を得るため、ブロック内位置から必要な
+// スケール/最小値/ビットを取り出す。
+
+// Q4_K/Q5_K 共通の 6bit スケール・最小値の展開 (get_scale_min_k4)。
+inline void ggml_get_scale_min_k4(int j, const uint8_t * q, uint8_t * d, uint8_t * m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = static_cast<uint8_t>((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+        *m = static_cast<uint8_t>((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    }
+}
+
+// block_q2_K: scales[16] + qs[64] + d + dmin (84 バイト)。
+inline float ggml_q2_k_value(const uint8_t * blk, int i) {
+    const uint8_t * scales = blk;
+    const uint8_t * qs = blk + 16;
+    const float d = ggml_half_to_float(ggml_load_u16(blk + 80));
+    const float dmin = ggml_half_to_float(ggml_load_u16(blk + 82));
+    const int n = i >> 7;              // 0 or 1 (128 値ずつ)
+    const int r = i & 127;
+    const int j = r >> 5;              // 0..3
+    const int half = (r >> 4) & 1;
+    const int l = r & 15;
+    const int is = n * 8 + j * 2 + half;
+    const int shift = j * 2;
+    const uint8_t sc = scales[is];
+    const uint8_t q = qs[n * 32 + l + (half ? 16 : 0)];
+    const int v = (q >> shift) & 3;
+    return d * static_cast<float>(sc & 0x0F) * static_cast<float>(v) -
+           dmin * static_cast<float>(sc >> 4);
+}
+
+// block_q3_K: hmask[32] + qs[64] + scales[12] + d (110 バイト)。
+inline float ggml_q3_k_value(const uint8_t * blk, int i) {
+    const uint8_t * hm = blk;
+    const uint8_t * qs = blk + 32;
+    const uint8_t * raw = blk + 96;
+    const float d_all = ggml_half_to_float(ggml_load_u16(blk + 108));
+
+    // 12 バイト → 16 個の int8 スケール (dequantize_row_q3_K の aux 展開)。
+    uint32_t aux[4] = {0, 0, 0, 0};
+    std::memcpy(aux, raw, 12);
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const int8_t * scales = reinterpret_cast<const int8_t *>(aux);
+
+    const int n = i >> 7;
+    const int r = i & 127;
+    const int j = r >> 5;
+    const int half = (r >> 4) & 1;
+    const int l = r & 15;
+    const int is = n * 8 + j * 2 + half;
+    const int shift = j * 2;
+    const uint8_t m = static_cast<uint8_t>(1u << (n * 4 + j));
+    // qs は n ごとに 32 バイト進むが、hmask は 32 バイト固定で n に依存しない
+    // (dequantize_row_q3_K も q だけを進めている)。
+    const int hidx = l + (half ? 16 : 0);
+    const uint8_t q = qs[n * 32 + hidx];
+    const int v = static_cast<int>((q >> shift) & 3) - ((hm[hidx] & m) ? 0 : 4);
+    return d_all * static_cast<float>(scales[is] - 32) * static_cast<float>(v);
+}
+
+// block_q4_K: d + dmin + scales[12] + qs[128] (144 バイト)。
+inline float ggml_q4_k_value(const uint8_t * blk, int i) {
+    const uint8_t * scales = blk + 4;
+    const uint8_t * qs = blk + 16;
+    const float d = ggml_half_to_float(ggml_load_u16(blk));
+    const float dmin = ggml_half_to_float(ggml_load_u16(blk + 2));
+    const int j = i >> 6;              // 0..3 (64 値ずつ)
+    const int r = i & 63;
+    const int half = r >> 5;           // 下ニブル / 上ニブル
+    const int l = r & 31;
+    uint8_t sc = 0, m = 0;
+    ggml_get_scale_min_k4(j * 2 + half, scales, &sc, &m);
+    const uint8_t q = qs[j * 32 + l];
+    const int v = half ? (q >> 4) : (q & 0x0F);
+    return d * static_cast<float>(sc) * static_cast<float>(v) - dmin * static_cast<float>(m);
+}
+
+// block_q5_K: d + dmin + scales[12] + qh[32] + qs[128] (176 バイト)。
+inline float ggml_q5_k_value(const uint8_t * blk, int i) {
+    const uint8_t * scales = blk + 4;
+    const uint8_t * qh = blk + 16;
+    const uint8_t * ql = blk + 48;
+    const float d = ggml_half_to_float(ggml_load_u16(blk));
+    const float dmin = ggml_half_to_float(ggml_load_u16(blk + 2));
+    const int j = i >> 6;
+    const int r = i & 63;
+    const int half = r >> 5;
+    const int l = r & 31;
+    uint8_t sc = 0, m = 0;
+    ggml_get_scale_min_k4(j * 2 + half, scales, &sc, &m);
+    const uint8_t q = ql[j * 32 + l];
+    const uint8_t bit = static_cast<uint8_t>(1u << (j * 2 + half));
+    const int v = (half ? (q >> 4) : (q & 0x0F)) + ((qh[l] & bit) ? 16 : 0);
+    return d * static_cast<float>(sc) * static_cast<float>(v) - dmin * static_cast<float>(m);
+}
+
 // ブロック先頭ポインタとブロック内位置から 1 値を返す。
 inline float ggml_dequant_value_f32(GgmlType type, const uint8_t * block, int index_in_block) {
     switch (type) {
@@ -187,9 +346,15 @@ inline float ggml_dequant_value_f32(GgmlType type, const uint8_t * block, int in
         case GgmlType::F16:
             return ggml_half_to_float(reinterpret_cast<const uint16_t *>(block)[index_in_block]);
         case GgmlType::Q4_0: return ggml_q4_0_value(block, index_in_block);
+        case GgmlType::Q5_0: return ggml_q5_0_value(block, index_in_block);
+        case GgmlType::Q5_1: return ggml_q5_1_value(block, index_in_block);
         case GgmlType::Q4_1: return ggml_q4_1_value(block, index_in_block);
         case GgmlType::Q8_0: return ggml_q8_0_value(block, index_in_block);
         case GgmlType::Q6_K: return ggml_q6_k_value(block, index_in_block);
+        case GgmlType::Q2_K: return ggml_q2_k_value(block, index_in_block);
+        case GgmlType::Q3_K: return ggml_q3_k_value(block, index_in_block);
+        case GgmlType::Q4_K: return ggml_q4_k_value(block, index_in_block);
+        case GgmlType::Q5_K: return ggml_q5_k_value(block, index_in_block);
         default:
             throw std::runtime_error(std::string("再量子化できない型です: ") + ggml_type_name(type));
     }

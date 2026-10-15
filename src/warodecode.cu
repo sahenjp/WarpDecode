@@ -1435,10 +1435,23 @@ __global__ void embedding_q8_0_kernel(const uint8_t* __restrict__ w, int hidden,
     out[i] = __float2half(d * static_cast<float>(q));
 }
 
-static inline void launch_q8_half(const Q4Matrix& w, const __half* x, __half* y, cudaStream_t s) {
+// Qwen2 系は attn_q/k/v に bias を持つ。Q4_0 の 2 行カーネルは bias を内蔵して
+// いるが、Q8_0 経路は無いので後段で足す。
+__global__ void add_bias_half_kernel(__half* __restrict__ y, const __half* __restrict__ bias,
+                                     int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = __float2half(__half2float(y[i]) + __half2float(bias[i]));
+}
+
+static inline void launch_q8_half(const Q4Matrix& w, const __half* x, __half* y,
+                                   const __half* bias, cudaStream_t s) {
     const int threads = 256;
     const int blocks = (w.rows + (threads / 32) - 1) / (threads / 32);
     q8_0_gemv_kernel<false><<<blocks, threads, 0, s>>>(w.q8, x, y, w.rows, w.cols);
+    if (bias != nullptr) {
+        add_bias_half_kernel<<<(w.rows + 255) / 256, 256, 0, s>>>(y, bias, w.rows);
+    }
 }
 
 static inline void launch_q8_float(const Q4Matrix& w, const __half* x, float* y, cudaStream_t s) {
@@ -1449,8 +1462,7 @@ static inline void launch_q8_float(const Q4Matrix& w, const __half* x, float* y,
 
 static inline void launch_q4_half(const Q4Matrix& w, const __half* x, __half* y, const __half* bias, cudaStream_t s) {
     if (!w.planar_q4) {
-        if (bias != nullptr) throw std::runtime_error("Q8_0 経路は bias 未対応");
-        launch_q8_half(w, x, y, s);
+        launch_q8_half(w, x, y, bias, s);
         return;
     }
     const int threads = g_q4_threads_half;
@@ -1472,7 +1484,7 @@ static inline void launch_q4_float(const Q4Matrix& w, const __half* x, float* y,
 
 static float time_q4_half(const Q4Matrix& w, const __half* x, __half* y, int threads, cudaStream_t s) {
     if (!w.planar_q4) {
-        launch_q8_half(w, x, y, s);
+        launch_q8_half(w, x, y, nullptr, s);
         WD_CUDA(cudaStreamSynchronize(s));
         return 1.0f;   // autotune の候補から外れないよう固定値
     }
@@ -1687,6 +1699,7 @@ __global__ void argmax_kernel(const float* logits, int n, int* token, int* out_t
 }
 
 __global__ void increment_pos_kernel(int* pos) { if (threadIdx.x == 0) ++(*pos); }
+
 
 struct Runtime {
     Model& m;
@@ -2060,6 +2073,31 @@ static int qwen38_run_stream_mode(
 }
 
 } // namespace wd
+
+// Chat template のごく一般的な 2 形式だけを扱う。GGUF の
+// tokenizer.chat_template を見て判別し、当てはまらなければ素のプロンプトを返す
+// (dense モデル向けの最小実装。Jinja は解釈しない)。
+static std::string dense_chat_prompt(const std::string & tmpl,
+                                     const std::string & system,
+                                     const std::string & user) {
+    if (tmpl.find("<|im_start|>") != std::string::npos) {          // Qwen2/2.5/3 (ChatML)
+        std::string out;
+        if (!system.empty()) out += "<|im_start|>system\n" + system + "<|im_end|>\n";
+        out += "<|im_start|>user\n" + user + "<|im_end|>\n";
+        out += "<|im_start|>assistant\n";
+        return out;
+    }
+    if (tmpl.find("<|start_header_id|>") != std::string::npos) {   // Llama-3
+        std::string out;
+        if (!system.empty()) {
+            out += "<|start_header_id|>system<|end_header_id|>\n\n" + system + "<|eot_id|>";
+        }
+        out += "<|start_header_id|>user<|end_header_id|>\n\n" + user + "<|eot_id|>";
+        out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        return out;
+    }
+    return user;
+}
 
 int main(int argc, char** argv) {
     try {
@@ -2611,10 +2649,7 @@ int main(int argc, char** argv) {
         if (!args.prefill_tokens.empty()) {
             throw std::runtime_error("--prefill-tokens は qwen4exp (Qwen3.8-Flash-Next) 専用です");
         }
-        if (args.prompt_given || args.interactive) {
-            throw std::runtime_error("--prompt/--interactive は qwen4exp (Qwen3.8-Flash-Next) 専用です "
-                                     "(このモデルのarch: " + arch + ")");
-        }
+        // dense モデルでも --prompt / --interactive を使える (下の text mode)。
         wd::Model model = wd::load_model(gguf);
         if (args.autotune) wd::autotune_q4(model);
         std::cerr << "arch=" << model.arch << " layers=" << model.layers << " hidden=" << model.hidden
@@ -2630,6 +2665,87 @@ int main(int argc, char** argv) {
 
         if (args.start_token >= model.vocab) throw std::runtime_error("--start-token が語彙数以上です");
         wd::Runtime rt(model, args.ctx);
+
+        if (args.prompt_given || args.interactive) {
+            wd::Qwen38Tokenizer tokenizer(args.model, /*verbose=*/false);
+            wd::Qwen38GgufMeta meta(args.model);
+            const std::string * tmpl_ptr = meta.string("tokenizer.chat_template");
+            const std::string tmpl = tmpl_ptr ? *tmpl_ptr : std::string();
+            const bool use_chat = args.chat_template == 1 ||
+                                  (args.chat_template < 0 && args.interactive);
+
+            if (args.temp_set && args.temp > 0.0) {
+                std::cerr << "注意: dense パスは greedy (argmax) のみです。--temp は無視します。\n";
+            }
+            auto run_prompt = [&](const std::string & user_text) {
+                const std::string text = use_chat
+                    ? dense_chat_prompt(tmpl, std::string(), user_text)
+                    : user_text;
+                const std::vector<int32_t> ids = tokenizer.encode(text, true, true);
+                if (args.tokenize_only) {
+                    std::cout << "{\"tokens\":[";
+                    for (size_t i = 0; i < ids.size(); ++i) {
+                        if (i != 0) std::cout << ',';
+                        std::cout << ids[i];
+                    }
+                    std::cout << "]}\n";
+                    return;
+                }
+                if (static_cast<int>(ids.size()) >= args.ctx) {
+                    throw std::runtime_error("プロンプトが context 長を超えています (" +
+                                             std::to_string(ids.size()) + " >= " +
+                                             std::to_string(args.ctx) + ")");
+                }
+                int pos = 0;
+                for (int32_t id : ids) {
+                    rt.set_state(id, pos);
+                    rt.emit_step();
+                    ++pos;
+                }
+                std::vector<int32_t> produced;
+                for (int n = 0; n < args.generate; ++n) {
+                    // rt.stream は cudaStreamNonBlocking なので、同期コピーでは
+                    // 直前のカーネルを待たない。ストリームに載せて明示的に待つ。
+                    int token = -1;
+                    WD_CUDA(cudaMemcpyAsync(&token, rt.d_token, sizeof(int),
+                                            cudaMemcpyDeviceToHost, rt.stream));
+                    WD_CUDA(cudaStreamSynchronize(rt.stream));
+                    if (token == tokenizer.eos_id()) break;
+                    produced.push_back(token);
+                    const std::string piece = tokenizer.decode({token}, /*skip_special=*/true);
+                    std::cout << piece << std::flush;
+                    if (pos + 1 >= args.ctx) break;
+                    rt.emit_step();
+                    ++pos;
+                }
+                std::cout << "\n";
+                std::cout << "{\"engine\":\"warodecode-v2\",\"arch\":\"" << model.arch
+                          << "\",\"prompt_tokens\":" << ids.size()
+                          << ",\"generated\":" << produced.size()
+                          << ",\"chat_template\":" << (use_chat && !text.empty() ? "true" : "false")
+                          << ",\"token_ids\":[";
+                for (size_t i = 0; i < produced.size(); ++i) {
+                    if (i != 0) std::cout << ',';
+                    std::cout << produced[i];
+                }
+                std::cout << "]}\n";
+            };
+
+            if (args.prompt_given) {
+                run_prompt(args.prompt);
+            } else {
+                std::string line;
+                for (;;) {
+                    std::cerr << "> " << std::flush;
+                    if (!std::getline(std::cin, line)) break;
+                    if (line == "/exit" || line == "/quit") break;
+                    if (line.empty()) continue;
+                    run_prompt(line);
+                }
+            }
+            return 0;
+        }
+
         const double sec = rt.run(args.generate, args.graph, args.start_token);
         const double tps = args.generate / sec;
         const uint64_t token_hash = rt.output_hash(args.generate);

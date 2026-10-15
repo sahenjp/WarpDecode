@@ -25,10 +25,11 @@ cmake --build build -j8 --target warodecode
 
 | モデル | 対応 |
 |---|---|
-| Qwen3.8-Flash-Next (qwen4exp) | **完全対応**（CPU オラクルと 64/64 一致、プロンプト・対話も可） |
-| llama / qwen2 / qwen3 の dense | **動作**（Q4_0 はそのまま、Q6_K / Q8_0 / Q4_1 / F16 / F32 は読み込み時に **Q8_0 へ詰め直して**実行） |
-| Q4_K_M / Q5_K_M など k-quant | 未対応 |
-| dense モデルでの `--prompt` / `-i` | 未対応（`--start-token` からの生成とベンチのみ） |
+| Qwen3.8-Flash-Next (qwen4exp) | **完全対応**（CPU オラクルと 64/64 一致） |
+| llama / qwen2 / qwen3 の dense | **動作**。Q4_0 はそのまま、それ以外の 2D テンソル（Q6_K / Q8_0 / Q5_0 / Q5_1 / Q4_1 / Q2_K / Q3_K / Q4_K / Q5_K / F16 / F32）は読み込み時に **Q8_0 へ詰め直して**実行 |
+| トークナイザ | gpt2 BPE / llama-bpe (Llama-3) / SentencePiece (model=llama) に対応。`--prompt` と `-i` は dense モデルでも使えます |
+| chat template | ChatML (Qwen2/2.5/3) と Llama-3 形式を自動判別（それ以外は素のプロンプト） |
+| サンプリング | dense は greedy のみ（`--temp` は無視、警告を出します） |
 
 dense モデルの実測（A100 80GB・64 トークン・llama.cpp mainline `-ngl 99` と同時計測）:
 

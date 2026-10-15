@@ -28,7 +28,13 @@ enum class GgmlType : uint32_t {
     F16 = 1,
     Q4_0 = 2,
     Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
     Q8_0 = 8,
+    Q2_K = 10,
+    Q3_K = 11,
+    Q4_K = 12,
+    Q5_K = 13,
     Q6_K = 14,
     IQ3_XXS = 18,
     IQ4_NL = 20,
@@ -45,8 +51,14 @@ inline const char * ggml_type_name(GgmlType type) {
         case GgmlType::F16: return "F16";
         case GgmlType::Q4_0: return "Q4_0";
         case GgmlType::Q4_1: return "Q4_1";
+        case GgmlType::Q5_0: return "Q5_0";
+        case GgmlType::Q5_1: return "Q5_1";
         case GgmlType::Q8_0: return "Q8_0";
         case GgmlType::Q6_K: return "Q6_K";
+        case GgmlType::Q2_K: return "Q2_K";
+        case GgmlType::Q3_K: return "Q3_K";
+        case GgmlType::Q4_K: return "Q4_K";
+        case GgmlType::Q5_K: return "Q5_K";
         case GgmlType::IQ3_XXS: return "IQ3_XXS";
         case GgmlType::IQ4_NL: return "IQ4_NL";
         case GgmlType::IQ3_S: return "IQ3_S";
@@ -280,7 +292,13 @@ struct TensorInfo {
             case GgmlType::BF16:   return static_cast<size_t>(n * 2);
             case GgmlType::Q4_0:   return blocked(32, 18, "Q4_0");
             case GgmlType::Q4_1:   return blocked(32, 20, "Q4_1");
+            case GgmlType::Q5_0:   return blocked(32, 22, "Q5_0");
+            case GgmlType::Q5_1:   return blocked(32, 24, "Q5_1");
             case GgmlType::Q8_0:   return blocked(32, 34, "Q8_0");
+            case GgmlType::Q2_K:   return blocked(256, 84, "Q2_K");
+            case GgmlType::Q3_K:   return blocked(256, 110, "Q3_K");
+            case GgmlType::Q4_K:   return blocked(256, 144, "Q4_K");
+            case GgmlType::Q5_K:   return blocked(256, 176, "Q5_K");
             case GgmlType::Q6_K:   return blocked(256, 210, "Q6_K");
             case GgmlType::IQ3_XXS:return blocked(256, 98, "IQ3_XXS");
             case GgmlType::IQ4_NL: return blocked(32, 18, "IQ4_NL");
