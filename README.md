@@ -91,8 +91,32 @@ total が 30% 動くため、**同じラウンドの中の比だけ**を根拠�
 初めて触る 7,448 回＝compulsory だけ」という状態に届きません。18.31 対 18.00 の
 僅差はこのためで、VRAM を使い切れる 28 GiB 側では +12.5% まで開きます。
 
-ここまでの伸び（6.16 → 24.82 tok/s）は、HC mix の exact GEMV パイプライン化、
-expert I/O のプール化、router の warp 並列化、Q8_0 exact GEMV の ILP 化によるものです。
+### A100 80GB（VRAM をほぼ使い切る条件）
+
+同じ A/B を A100-SXM4-**80GB**（81,920 MiB）でも回しました。同一ジョブ内・交互実行・3 ラウンドです。
+
+| 構成 | VRAM 実測 | decode 中央値 | 出力一致 |
+|---|---|---|---|
+| 本エンジン expert cache 20,000 MiB | 26,256 MiB | **26.82 tok/s** | **64/64** |
+| 本エンジン expert cache 50,000 MiB | 56,256 MiB | 26.80 tok/s | **64/64** |
+| 本エンジン expert cache 70,000 MiB（VRAM 76 GB） | 76,256 MiB | 26.80 tok/s | **64/64** |
+| llama.cpp `--keep-moe-gpu-last 24`（有効な最速構成） | 28,196 MiB | 23.18 tok/s | 40/64 |
+| llama.cpp `--keep-moe-gpu-last 48`（全 expert を GPU） | 51,470 MiB | 561〜586 tok/s | **6/64（不正解）** |
+
+- 80GB でも **26.82 対 23.18 = +15.7%**。VRAM は本エンジンのほうが 2 GiB 少ない条件です。
+- llama.cpp は **K≥32 で出力が壊れます**（K=32:10/64、K=40:22/64、K=44:6/64）。
+  K=48 の 561〜586 tok/s は 1.72 ms/token で、このモデルの 1 トークンあたり約 4.7 GB を
+  運ぶには 2.7 TB/s 必要（A100-80GB の HBM ピークは 2.04 TB/s）なので、計算が飛んでいます。
+- 本家 mainline llama.cpp（`c0cb53ac`）はこのモデルを**ロードできません**
+  （tensor 数 1257 期待に対し 1256）。qwen4exp 対応は pinned PR 側にしかないため、
+  上記 PR ビルドが唯一の比較相手です。
+- 本エンジンが 40GB 機（26.58）と 80GB 機（26.82）でほぼ同じなのは、64 トークンの
+  working set（7,448 expert = 14.7 GB）が cache 20,000 MiB に収まっているためです。
+  より長い生成では 80GB 側が有利になります。詳細: `docs/LLAMACPP_AB_80GB.md`
+
+ここまでの伸び（6.16 → 26.58 tok/s）は、HC mix の exact GEMV パイプライン化、
+expert I/O のプール化、router の warp 並列化、Q8_0 exact GEMV の ILP 化、
+そして routed expert の IQ4_NL down を shared 符号帳にしたことによるものです。
 
 
 再現:
