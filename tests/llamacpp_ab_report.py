@@ -2,10 +2,16 @@
 """Turn the interleaved A/B jsonl into the win/lose table used by docs/LLAMACPP_AB.md.
 
 Only same-round pairs are compared: the two runtimes are measured alternately
-inside one job, so the round is the only unit whose ratio is meaningful (the VM
+inside one job, so the round is the only unit whose ratio is meaningful (this VM
 drifts by 30 % between time slots).
 
-  python3 tests/llamacpp_ab_report.py issue1_artifacts/taskl_ab3_results.jsonl \
+Both sides report their FASTEST in-process repetition (the engine's
+--bench-repeat N keeps the fastest of N, and llama.cpp's --reps N gives one
+line per repetition, so max(reps_tok_s) is taken here). The first repetition is
+consistently slower because it faults in pages / loads CUDA modules, and the
+engine never reports that one, so using it for llama.cpp would be unfair.
+
+  python3 tests/llamacpp_ab_report.py issue1_artifacts/taskl_ab3_results.jsonl \\
       --pairs engine_8000=llama_k0,engine_20000=llama_k16,engine_30000=llama_k24
 """
 from __future__ import annotations
@@ -21,12 +27,27 @@ def median(values):
     return statistics.median(values) if values else float("nan")
 
 
+def run_value(row, metric):
+    """Engine: single best-of-N value. llama.cpp: one value per repetition."""
+    reps = [v for v in row.get("reps_tok_s", []) if v]
+    if not reps:
+        return float("nan")
+    if metric == "best":
+        return max(reps)
+    if metric == "first":
+        return reps[0]
+    if metric == "last":
+        return reps[-1]
+    return median(reps)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("jsonl", type=pathlib.Path)
     parser.add_argument("--pairs", default="engine_8000=llama_k0,engine_20000=llama_k16,engine_30000=llama_k24")
     parser.add_argument("--floor", type=float, default=1.05,
                         help="ratio above this is a win, below 1/floor a loss")
+    parser.add_argument("--metric", default="best", choices=["best", "median", "first", "last"])
     parser.add_argument("--json-out", type=pathlib.Path, default=None)
     args = parser.parse_args()
 
@@ -36,10 +57,12 @@ def main() -> int:
         by_label.setdefault(row["label"], {})[row["round"]] = row
 
     def stats(label):
-        values = [r["tok_s"] for r in by_label.get(label, {}).values() if r.get("tok_s")]
-        vr = [r["max_vram_mib"] for r in by_label.get(label, {}).values() if r.get("max_vram_mib")]
-        match = [r["matched_prefix"] for r in by_label.get(label, {}).values()]
-        secs = [r["decode_seconds"] for r in by_label.get(label, {}).values() if r.get("decode_seconds")]
+        rounds = by_label.get(label, {})
+        values = [run_value(r, args.metric) for r in rounds.values()]
+        values = [v for v in values if v == v and v > 0]
+        vr = [r["max_vram_mib"] for r in rounds.values() if r.get("max_vram_mib")]
+        match = [r["matched_prefix"] for r in rounds.values()]
+        pids = [len(r.get("gpu_app_pids", [])) for r in rounds.values()]
         return {
             "label": label,
             "n": len(values),
@@ -48,27 +71,27 @@ def main() -> int:
             "worst": min(values) if values else float("nan"),
             "vram_max": max(vr) if vr else None,
             "match_min": min(match) if match else None,
-            "decode_median_s": median(secs),
+            "gpu_pids_max": max(pids) if pids else None,
         }
 
-    print("## per-run statistics (best / median / worst tok/s over the rounds)")
+    print("## per-run statistics (metric=%s over the rounds)" % args.metric)
     print("")
-    print("| run | n | best | median | worst | max VRAM (MiB) | decode median (s) | min 64-token prefix match |")
+    print("| run | rounds | best | median | worst | max VRAM (MiB) | 64-token prefix match | distinct GPU pids seen |")
     print("|---|---|---|---|---|---|---|---|")
-    summary = {"runs": {}, "pairs": [], "verdict": None}
+    summary = {"metric": args.metric, "runs": {}, "pairs": [], "verdict": None}
     for label in sorted(by_label):
         st = stats(label)
         summary["runs"][label] = st
-        print("| %s | %d | %.3f | %.3f | %.3f | %s | %.2f | %s/64 |" % (
+        print("| %s | %d | %.3f | %.3f | %.3f | %s | %s/64 | %s |" % (
             label, st["n"], st["best"], st["median"], st["worst"],
             st["vram_max"] if st["vram_max"] is not None else "-",
-            st["decode_median_s"], st["match_min"]))
+            st["match_min"], st["gpu_pids_max"]))
 
     print("")
-    print("## same-round ratios (engine / llama.cpp)")
+    print("## same-round ratios (engine / llama.cpp), metric=%s" % args.metric)
     print("")
-    print("| pair | round | engine tok/s | llama tok/s | ratio | engine VRAM | llama VRAM | parity |")
-    print("|---|---|---|---|---|---|---|---|")
+    print("| pairing | round | engine tok/s | llama tok/s | ratio | engine VRAM | llama VRAM | engine match | llama match |")
+    print("|---|---|---|---|---|---|---|---|---|")
     ratios = []
     for pair in args.pairs.split(","):
         engine_label, llama_label = pair.split("=")
@@ -76,16 +99,20 @@ def main() -> int:
         for rnd in sorted(by_label.get(engine_label, {})):
             e = by_label[engine_label].get(rnd)
             l = by_label.get(llama_label, {}).get(rnd)
-            if not e or not l or not e.get("tok_s") or not l.get("tok_s"):
+            if not e or not l:
                 continue
-            ratio = e["tok_s"] / l["tok_s"]
+            ev = run_value(e, args.metric)
+            lv = run_value(l, args.metric)
+            if not ev or not lv or ev != ev or lv != lv:
+                continue
+            ratio = ev / lv
             per_round.append(ratio)
             ratios.append(ratio)
-            print("| %s vs %s | %d | %.3f | %.3f | %.3f | %s | %s | %s vs %s |" % (
-                engine_label, llama_label, rnd, e["tok_s"], l["tok_s"], ratio,
+            print("| %s vs %s | %d | %.3f | %.3f | %.3f | %s | %s | %d/64 | %d/64 |" % (
+                engine_label, llama_label, rnd, ev, lv, ratio,
                 e["max_vram_mib"], l["max_vram_mib"],
-                "%d/64" % e["matched_prefix"], "%d/64" % l["matched_prefix"]))
-        entry = {
+                e["matched_prefix"], l["matched_prefix"]))
+        summary["pairs"].append({
             "engine": engine_label,
             "llama": llama_label,
             "rounds": len(per_round),
@@ -93,8 +120,7 @@ def main() -> int:
             "median_ratio": median(per_round),
             "engine_median_tok_s": stats(engine_label)["median"],
             "llama_median_tok_s": stats(llama_label)["median"],
-        }
-        summary["pairs"].append(entry)
+        })
 
     print("")
     print("## verdict per pairing")
@@ -105,13 +131,13 @@ def main() -> int:
     for entry in summary["pairs"]:
         ratio = entry["median_ratio"]
         if ratio >= args.floor:
-            verdict = "warp WINS (>=%.2fx)" % args.floor
+            verdict = "warp wins (>=%.2fx)" % args.floor
             wins += 1
         elif ratio <= 1.0 / args.floor:
-            verdict = "warp LOSES (<=%.2fx)" % (1.0 / args.floor)
+            verdict = "llama.cpp wins (<=%.2fx)" % (1.0 / args.floor)
             losses += 1
         else:
-            verdict = "DRAW (within +-%.0f%%)" % ((args.floor - 1.0) * 100)
+            verdict = "draw (within +-%.0f%%)" % ((args.floor - 1.0) * 100)
             draws += 1
         print("| %s vs %s | %d | %.3f | %.3f | %.3f | %s |" % (
             entry["engine"], entry["llama"], entry["rounds"], ratio,

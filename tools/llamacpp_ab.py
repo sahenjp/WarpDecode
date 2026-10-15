@@ -393,8 +393,11 @@ else:
     for key in ("n_gpu_layers", "moe_cpu_layers", "load_mode", "threads", "ctx", "ctx_seconds"):
         rec[key] = j.get(key)
     # best-of-N over the in-process repetitions, symmetric with the engine's
-    # --bench-repeat (which also reports its fastest repeat)
-    rec["tok_s"] = min(rec["reps_tok_s"])
+    # --bench-repeat (which reports its fastest repeat). The raw list is kept:
+    # the first repetition is always the slow one (page faults / CUDA modules).
+    rec["tok_s"] = max(rec["reps_tok_s"])
+    rec["tok_s_first"] = rec["reps_tok_s"][0]
+    rec["tok_s_slowest"] = min(rec["reps_tok_s"])
     rec["tok_s_last"] = rec["reps_tok_s"][-1]
     rec["decode_seconds"] = min(rec["reps_seconds"])
     rec["decode_tokens"] = j.get("decode_tokens")
@@ -470,7 +473,7 @@ run_one() {   # run_one <label> <kind> <round> <command...>
   local t1=$(date +%s.%N)
   touch "$stop"; wait $sampler 2>/dev/null
   local wall=$(echo "$t1 - $t0" | bc)
-  local maxapps=$(sort -n $procs 2>/dev/null | tail -1)
+  local maxapps=$(sort -u $procs 2>/dev/null | grep -c .)
   echo "RUN $label round=$rnd rc=$rc wall_s=$wall max_vram_mib=$(maxvram $samples) max_gpu_apps=$maxapps pids=$(sort -u $procs | paste -sd, -)"
   if [ "$rc" -ne 0 ]; then echo "FAILED $label r$rnd"; tail -5 $R/${label}_r${rnd}.err; return 1; fi
   python3 "$EMIT" "$label" "$kind" "$rnd" "$wall" "$(maxvram $samples)" "$maxapps" "$(sort -u $procs | paste -sd' ' -)" "$out" "$RESULTS"

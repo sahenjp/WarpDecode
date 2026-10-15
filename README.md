@@ -55,39 +55,51 @@ CUDAエンジンは llama.cpp (`6fcaa16f4b360649933a54d1f91ad40ed35c0e11`) のCP
 | モデル | Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf (85.9 GB) |
 | 一致 | **64/64トークン** (全最適化後も維持、通算200本以上で確認) |
 | decode (L4 8000MiB, batch=1, ctx=128) | **5.29 tok/s** |
-| decode (A100 16000MiB) | **5.61〜5.88 tok/s**（単発計測 / 3反復の最速値） |
+| decode (A100 20000MiB) | **18.04 tok/s**（同一ジョブ内の交互計測・3ラウンドの中央値） |
 | prefill (L4 8000MiB, 同条件) | **4.63 tok/s** |
 | 速度 (F16高速パス基準) | 2.38 tok/s → **2.2〜2.4倍** |
 | 速度 (最適化前の本エンジン) | 3.20 tok/s → **1.65倍** |
 
-### llama.cpp (CUDA) との直接 A/B（A100 40GB・同一モデル・同一条件）
+### llama.cpp (CUDA) との直接 A/B（A100 40GB・同一ジョブ内で交互計測）
 
-同じセッション・同じ 85.9GB GGUF で、pinned llama.cpp を CUDA sm80 でビルドして
-batch=1 decode を交互に実測しました（詳細と再現手順: `docs/LLAMACPP_AB.md`）。
+同じセッション・同じ 85.9GB GGUF で、pinned llama.cpp を CUDA sm80 でビルドし、
+**同一ジョブの中で交互に** batch=1 decode を実測しました。この VM は同一構成でも
+total が 30% 動くため、**同じラウンドの中の比だけ**を根拠にしています
+（詳細と再現手順: `docs/LLAMACPP_AB.md`）。
 
 | 構成 | VRAM 実測 | decode | 出力一致 |
 |---|---|---|---|
-| 本エンジン expert cache 8,000 MiB | 14,248 MiB | 5.56 tok/s | **64/64** |
-| 本エンジン expert cache 16,000 MiB | 22,248 MiB | 5.88 tok/s | **64/64** |
-| 本エンジン expert cache 30,000 MiB | 36,248 MiB | **6.15 tok/s** | **64/64** |
-| llama.cpp `-ngl 99`（MoE expert 全 CPU・12 threads） | 5,098 MiB | 12.54 tok/s | 36/64 |
-| llama.cpp `-ngl 99`（末尾 8 層の expert を GPU） | 12,796 MiB | 15.00 tok/s | 36/64 |
-| llama.cpp `-ngl 99`（末尾 16 層の expert を GPU） | 20,494 MiB | 18.49 tok/s | 36/64 |
-| llama.cpp 純 CPU（`-ngl 0`・12 threads） | 436 MiB | 4.56 tok/s | 44/64 |
+| 本エンジン expert cache 8,000 MiB | 14,256 MiB | 11.72 tok/s | **64/64** |
+| llama.cpp `-ngl 99`（MoE expert 全 CPU・12 threads, K=0） | 5,098 MiB | 12.31 tok/s | 36/64 |
+| 本エンジン expert cache 20,000 MiB | 26,256 MiB | 18.04 tok/s | **64/64** |
+| llama.cpp `-ngl 99`（末尾 16 層の expert を GPU, K=16） | 20,494 MiB | 17.91 tok/s | 36/64 |
+| 本エンジン expert cache 30,000 MiB | 36,256 MiB | 18.05 tok/s | **64/64** |
+| llama.cpp `-ngl 99`（末尾 24 層の expert を GPU, K=24） | 28,196 MiB | 23.01 tok/s | 40/64 |
 
-**A100 40GB では llama.cpp のほうが速い**（VRAM 予算を揃えると 2.7〜3.8 倍）。
-本エンジンが勝つのは「純 CPU の llama.cpp に対して約 1.3 倍」の範囲です。
+**正直な結論: この構成では「llama.cpp より高速」とは言えません。**
+3 組のうち 2 組（8,000 vs K=0、20,000 vs K=16）は同一ラウンド内の比が 0.95〜1.01 で誤差の範囲（±5%）の引き分け、
+30,000 vs K=24 は比 0.79 で **llama.cpp が 1.27 倍速い**という結果です。
+しかも VRAM はどの組でも本エンジンのほうが 5.8〜9.2 GiB 多く、VRAM 効率では全組で劣ります。
+3 ラウンドの比は 1% 未満のばらつきで一致しており、この判定は安定しています。
+
+一方で前回計測（2026-10-14・別時間帯の比較）の「2.7〜3.8 倍の差」は **0.79〜1.01 倍まで縮小**しました。
+HC mix、expert I/O、router 並列化などの最適化で本エンジンが 5.6〜6.1 → 11.7〜18.1 tok/s に伸びたためです。
+なお expert cache を 20,000 → 30,000 MiB に増やしても 18.04 → 18.05 tok/s で飽和します。
+
 一方で CPU オラクルと 64/64 一致するのは本エンジンだけで、llama.cpp は既定ビルド
-（`GGML_NATIVE=ON` / repack 有効）だと自分の CPU 参照実装すら再現しません
-（オラクルと同じ cmake フラグでビルドすると 64/64 に戻ることが確認済み）。
+（`GGML_NATIVE=ON`）だと自分の CPU 参照実装すら再現しません（36〜40/64）。
 速度と数値忠実度は別の軸として読んでください。
 
 再現:
 
 ```bash
+export PATH=/home/sahen/.local/bin:$PATH
 WARODECODE_COLAB_SESSION=warpdecode-a100 WARODECODE_COLAB_ARCH=80 \
-  python3 tools/llamacpp_ab.py --rounds 3 --reps 3 --llama-k 8 --llama-k2 16
+  python3 tools/llamacpp_ab.py --phases build_llamacpp,build_engine,ab3 \
+    --rounds 3 --reps 3 --engine-caches 8000,20000,30000 --llama-ks 0,16,24
+python3 tests/llamacpp_ab_report.py issue1_artifacts/taskl_ab3_results.jsonl
 ```
+
 
 ### 速度の内訳と効いた最適化
 
