@@ -51,6 +51,26 @@ PLANS = {
         ("default-a", {}),
         ("default-b", {}),
     ],
+    # Task R: HC legacy-duplication removal. "base" keeps the legacy F16 pass at
+    # both sites (the pre-Task-R order, WARODECODE_HC_SKIP_LEGACY=0), then each
+    # site on its own, then both - which is the shipped default (no switch set).
+    "taskr": [
+        ("base-a", {"WARODECODE_HC_SKIP_LEGACY": "0"}),
+        ("attn-only", {"WARODECODE_HC_SKIP_LEGACY_FFN": "0"}),
+        ("ffn-only", {"WARODECODE_HC_SKIP_LEGACY_ATTN": "0"}),
+        ("both", {}),
+        ("base-b", {"WARODECODE_HC_SKIP_LEGACY": "0"}),
+    ],
+    # Task R tok_s only, profilers off: the headline number must not carry the
+    # per-kernel event overhead, and the alternation shows the drift.
+    "taskr_tok": [
+        ("base-1", {"WARODECODE_HC_SKIP_LEGACY": "0", "WARODECODE_HC_PROFILE": "0",
+                    "WARODECODE_ATTN_PROFILE": "0"}),
+        ("both-1", {"WARODECODE_HC_PROFILE": "0", "WARODECODE_ATTN_PROFILE": "0"}),
+        ("base-2", {"WARODECODE_HC_SKIP_LEGACY": "0", "WARODECODE_HC_PROFILE": "0",
+                    "WARODECODE_ATTN_PROFILE": "0"}),
+        ("both-2", {"WARODECODE_HC_PROFILE": "0", "WARODECODE_ATTN_PROFILE": "0"}),
+    ],
     # Percent-only comparison inside one measurement session: four repeats each,
     # alternated, with the profilers off so they cannot perturb the timing.
     "tok": [

@@ -59,7 +59,13 @@ site は attn / ffn の 2 バンクに分けてある（共有カーネル本体
 
 ```
 warodecode: HC mix Task J switches: skip_legacy=1 gamma_resident=1 inject_warp=1 down_dp4a=0
+warodecode: HC mix Task R switches: skip_legacy_attn=1 skip_legacy_ffn=1
 ```
+
+> **Task R の追記**: このガードは Task J の時点では ffn サイトで発火しておらず
+> (`!debug_hc_q8_0_ffn` が exact 経路の選択述語だったため)、attn サイトには
+> 存在しなかった。両サイトを共通述語に直した経緯と実測は
+> [HC_LEGACY_REMOVAL.md](HC_LEGACY_REMOVAL.md) を参照。
 
 ### 1.2 スタンドアロン・マイクロベンチ
 `tests/qwen38_hc_bench.cu`（新規）。合成データで実際の HC mix 本体を回す:

@@ -80,6 +80,11 @@ struct ExpertCacheOptions {
     int layer_count = 0;
     std::vector<size_t> shadow_slots;
 
+    // Task Q: LFU shadow capacities (WARODECODE_EXPERT_SHADOW_FREQ=a,b,..) plus a
+    // switch that reuses the LRU capacity list for a like-for-like comparison.
+    std::vector<size_t> shadow_freq_slots;
+    bool shadow_freq_same_as_lru = false;
+
     // Task H: pread + pinned ring staging. ON by default because it was
     // measured faster in every configuration (A100 +41% tok/s at the 1536 MiB
     // cache, all 64/64); WARODECODE_EXPERT_IO_PREAD=0 restores the pageable
@@ -87,6 +92,7 @@ struct ExpertCacheOptions {
     bool io_pread = true;
     int io_ring = 4;
     int io_threads = 4;
+    int io_streams = 1;   // Task Q: copy streams the per-expert DMA is spread over
     bool io_stats = false;
 
     // Task K: expert read-ahead. The on-demand fill blocks the calling thread in
@@ -138,6 +144,23 @@ inline int expert_cache_env_int(const char * name, int fallback) {
     if (v == nullptr || v[0] == '\0') return fallback;
     const long n = std::strtol(v, nullptr, 10);
     return n > 0 ? static_cast<int>(n) : fallback;
+}
+
+// Comma/space separated positive integers, used by the Task Q frequency shadow.
+inline std::vector<size_t> expert_cache_env_slots(const char * name) {
+    std::vector<size_t> out;
+    const char * v = std::getenv(name);
+    if (v == nullptr) return out;
+    const char * p = v;
+    while (*p != '\0') {
+        char * end = nullptr;
+        const long long n = std::strtoll(p, &end, 10);
+        if (end == p) break;
+        if (n > 0) out.push_back(static_cast<size_t>(n));
+        p = end;
+        while (*p == ',' || *p == ' ') ++p;
+    }
+    return out;
 }
 
 // posix_fadvise() advice for the range about to be read. Returns 0 for "none".
@@ -864,17 +887,49 @@ public:
         // run can prove the ring works end to end on real hardware instead of
         // posting nothing. It can only waste I/O, never change a slot byte.
         prefetch_all_ = expert_cache_env_flag("WARODECODE_EXPERT_PREFETCH_ALL", false);
+        // Task Q diagnostics. None of these change the *bytes* a slot receives
+        // unless the run is explicitly asked to skip work, and a skipping run is
+        // expected to break parity: they exist to attribute the MoE region.
+        //   WARODECODE_EXPERT_IO_SKIP=1   queue nothing at all (the slot keeps
+        //                                 whatever the previous expert left);
+        //                                 the floor of "no expert I/O"
+        //   WARODECODE_EXPERT_IO_NODMA=1  pread the slices into the ring but do
+        //                                 not DMA them (separates pread from DMA)
+        //   WARODECODE_EXPERT_IO_TIMING=1 CUDA events around each DMA and around
+        //                                 the consumer wait, harvested lazily on
+        //                                 the next submit so nothing blocks
+        io_skip_ = expert_cache_env_flag("WARODECODE_EXPERT_IO_SKIP", false);
+        io_nodma_ = expert_cache_env_flag("WARODECODE_EXPERT_IO_NODMA", false);
+        io_timing_ = expert_cache_env_flag("WARODECODE_EXPERT_IO_TIMING", false);
         io_enabled_ = expert_cache_env_flag("WARODECODE_EXPERT_IO_PREAD", opt.io_pread);
         io_ring_entries_ = static_cast<size_t>(expert_cache_env_int("WARODECODE_EXPERT_IO_RING", opt.io_ring));
         if (io_ring_entries_ == 0) io_ring_entries_ = 1;
         io_threads_ = expert_cache_env_int("WARODECODE_EXPERT_IO_THREADS", opt.io_threads);
         if (io_threads_ < 1) io_threads_ = 1;
+        // Task Q: one pinned source per DMA cannot saturate the host->device
+        // link, exactly like one pread thread cannot saturate the page cache
+        // (Task H measured 6.8 GB/s single-threaded vs 17.8 with four). Round
+        // robin the per-expert DMA over io_streams_ copy streams so several
+        // transfers are in flight at once, and keep the consumer's wait per
+        // expert so every slot is still complete before its kernels run.
+        io_streams_ = expert_cache_env_int("WARODECODE_EXPERT_IO_STREAMS", opt.io_streams);
+        if (io_streams_ < 1) io_streams_ = 1;
+        if (io_streams_ > 8) io_streams_ = 8;
         io_fadvise_ = expert_cache_env_fadvise();
         if (stage_enabled_ && opt.copy_stream) {
             cudaError_t e = cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking);
             if (e != cudaSuccess) {
                 copy_stream_ = nullptr;
                 throw std::runtime_error(std::string("expert copy stream create failed: ") + cudaGetErrorString(e));
+            }
+            copy_streams_.push_back(copy_stream_);
+            for (int i = 1; i < io_streams_; ++i) {
+                cudaStream_t extra = nullptr;
+                if (cudaStreamCreateWithFlags(&extra, cudaStreamNonBlocking) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    break;
+                }
+                copy_streams_.push_back(extra);
             }
             e = cudaEventCreateWithFlags(&done_, cudaEventDisableTiming);
             if (e != cudaSuccess) {
@@ -906,6 +961,26 @@ public:
                         io_enabled_ = false;
                         break;
                     }
+                }
+                if (io_enabled_ && io_timing_) {
+                    // Default (timing) flags: cudaEventElapsedTime needs them.
+                    for (int i = 0; i < kTimingSlots; ++i) {
+                        TimingSlot & t = timing_[i];
+                        t.used = false;
+                        const bool ok =
+                            cudaEventCreate(&t.begin) == cudaSuccess &&
+                            cudaEventCreate(&t.end) == cudaSuccess &&
+                            cudaEventCreate(&t.wait_a) == cudaSuccess &&
+                            cudaEventCreate(&t.wait_b) == cudaSuccess;
+                        if (!ok) {
+                            io_timing_ = false;
+                            break;
+                        }
+                    }
+                    if (!io_timing_) {
+                        std::fprintf(stderr, "expert-io: timing events unavailable, timing off\n");
+                    }
+                    (void)cudaGetLastError();
                 }
                 if (io_enabled_) {
                     pool_ = std::make_unique<ExpertPreadPool>();
@@ -960,10 +1035,26 @@ public:
         }
         ring_.clear();
         map_.release();
+        for (int i = 0; i < kTimingSlots; ++i) {
+            TimingSlot & t = timing_[i];
+            if (t.begin) cudaEventDestroy(t.begin);
+            if (t.end) cudaEventDestroy(t.end);
+            if (t.wait_a) cudaEventDestroy(t.wait_a);
+            if (t.wait_b) cudaEventDestroy(t.wait_b);
+            t = TimingSlot{};
+        }
+        timing_next_ = 0;
+        timing_slot_ = -1;
+        dma_ms_ = dma_max_ms_ = stall_ms_ = stall_max_ms_ = 0.0;
+        dma_calls_ = stall_calls_ = 0;
         if (done_) cudaEventDestroy(done_);
         done_ = nullptr;
+        for (size_t i = 1; i < copy_streams_.size(); ++i) cudaStreamDestroy(copy_streams_[i]);
+        copy_streams_.clear();
         if (copy_stream_) cudaStreamDestroy(copy_stream_);
         copy_stream_ = nullptr;
+        stream_next_ = 0;
+        last_dma_stream_ = nullptr;
         stage_enabled_ = false;
         io_enabled_ = false;
         prefetch_depth_ = 0;
@@ -975,6 +1066,7 @@ public:
     size_t ring_entries() const { return ring_.size(); }
     int fadvise_mode() const { return io_fadvise_; }
     int io_threads() const { return io_threads_; }
+    int io_streams() const { return static_cast<int>(copy_streams_.size()); }
     bool io_busy() const { return pool_ != nullptr && pool_->threads() > 1; }
     int fd() const { return map_.fd(); }
     size_t slot_bytes() const { return ring_slot_bytes_; }
@@ -1082,8 +1174,25 @@ public:
             uint64_t key = 0) {
         // The pinned path works with and without the copy stream: without it the
         // DMA and its reuse event are ordered on the decode stream instead.
-        cudaStream_t s = copy_stream_ ? copy_stream_ : consumer;
+        cudaStream_t s = copy_stream_;
+        if (s != nullptr && copy_streams_.size() > 1) {
+            s = copy_streams_[stream_next_ % copy_streams_.size()];
+            stream_next_ = (stream_next_ + 1) % copy_streams_.size();
+        }
+        if (s == nullptr) s = consumer;
+        last_dma_stream_ = s;
         served_prefetch_ = false;
+        // Whether this submit queued anything on copy_stream_ decides if the
+        // consumer has to wait in finish(). skip/nodma queue nothing.
+        copy_stream_used_ = false;
+        // Task Q diagnostic: queue nothing, so the slot keeps the previous
+        // expert's bytes. Only used to attribute the MoE region (parity breaks).
+        if (io_skip_) return false;
+        timing_slot_ = -1;
+        if (io_timing_) {
+            harvest_timing();
+            timing_slot_ = acquire_timing_slot();
+        }
         if (io_enabled_ && readahead_ && readahead_->enabled() && count <= kExpertSliceMax) {
             cudaEvent_t reuse = nullptr;
             uint8_t * ready = readahead_->borrow(key, &reuse);
@@ -1100,13 +1209,19 @@ public:
                 copy_record(reuse, s, "expert read-ahead reuse event");
                 readahead_->finish_borrow(key);
                 served_prefetch_ = true;
+                copy_stream_used_ = (s != consumer);
                 return true;
             }
         }
         if (io_enabled_ && fill_pinned(src, offset, bytes, count)) {
+            // Task Q diagnostic: the pread ran, the DMA does not. The slot keeps
+            // the previous expert's bytes (parity breaks), which separates the
+            // pread cost from the DMA cost inside the MoE region.
+            if (io_nodma_) return true;
             wait_depend(s, depend);
             RingEntry & entry = ring_[ring_next_];
             ring_next_ = (ring_next_ + 1) % ring_.size();
+            record_timing_begin(s, timing_slot_);
             // Contiguous runs of the slot are one DMA, which keeps the transfer
             // per expert at two calls (gate_up + down) instead of four.
             int i = 0;
@@ -1116,10 +1231,12 @@ public:
                 copy(dst + offset[i], entry.buf + offset[i], offset[j - 1] + bytes[j - 1] - offset[i], s, "expert");
                 i = j;
             }
+            record_timing_end(s, timing_slot_);
             // The host must not write this entry again before the DMA above has
             // read it: record the event the reuse guard waits on.
             copy_record(entry.done, s, "expert ring reuse event");
             entry.pending = true;
+            copy_stream_used_ = (s != consumer);
             return true;
         }
         if (!stage_enabled_) {
@@ -1132,19 +1249,41 @@ public:
         for (int i = 0; i < count; ++i) {
             copy(dst + offset[i], src[i], bytes[i], s, "expert");
         }
+        copy_stream_used_ = (s != consumer);
         return false;
     }
 
     // Make the decode stream wait for everything submit() queued.
     void finish(cudaStream_t consumer) {
-        if (copy_stream_ == nullptr) return;
-        copy_record(done_, copy_stream_, "expert done event");
+        if (copy_stream_ == nullptr || !copy_stream_used_) return;
+        copy_record(done_, last_dma_stream_ ? last_dma_stream_ : copy_stream_, "expert done event");
+        // Task Q: the span of the wait is the time this expert's DMA stall cost
+        // the consumer stream, i.e. the part of the MoE region that is transfer
+        // latency rather than kernel execution or host enqueue time.
+        // The wait events land in the same slot as this submit's DMA pair, so a
+        // harvested sample always pairs one DMA with its own consumer wait.
+        if (io_timing_ && timing_slot_ >= 0) {
+            (void)cudaEventRecord(timing_[timing_slot_].wait_a, consumer);
+        }
         const cudaError_t e = cudaStreamWaitEvent(consumer, done_, 0);
         if (e != cudaSuccess) throw std::runtime_error(std::string("expert done wait failed: ") + cudaGetErrorString(e));
+        if (io_timing_ && timing_slot_ >= 0) {
+            (void)cudaEventRecord(timing_[timing_slot_].wait_b, consumer);
+        }
     }
 
     double last_pread_ms() const { return last_pread_ms_; }
     double last_ring_wait_ms() const { return last_ring_wait_ms_; }
+    // Task Q diagnostics (all zero unless WARODECODE_EXPERT_IO_TIMING=1).
+    double dma_ms() const { return dma_ms_; }
+    double dma_max_ms() const { return dma_max_ms_; }
+    uint64_t dma_calls() const { return dma_calls_; }
+    double dma_stall_ms() const { return stall_ms_; }
+    double dma_stall_max_ms() const { return stall_max_ms_; }
+    uint64_t dma_stall_calls() const { return stall_calls_; }
+    bool io_skip() const { return io_skip_; }
+    bool io_nodma() const { return io_nodma_; }
+    bool io_timing() const { return io_timing_; }
 
 private:
     struct RingEntry {
@@ -1173,6 +1312,10 @@ private:
         o.last_layer_ = -1;
         o.prefetch_depth_ = 0;
         copy_stream_ = o.copy_stream_;
+        copy_streams_ = std::move(o.copy_streams_);
+        stream_next_ = o.stream_next_;
+        last_dma_stream_ = nullptr;
+        io_streams_ = o.io_streams_;
         done_ = o.done_;
         stage_enabled_ = o.stage_enabled_;
         io_enabled_ = o.io_enabled_;
@@ -1183,8 +1326,28 @@ private:
         io_threads_ = o.io_threads_;
         ring_next_ = o.ring_next_;
         ring_slot_bytes_ = o.ring_slot_bytes_;
+        io_skip_ = o.io_skip_;
+        io_nodma_ = o.io_nodma_;
+        io_timing_ = o.io_timing_;
+        copy_stream_used_ = false;
+        for (int i = 0; i < kTimingSlots; ++i) {
+            timing_[i] = o.timing_[i];
+            o.timing_[i] = TimingSlot{};
+        }
+        timing_next_ = o.timing_next_;
+        timing_slot_ = -1;
+        o.timing_next_ = 0;
+        dma_ms_ = o.dma_ms_;
+        dma_max_ms_ = o.dma_max_ms_;
+        stall_ms_ = o.stall_ms_;
+        stall_max_ms_ = o.stall_max_ms_;
+        dma_calls_ = o.dma_calls_;
+        stall_calls_ = o.stall_calls_;
         map_ = std::move(o.map_);
         o.copy_stream_ = nullptr;
+        o.copy_streams_.clear();
+        o.stream_next_ = 0;
+        o.io_streams_ = 1;
         o.done_ = nullptr;
         o.stage_enabled_ = false;
         o.io_enabled_ = false;
@@ -1195,9 +1358,66 @@ private:
         o.io_threads_ = 1;
     }
 
+    // Task Q: one event pair around the DMA on the copy stream (its elapsed
+    // time is the transfer itself, since wait_depend is recorded before the
+    // begin event) and one pair around the consumer wait (its elapsed time is
+    // the stall the transfer imposed on the decode stream). Both pairs are
+    // harvested on the *next* submit, and only when cudaEventQuery says they
+    // completed, so nothing here ever blocks.
+    // A rejected sample is worse than a delayed one: the first version kept a
+    // single event pair and dropped the sample whenever the DMA had not finished
+    // by the next submit, which is exactly the pipelined (fast) case. Four slots
+    // let a sample live four submits.
+    static constexpr int kTimingSlots = 4;
+
+    int acquire_timing_slot() {
+        for (int i = 0; i < kTimingSlots; ++i) {
+            const int idx = (timing_next_ + i) % kTimingSlots;
+            if (!timing_[idx].used) {
+                timing_next_ = (idx + 1) % kTimingSlots;
+                return idx;
+            }
+        }
+        return -1;
+    }
+
+    void record_timing_begin(cudaStream_t s, int idx) {
+        if (idx < 0) return;
+        (void)cudaEventRecord(timing_[idx].begin, s);
+    }
+
+    void record_timing_end(cudaStream_t s, int idx) {
+        if (idx < 0) return;
+        (void)cudaEventRecord(timing_[idx].end, s);
+        timing_[idx].used = true;
+    }
+
+    void harvest_timing() {
+        for (int i = 0; i < kTimingSlots; ++i) {
+            TimingSlot & t = timing_[i];
+            if (!t.used) continue;
+            if (cudaEventQuery(t.end) != cudaSuccess || cudaEventQuery(t.wait_b) != cudaSuccess) {
+                (void)cudaGetLastError();
+                continue;
+            }
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, t.begin, t.end) == cudaSuccess) {
+                dma_ms_ += static_cast<double>(ms);
+                ++dma_calls_;
+                if (ms > dma_max_ms_) dma_max_ms_ = static_cast<double>(ms);
+            }
+            if (cudaEventElapsedTime(&ms, t.wait_a, t.wait_b) == cudaSuccess) {
+                stall_ms_ += static_cast<double>(ms);
+                ++stall_calls_;
+                if (ms > stall_max_ms_) stall_max_ms_ = static_cast<double>(ms);
+            }
+            t.used = false;
+        }
+    }
+
     void wait_depend(cudaStream_t s, cudaEvent_t depend) {
         if (copy_stream_ && depend != nullptr) {
-            const cudaError_t e = cudaStreamWaitEvent(copy_stream_, depend, 0);
+            const cudaError_t e = cudaStreamWaitEvent(s, depend, 0);
             if (e != cudaSuccess) throw std::runtime_error(std::string("expert retire wait failed: ") + cudaGetErrorString(e));
         }
         (void)s;
@@ -1303,6 +1523,10 @@ private:
     }
 
     cudaStream_t copy_stream_ = nullptr;
+    std::vector<cudaStream_t> copy_streams_;
+    size_t stream_next_ = 0;
+    cudaStream_t last_dma_stream_ = nullptr;
+    int io_streams_ = 1;
     cudaEvent_t done_ = nullptr;
     bool stage_enabled_ = false;
 
@@ -1318,6 +1542,28 @@ private:
 
     double last_pread_ms_ = 0.0;
     double last_ring_wait_ms_ = 0.0;
+
+    // Task Q diagnostics: read-path and copy-path attribution.
+    bool io_skip_ = false;
+    bool io_nodma_ = false;
+    bool io_timing_ = false;
+    bool copy_stream_used_ = false;
+    struct TimingSlot {
+        cudaEvent_t begin = nullptr;
+        cudaEvent_t end = nullptr;
+        cudaEvent_t wait_a = nullptr;
+        cudaEvent_t wait_b = nullptr;
+        bool used = false;
+    };
+    TimingSlot timing_[kTimingSlots];
+    int timing_next_ = 0;
+    int timing_slot_ = -1;
+    double dma_ms_ = 0.0;
+    double dma_max_ms_ = 0.0;
+    double stall_ms_ = 0.0;
+    double stall_max_ms_ = 0.0;
+    uint64_t dma_calls_ = 0;
+    uint64_t stall_calls_ = 0;
 
     // Task K: read-ahead ring + the per-layer access history it predicts from.
     int prefetch_depth_ = 0;
@@ -1372,6 +1618,56 @@ private:
     std::unordered_map<uint64_t, std::list<uint64_t>::iterator> index_;
 };
 
+// Task Q: offline comparison policy for the *same* access trace. Every config
+// that keeps the slot bytes correct produces exactly the same routing, so the
+// (layer, expert) trace is independent of the replacement policy and this
+// simulation is an exact counterfactual for "what would a frequency-aware
+// eviction have hit". It never affects the real cache.
+class ShadowFreq {
+public:
+    explicit ShadowFreq(size_t capacity) : capacity_(capacity ? capacity : 1) {}
+
+    void access(uint64_t key) {
+        auto where = resident_.find(key);
+        auto count = counts_.find(key);
+        const uint64_t seen = count == counts_.end() ? 0 : count->second;
+        counts_[key] = seen + 1;
+        if (where != resident_.end()) {
+            ++slots_[where->second].freq;
+            ++hits_;
+            return;
+        }
+        if (slots_.size() < capacity_) {
+            resident_[key] = slots_.size();
+            slots_.push_back(Entry{key, seen + 1});
+            return;
+        }
+        // Exact LFU with an LRU tie-break: cheapest resident entry leaves.
+        size_t victim = 0;
+        for (size_t i = 1; i < slots_.size(); ++i) {
+            if (slots_[i].freq < slots_[victim].freq) victim = i;
+        }
+        resident_.erase(slots_[victim].key);
+        slots_[victim] = Entry{key, seen + 1};
+        resident_[key] = victim;
+    }
+
+    uint64_t hits() const { return hits_; }
+    size_t capacity() const { return capacity_; }
+
+private:
+    struct Entry {
+        uint64_t key = 0;
+        uint64_t freq = 0;
+    };
+
+    size_t capacity_;
+    uint64_t hits_ = 0;
+    std::vector<Entry> slots_;
+    std::unordered_map<uint64_t, size_t> resident_;
+    std::unordered_map<uint64_t, uint64_t> counts_;
+};
+
 class ExpertCacheMonitor {
 public:
     struct ShadowSet {
@@ -1391,6 +1687,12 @@ public:
             size_t slots,
             size_t slot_bytes,
             int layer_count) {
+        // Task Q: WARODECODE_EXPERT_SHADOW_FREQ=a,b,.. simulates an exact-LFU
+        // eviction over the identical access trace; "lru" reuses the LRU list so
+        // the two policies are compared at the same capacities.
+        const char * freq_env = std::getenv("WARODECODE_EXPERT_SHADOW_FREQ");
+        shadow_freq_slots_ = expert_cache_env_slots("WARODECODE_EXPERT_SHADOW_FREQ");
+        shadow_freq_same_as_lru_ = freq_env != nullptr && std::string(freq_env) == "lru";
         enabled_ = opt.stats;
         mode_ = mode ? mode : "?";
         capacity_mib_ = capacity_mib;
@@ -1402,6 +1704,14 @@ public:
         layer_misses_.assign(static_cast<size_t>(layer_count_), 0);
         shadow_global_.clear();
         shadow_layer_.clear();
+        shadow_freq_.clear();
+        // Task Q: the same capacities as the LRU shadow unless overridden, so
+        // the two lines of the report are directly comparable. A negative value
+        // in the list means "same capacities as WARODECODE_EXPERT_SHADOW".
+        for (size_t s : shadow_freq_slots_) shadow_freq_.push_back(ShadowFreq(s));
+        if (shadow_freq_same_as_lru_) {
+            for (size_t s : opt.shadow_slots) shadow_freq_.push_back(ShadowFreq(s));
+        }
         for (size_t s : opt.shadow_slots) {
             shadow_global_.push_back(ShadowLru(s));
             ShadowSet set;
@@ -1444,6 +1754,7 @@ public:
             if (prev_set_.count(key)) ++prev_hit_;
         }
         for (ShadowLru & s : shadow_global_) s.access(key);
+        for (ShadowFreq & s : shadow_freq_) s.access(key);
         for (ShadowSet & set : shadow_layer_) {
             if (li < set.layers.size()) set.layers[li].access(key);
         }
@@ -1476,11 +1787,12 @@ public:
         cur_.stage_ms += ms;
     }
 
-    void note_io_configured(bool enabled, size_t ring, int fadvise, int threads) {
+    void note_io_configured(bool enabled, size_t ring, int fadvise, int threads, int streams) {
         io_enabled_ = enabled;
         io_ring_ = ring;
         io_fadvise_ = fadvise;
         io_threads_ = threads;
+        io_streams_ = streams;
     }
 
     // Task H: pread / pinned ring read path, split out of stage_ms.
@@ -1496,6 +1808,20 @@ public:
             ++io_fallbacks_;
         }
         if (served_prefetch) ++io_prefetched_;
+    }
+
+    // Task Q: copy-path attribution. dma_* comes from events on the copy stream
+    // around each DMA (pure transfer time), stall_* from events around the
+    // consumer wait (how much of the MoE region the transfer latency cost).
+    void note_io_timing(double dma_ms, double dma_max_ms, uint64_t dma_calls,
+                        double stall_ms, double stall_max_ms, uint64_t stall_calls) {
+        if (!enabled_) return;
+        dma_ms_ = dma_ms;
+        dma_max_ms_ = dma_max_ms;
+        dma_calls_ = dma_calls;
+        stall_ms_ = stall_ms;
+        stall_max_ms_ = stall_max_ms;
+        stall_calls_ = stall_calls;
     }
 
     // Task K: the time the cache was *not* inside acquire(), split by whether
@@ -1577,7 +1903,14 @@ public:
         s += ",\"io_ring\":" + std::to_string(io_ring_);
         s += ",\"io_fadvise\":" + std::to_string(io_fadvise_);
         s += ",\"io_threads\":" + std::to_string(io_threads_);
+        s += ",\"io_streams\":" + std::to_string(io_streams_);
         s += ",\"io_prefetched\":" + std::to_string(io_prefetched_);
+        s += ",\"io_dma_ms\":" + fixed(dma_ms_, 1);
+        s += ",\"io_dma_max_ms\":" + fixed(dma_max_ms_, 3);
+        s += ",\"io_dma_calls\":" + std::to_string(dma_calls_);
+        s += ",\"io_dma_stall_ms\":" + fixed(stall_ms_, 1);
+        s += ",\"io_dma_stall_max_ms\":" + fixed(stall_max_ms_, 3);
+        s += ",\"io_dma_stall_calls\":" + std::to_string(stall_calls_);
         s += ",\"prefetch_depth\":" + std::to_string(prefetch_depth_);
         s += ",\"prefetch_slots\":" + std::to_string(prefetch_slots_);
         s += ",\"prefetch_posted\":" + std::to_string(prefetch_posted_);
@@ -1615,6 +1948,15 @@ public:
             s += ",\"global_hit_rate\":" + fixed(accesses_ ? static_cast<double>(gh) / static_cast<double>(accesses_) : 0.0, 4);
             s += ",\"layer_hits\":" + std::to_string(lh);
             s += ",\"layer_hit_rate\":" + fixed(accesses_ ? static_cast<double>(lh) / static_cast<double>(accesses_) : 0.0, 4);
+            s += "}";
+        }
+        s += "],\"shadow_freq\":[";
+        for (size_t i = 0; i < shadow_freq_.size(); ++i) {
+            if (i) s += ",";
+            const uint64_t h = shadow_freq_[i].hits();
+            s += "{\"slots\":" + std::to_string(shadow_freq_[i].capacity());
+            s += ",\"hits\":" + std::to_string(h);
+            s += ",\"hit_rate\":" + fixed(accesses_ ? static_cast<double>(h) / static_cast<double>(accesses_) : 0.0, 4);
             s += "}";
         }
         s += "]}";
@@ -1712,6 +2054,12 @@ private:
     uint64_t io_served_ = 0;
     uint64_t io_fallbacks_ = 0;
     uint64_t io_prefetched_ = 0;
+    double dma_ms_ = 0.0;
+    double dma_max_ms_ = 0.0;
+    uint64_t dma_calls_ = 0;
+    double stall_ms_ = 0.0;
+    double stall_max_ms_ = 0.0;
+    uint64_t stall_calls_ = 0;
     double intra_gap_ms_ = 0.0;
     double layer_gap_ms_ = 0.0;
     int last_gap_layer_ = -1;
@@ -1731,6 +2079,7 @@ private:
     size_t io_ring_ = 0;
     int io_fadvise_ = 0;
     int io_threads_ = 1;
+    int io_streams_ = 1;
 
     int last_layer_ = -1;
     clock::time_point token_start_{};
@@ -1750,6 +2099,9 @@ private:
 
     std::vector<ShadowLru> shadow_global_;
     std::vector<ShadowSet> shadow_layer_;
+    std::vector<ShadowFreq> shadow_freq_;
+    std::vector<size_t> shadow_freq_slots_;
+    bool shadow_freq_same_as_lru_ = false;
 };
 
 
@@ -1867,7 +2219,8 @@ public:
         layer_count_ = options.layer_count;
         stage_.configure(options_, slot_bytes_, sample_gate.data);
         monitor_.configure(options_, "separate", capacity_mib, n_slots_, slot_bytes_, options.layer_count);
-        monitor_.note_io_configured(stage_.io_enabled(), stage_.ring_entries(), stage_.fadvise_mode(), stage_.io_threads());
+        monitor_.note_io_configured(stage_.io_enabled(), stage_.ring_entries(), stage_.fadvise_mode(),
+                                    stage_.io_threads(), stage_.io_streams());
     }
 
     size_t slot_count() const { return n_slots_; }
@@ -1947,6 +2300,9 @@ public:
         monitor_.note_stage_ms(ms_since(stage_start));
         monitor_.note_io_ms(stage_.last_pread_ms(), stage_.last_ring_wait_ms(), io_served,
                             stage_.last_served_prefetch());
+        monitor_.note_io_timing(stage_.dma_ms(), stage_.dma_max_ms(), stage_.dma_calls(),
+                                stage_.dma_stall_ms(), stage_.dma_stall_max_ms(),
+                                stage_.dma_stall_calls());
 
         meta.key = key;
         meta.last_use = clock_;
@@ -2247,7 +2603,8 @@ public:
         layer_count_ = options.layer_count;
         stage_.configure(options_, slot_bytes_, sample_gate_up.data);
         monitor_.configure(options_, "fused", capacity_mib, n_slots_, slot_bytes_, options.layer_count);
-        monitor_.note_io_configured(stage_.io_enabled(), stage_.ring_entries(), stage_.fadvise_mode(), stage_.io_threads());
+        monitor_.note_io_configured(stage_.io_enabled(), stage_.ring_entries(), stage_.fadvise_mode(),
+                                    stage_.io_threads(), stage_.io_streams());
     }
 
     size_t slot_count() const { return n_slots_; }
@@ -2321,6 +2678,9 @@ public:
         monitor_.note_stage_ms(ms_since(stage_start));
         monitor_.note_io_ms(stage_.last_pread_ms(), stage_.last_ring_wait_ms(), io_served,
                             stage_.last_served_prefetch());
+        monitor_.note_io_timing(stage_.dma_ms(), stage_.dma_max_ms(), stage_.dma_calls(),
+                                stage_.dma_stall_ms(), stage_.dma_stall_max_ms(),
+                                stage_.dma_stall_calls());
 
         meta.key = key;
         meta.last_use = clock_;

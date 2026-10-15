@@ -66,6 +66,26 @@ inline bool qwen38_hc_f32_inject_enabled(const Qwen38HcWeights & w) {
     return enabled && qwen38_hc_f32_inject_ready(w);
 }
 
+// Task R: one HC mix site's decision to skip the legacy F16 pass.
+//
+// The legacy pass is the only writer of the half mirrors st.hc_*.xn / .gate /
+// .lo (read by the trace/debug tooling alone) and, together with
+// run_qwen38_hc_mix_f32_with_inject(), of the half-typed st.hc_*.inject().
+// It is skippable exactly when the exact Q8_0 replay runs for this layer, that
+// replay takes its non-null branch (the branch that copies the unrounded inject
+// back into the half scratch, so the fallback combine cannot read a stale
+// buffer) and nothing consumes the half mirrors. The caller passes the facts it
+// has already computed; the switches live in q38_hc_skip_legacy_*_enabled()
+// (src/qwen38_forward.cuh).
+inline bool q38_hc_legacy_mix_skippable(
+        bool skip_switch_enabled,
+        bool exact_mix_active,
+        bool exact_writes_inject,
+        bool half_mirror_consumed) {
+    return skip_switch_enabled && exact_mix_active && exact_writes_inject &&
+           !half_mirror_consumed;
+}
+
 inline Qwen38HcWeights load_qwen38_hc_weights(
         const GgufFile & g,
         int il,

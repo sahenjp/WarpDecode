@@ -102,19 +102,43 @@ inline bool q38_hc_q8_0_compatible(const Qwen38HcWeights & w) {
            w.up.lowbit && w.up.type == GgmlType::Q8_0;
 }
 
-// Task J (WARODECODE_HC_SKIP_LEGACY, default ON).
+// Task J / Task R (WARODECODE_HC_SKIP_LEGACY, default ON).
 //
 // Both HC mix sites used to run the legacy F16 mirror first and the exact Q8_0
-// replay afterwards. The F16 pass is pure duplicate work when the Q8_0 path is
-// active: it writes st.hc_*.{xn,gate,lo,inject,mixed}, and every one of those
-// buffers is either overwritten by the exact pass (the F32 -> half copies) or
-// read only by the legacy combines that the exact pass makes unreachable
-// (run_qwen38_hc_combine_f32_inject / run_qwen38_hc_combine_moe_f32_inject use
-// the F32 scratch copy). The attn site already skipped it through
-// attn_f32_mix_active; this is the same guard for the ffn site.
-// =0 restores the previous behaviour for A/B runs.
+// replay afterwards. The F16 pass is duplicate work whenever the exact replay
+// is the one whose output survives: the F16 pass fills
+// st.hc_*.{xn,gate,lo,inject,mixed}, the exact pass rewrites mixed() and the
+// half inject() (run_qwen38_hc_mix_f32_with_inject() copies its unrounded
+// inject back into the half scratch - the skip only allows that variant), and
+// the remaining three buffers are read by trace/debug code alone.
+//
+// Task J added this guard to the ffn site only, and keyed it on
+// !debug_hc_q8_0_ffn. debug_hc_q8_0_ffn is the predicate that *selects* the
+// exact replay (its last clause is the default-on q38_hc_q8_0_compatible()
+// test), so the guard could never fire once the exact path was on: Task P's
+// profile still shows ffn.f16_* at 48 calls/token. Task R re-keys both sites
+// through q38_hc_legacy_mix_skippable() and adds the guard the attn site was
+// missing (the attn site had none: with attn_f32_mix_active set, cur is still
+// nullptr at the legacy call, so the F16 mirror ran there too - 48 calls/token,
+// 6.2 ms/token).
+//
+// =0 restores the previous behaviour for A/B runs. The per-site switches
+// (WARODECODE_HC_SKIP_LEGACY_ATTN / _FFN) default to this value so a run can
+// A/B one bank at a time.
 inline bool q38_hc_skip_legacy_enabled() {
     static const bool enabled = q38_env_flag("WARODECODE_HC_SKIP_LEGACY", true);
+    return enabled;
+}
+
+inline bool q38_hc_skip_legacy_attn_enabled() {
+    static const bool enabled =
+        q38_env_flag("WARODECODE_HC_SKIP_LEGACY_ATTN", q38_hc_skip_legacy_enabled());
+    return enabled;
+}
+
+inline bool q38_hc_skip_legacy_ffn_enabled() {
+    static const bool enabled =
+        q38_env_flag("WARODECODE_HC_SKIP_LEGACY_FFN", q38_hc_skip_legacy_enabled());
     return enabled;
 }
 
@@ -130,6 +154,10 @@ inline void q38_hc_report_switches_once() {
                      q38_hc_gamma_resident_enabled() ? 1 : 0,
                      q38_hc_f32_gemv_warp_enabled() ? 1 : 0,
                      q38_hc_q8_down_dp4a_enabled() ? 1 : 0);
+        std::fprintf(stderr,
+                     "warodecode: HC mix Task R switches: skip_legacy_attn=%d skip_legacy_ffn=%d\n",
+                     q38_hc_skip_legacy_attn_enabled() ? 1 : 0,
+                     q38_hc_skip_legacy_ffn_enabled() ? 1 : 0);
         return true;
     }();
     (void)once;
@@ -909,6 +937,21 @@ public:
                 q38_hc_q8_0_compatible(layer.hc_attn) &&
                 qwen38_hc_f32_inject_enabled(layer.hc_attn) &&
                 !(trace && trace->state_trace && trace->debug_hc_full_q8_0_layer == il);
+            // Task R: the exact replay below rewrites st.hc_attn.mixed() and
+            // st.hc_attn.inject() - the two buffers the rest of the token reads -
+            // and run_qwen38_hc_combine_f32_inject() consumes the unrounded inject
+            // from the F32 scratch, so the legacy F16 pass computes the same row a
+            // second time and its result is overwritten immediately. The half
+            // mirrors that only it fills (st.hc_attn.xn() / .gate() / .lo()) are
+            // read by the trace/debug tooling alone, and a debug replay
+            // (debug_f32_hc_attn) leaves the half inject to the legacy pass, so
+            // both keep it. See q38_hc_skip_legacy_enabled().
+            const bool attn_skip_legacy = q38_hc_legacy_mix_skippable(
+                q38_hc_skip_legacy_attn_enabled(),
+                attn_f32_mix_active,
+                q38_hc_q8_0_compatible(layer.hc_attn) &&
+                    qwen38_hc_f32_inject_enabled(layer.hc_attn),
+                trace != nullptr || debug_f32_hc_attn);
             __half * cur = nullptr;
             bool attn_f32_inject = false;
             if (!attn_f32_mix_active && q38_hc_f32_enabled()) {
@@ -916,9 +959,12 @@ public:
                     state_.residual(), layer.hc_attn, hc_f32_scratch, st.hc_attn,
                     q.rms_eps, stream, kQ38HcSiteAttnF16Norm);
             }
-            if (cur == nullptr) {
-                // The legacy F16 path still runs first: it fills the F16 inject
-                // weights that run_qwen38_hc_combine consumes.
+            if (!attn_skip_legacy && cur == nullptr) {
+                // The legacy F16 path fills the half-typed st.hc_attn.inject()
+                // that run_qwen38_hc_combine() consumes whenever the F32 inject
+                // path is unavailable (quantised inject tensor, or
+                // WARODECODE_HC_INJECT_F32=0), and it is what the trace tooling
+                // reads for the half mirrors of xn / gate / lo.
                 cur = run_qwen38_hc_mix(
                     state_.residual(), layer.hc_attn, st.hc_attn, q.rms_eps, stream,
                     trace_hc_attn_projection ? hc_f32_scratch.low_raw() : nullptr,
@@ -948,6 +994,15 @@ public:
                         hc_f32_scratch.mixed(), st.hc_attn.mixed(), q.hidden);
                     cur = st.hc_attn.mixed();
                 }
+            }
+            if (attn_skip_legacy && !attn_f32_inject) {
+                // Fail closed: the skip is only sound while the exact replay is
+                // the F32-inject variant, which rewrites the half inject as well.
+                // If a future edit breaks that premise, run_qwen38_hc_combine()
+                // would silently consume the half inject left over from the
+                // previous layer - a wrong token instead of a raised error.
+                throw std::runtime_error(
+                    "HC attn legacy skip is active without the F32 inject mix");
             }
             if (trace_hc_attn_projection && il == 2) {
                 const std::string layer = "layer" + std::to_string(il) + ".hc_attn_";
@@ -2179,19 +2234,27 @@ public:
                     ffn_used_f32 = true;
                 }
             }
-            // Mirrors attn_f32_mix_active: when the exact Q8_0 replay is the one
-            // that will produce the mix row, the legacy F16 pass below is skipped
-            // entirely (it would be recomputed into the same scratch an instant
-            // later). With WARODECODE_HC_SKIP_LEGACY=0 the old order returns.
-            // The exact path must also be the one that produces the [hc] inject
+            // Task R: keyed on debug_hc_q8_0_ffn - the predicate that *selects*
+            // the exact replay below - and not on its negation as Task J did.
+            // !debug_hc_q8_0_ffn is false whenever the replay is on (its last
+            // clause is the default-on q38_hc_q8_0_compatible() test), so Task
+            // J's guard never fired and the legacy F16 pass kept running here
+            // (Task P: 48 calls/token, 6.2 ms/token).
+            // The exact replay must also be the one that writes the [hc] inject
             // row, otherwise the fallback combine (which reads the half-typed
-            // st.hc_ffn.inject()) would consume a stale buffer: the legacy pass
-            // is the only other writer. Quantised inject tensors (the blk.48 MTP
-            // block) and WARODECODE_HC_INJECT_F32=0 therefore keep the old order.
-            const bool ffn_exact_mix_active = q38_hc_q8_0_enabled() && !debug_hc_q8_0_ffn &&
-                q38_hc_q8_0_compatible(layer.hc_ffn) && q38_hc_skip_legacy_enabled() &&
-                qwen38_hc_f32_inject_enabled(layer.hc_ffn);
-            if (!ffn_used_f32 && !ffn_exact_mix_active) {
+            // st.hc_ffn.inject()) would consume a stale buffer: only the legacy
+            // pass and run_qwen38_hc_mix_f32_with_inject() write it. Quantised
+            // inject tensors (the blk.48 MTP block), WARODECODE_HC_INJECT_F32=0,
+            // an F32 debug replay (it fills only the half mixed row) and any
+            // attached trace therefore keep the old order.
+            // See q38_hc_skip_legacy_enabled().
+            const bool ffn_skip_legacy = q38_hc_legacy_mix_skippable(
+                q38_hc_skip_legacy_ffn_enabled(),
+                debug_hc_q8_0_ffn,
+                q38_hc_q8_0_compatible(layer.hc_ffn) &&
+                    qwen38_hc_f32_inject_enabled(layer.hc_ffn),
+                trace != nullptr || debug_f32_hc_ffn);
+            if (!ffn_used_f32 && !ffn_skip_legacy) {
                 cur = run_qwen38_hc_mix(
                     state_.residual(), layer.hc_ffn, st.hc_ffn, q.rms_eps, stream,
                     nullptr, nullptr, nullptr, nullptr, kQ38HcSiteFfnF16Norm);
@@ -2223,6 +2286,13 @@ public:
                 q38_float_to_half_kernel<<<blocks, 256, 0, stream>>>(
                     hc_f32_scratch.mixed(), st.hc_ffn.mixed(), q.hidden);
                 cur = st.hc_ffn.mixed();
+            }
+            if (ffn_skip_legacy && !ffn_f32_inject) {
+                // Fail closed: see the attn site. Without the F32-inject variant
+                // the half st.hc_ffn.inject() is the legacy pass's output and
+                // run_qwen38_hc_combine() is its only remaining reader.
+                throw std::runtime_error(
+                    "HC ffn legacy skip is active without the F32 inject mix");
             }
             if (trace && trace->state_trace && il == 8 &&
                 !trace->debug_layer8_hc_ffn_mix_f32.empty()) {

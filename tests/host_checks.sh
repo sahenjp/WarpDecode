@@ -70,6 +70,10 @@ bash tests/qwen38_hc_dp4a_host_check.sh
 # Task P: GDN の F32 GEMV を warp 並列化しても ggml_vec_dot_f32 順序が変わらないことを確認する
 bash tests/qwen38_gdn_f32_gemv_host_check.sh
 
+# Task R: HC mix の legacy F16 パスを attn/ffn 両サイトで安全に止められること
+# (述語の安全条件 + 実サイトがその述語を通っていること) を確認する
+bash tests/qwen38_hc_legacy_skip_host_check.sh
+
 # Task G: expert 統合 MoE の加算順序と index 対応が従来と bit 一致することを確認する
 bash tests/moe_fused_grid_host_check.sh
 
