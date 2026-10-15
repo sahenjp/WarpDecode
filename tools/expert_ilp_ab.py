@@ -23,7 +23,17 @@ SESSION = os.environ.get("WARODECODE_COLAB_SESSION", "warpdecode-a100")
 WORK = "/content/wd_taskl"
 SCRIPT = ROOT / "tests/expert_ilp_ab.sh"
 CASE = ROOT / "tests/ceiling_case.py"
+SRC = WORK + "/warodecode"
 RESULTS = ROOT / "issue1_artifacts/expert_ilp_ab.jsonl"
+
+BUILDER = """import subprocess, sys
+cmd = ["cmake", "--build", "%(src)s/build-sm80", "-j", "8", "--target", "warodecode"]
+print("+ " + " ".join(cmd), flush=True)
+r = subprocess.run(cmd, cwd="%(src)s", text=True, capture_output=True)
+print(r.stdout[-3000:])
+print(r.stderr[-3000:])
+print("BUILD_OK" if r.returncode == 0 else "BUILD_FAIL")
+""" % {"src": SRC}
 
 STARTER = """import pathlib, subprocess
 dst = pathlib.Path("/content/wd_taskl/expert_ilp_ab.sh")
@@ -51,8 +61,16 @@ def main() -> None:
         tmp_path = pathlib.Path(tmp)
         starter = tmp_path / "start.py"
         starter.write_text(STARTER)
+        builder = tmp_path / "build.py"
+        builder.write_text(BUILDER)
         run(CLI + ["upload", "-s", SESSION, str(SCRIPT), WORK + "_expert_ilp_ab.sh"], quiet=True)
         run(CLI + ["upload", "-s", SESSION, str(CASE), WORK + "/ceiling_case.py"], quiet=True)
+        run(CLI + ["upload", "-s", SESSION, str(ROOT / "src/lowbit.cuh"), SRC + "/src/lowbit.cuh"],
+            quiet=True)
+        build = run(CLI + ["exec", "-s", SESSION, "--timeout", "900", "-f", str(builder)])
+        if "BUILD_OK" not in build:
+            print(build[-3000:])
+            raise RuntimeError("the engine rebuild failed")
         if "STARTED" not in run(CLI + ["exec", "-s", SESSION, "--timeout", "300", "-f", str(starter)]):
             raise RuntimeError("the A/B did not start")
         status = tmp_path / "status.txt"

@@ -1827,7 +1827,7 @@ inline void launch_iq4_nl_gemv_q8_0_f32(
 inline int lowbit_expert_gemv_ilp() {
     static const int value = [] {
         const char * v = std::getenv("WARODECODE_EXPERT_GEMV_ILP");
-        if (v == nullptr || v[0] == '\0') return 0;
+        if (v == nullptr || v[0] == '\0') return 8;
         const int parsed = std::atoi(v);
         if (parsed <= 1) return 0;
         return parsed > 8 ? 8 : parsed;
@@ -2169,6 +2169,174 @@ inline bool launch_iq4_nl_gemv_q8_0_experts_f32_ilp(
     return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// Task W2: the IQ4_NL codebook in shared memory.
+//
+// tests/qwen38_expert_ilp_bench.cu measures the down projection at 80 us per
+// layer (10 experts, 9.2 MB) while the same kernel with the codebook expansion
+// replaced by the raw nibbles runs the identical load pattern in 13.7 us - 674
+// GB/s against 115 GB/s. The gap is the decode, not the memory: four
+// iq4_nl_lut_value() lookups per 32-value block, with a nibble index that
+// differs between lanes, so the compiler's constant-memory/select-tree form
+// costs far more than the loads it feeds.
+//
+// A 16-byte table in shared memory answers the same lookup with one LDS per
+// value. All lanes of a warp read the same 16-byte region, so the accesses are
+// broadcasts and cost no bank conflicts. The table is filled once per block
+// before the early return, exactly like the IQ2_S grid staging.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ unsigned lowbit_iq4_nl_pack4_smem(
+        unsigned nibbles, const int8_t * __restrict__ lut) {
+    return static_cast<unsigned>(static_cast<uint8_t>(lut[nibbles & 0x0fu])) |
+           (static_cast<unsigned>(static_cast<uint8_t>(lut[(nibbles >> 8) & 0x0fu])) << 8) |
+           (static_cast<unsigned>(static_cast<uint8_t>(lut[(nibbles >> 16) & 0x0fu])) << 16) |
+           (static_cast<unsigned>(static_cast<uint8_t>(lut[(nibbles >> 24) & 0x0fu])) << 24);
+}
+
+template <int ILP>
+__device__ __forceinline__ float iq4_nl_q8_0_act_row_dp4a_ilp_smem(
+        const uint8_t * __restrict__ w,
+        const int8_t * __restrict__ x_qs,
+        const __half * __restrict__ x_scales,
+        const int8_t * __restrict__ lut,
+        int row,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int lane_in_row = lane & 15;
+    const int chunk = lane_in_row & 7;
+    const int parity = lane_in_row >> 3;
+
+    const int blocks_per_row = cols >> 5;
+    const size_t row_stride = static_cast<size_t>(blocks_per_row) * 18u;
+    const uint8_t * row_ptr = w + static_cast<size_t>(row) * row_stride;
+    const int byte_base = (chunk & 3) * 4;
+    const bool high_nibble = chunk >= 4;
+
+    float accumulator = 0.0f;
+    int b = parity;
+    for (; b + 2 * (ILP - 1) < blocks_per_row; b += 2 * ILP) {
+        unsigned weights4[ILP];
+        unsigned activation4[ILP];
+        float block_scale[ILP];
+#pragma unroll
+        for (int u = 0; u < ILP; ++u) {
+            const int block = b + 2 * u;
+            const uint8_t * blk = row_ptr + static_cast<size_t>(block) * 18u;
+            block_scale[u] = lowbit_half(blk) * __half2float(x_scales[block]);
+            const uint8_t * qs = blk + 2 + byte_base;
+            const unsigned packed =
+                static_cast<unsigned>(*reinterpret_cast<const uint16_t *>(qs)) |
+                (static_cast<unsigned>(*reinterpret_cast<const uint16_t *>(qs + 2)) << 16);
+            const unsigned nibbles = high_nibble
+                ? ((packed >> 4) & 0x0f0f0f0fu)
+                : (packed & 0x0f0f0f0fu);
+            weights4[u] = lowbit_iq4_nl_pack4_smem(nibbles, lut);
+            activation4[u] = *reinterpret_cast<const unsigned *>(
+                x_qs + static_cast<size_t>(block) * 32u + static_cast<size_t>(chunk) * 4u);
+        }
+#pragma unroll
+        for (int u = 0; u < ILP; ++u) {
+            accumulator = fmaf(
+                block_scale[u],
+                static_cast<float>(lowbit_dp4a(
+                    static_cast<int>(activation4[u]), static_cast<int>(weights4[u]), 0)),
+                accumulator);
+        }
+    }
+    for (; b < blocks_per_row; b += 2) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(b) * 18u;
+        const float d = lowbit_half(blk) * __half2float(x_scales[b]);
+        const uint8_t * qs = blk + 2 + byte_base;
+        const unsigned packed =
+            static_cast<unsigned>(*reinterpret_cast<const uint16_t *>(qs)) |
+            (static_cast<unsigned>(*reinterpret_cast<const uint16_t *>(qs + 2)) << 16);
+        const unsigned nibbles = high_nibble
+            ? ((packed >> 4) & 0x0f0f0f0fu)
+            : (packed & 0x0f0f0f0fu);
+        const unsigned weights4 = lowbit_iq4_nl_pack4_smem(nibbles, lut);
+        const unsigned activation4 = *reinterpret_cast<const unsigned *>(
+            x_qs + static_cast<size_t>(b) * 32u + static_cast<size_t>(chunk) * 4u);
+        accumulator = fmaf(
+            d,
+            static_cast<float>(lowbit_dp4a(
+                static_cast<int>(activation4), static_cast<int>(weights4), 0)),
+            accumulator);
+    }
+
+    const float combined =
+        __fadd_rn(accumulator, __shfl_xor_sync(0xffffffffu, accumulator, 8));
+    const float r = __fadd_rn(combined, __shfl_down_sync(0xffffffffu, combined, 4));
+    const float s = __fadd_rn(r, __shfl_down_sync(0xffffffffu, r, 2));
+    return __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, 1));
+}
+
+template <int ILP>
+__global__ void iq4_nl_q8_0_act_gemv_experts_dp4a_smem_kernel(
+        const uint8_t * const * __restrict__ w_experts,
+        const int8_t * __restrict__ x_qs,
+        const __half * __restrict__ x_scales,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    __shared__ int8_t lut[16];
+    if (threadIdx.x < 16) {
+        lut[threadIdx.x] = static_cast<int8_t>(iq4_nl_lut_value(static_cast<uint8_t>(threadIdx.x)));
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int row_in_warp = lane >> 4;
+
+    const int output_row =
+        (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 2 + row_in_warp;
+    const int row = min(output_row, rows - 1);
+
+    const int activation = blockIdx.y;
+    const float value = iq4_nl_q8_0_act_row_dp4a_ilp_smem<ILP>(
+        w_experts[activation],
+        x_qs + static_cast<size_t>(activation) * static_cast<size_t>(cols),
+        x_scales + static_cast<size_t>(activation) * static_cast<size_t>(cols / 32),
+        lut, row, cols);
+    if ((lane & 15) != 0 || output_row >= rows) return;
+    y[static_cast<size_t>(activation) * static_cast<size_t>(rows) + output_row] = value;
+}
+
+inline bool launch_iq4_nl_gemv_q8_0_experts_f32_smem(
+        const uint8_t * const * w_experts,
+        int experts,
+        int rows,
+        int cols,
+        const int8_t * activation,
+        const __half * activation_scales,
+        float * output,
+        cudaStream_t stream,
+        int threads,
+        int ilp) {
+    if (!lowbit_dp4a_available()) return false;
+    if (experts <= 0 || experts > 65535 || rows <= 0 ||
+        cols <= 0 || cols % 64 != 0) {
+        throw std::runtime_error("IQ4_NL x Q8_0 expert-batched GEMV geometry mismatch");
+    }
+    if (threads < 32 || threads % 32 != 0) {
+        throw std::runtime_error("IQ4_NL x Q8_0 expert-batched GEMV threads must be a multiple of 32");
+    }
+    constexpr int rows_per_warp = 2;
+    const int warps = threads / 32;
+    const dim3 grid((rows + warps * rows_per_warp - 1) / (warps * rows_per_warp), experts);
+    if (ilp == 4) {
+        iq4_nl_q8_0_act_gemv_experts_dp4a_smem_kernel<4><<<grid, threads, 0, stream>>>(
+            w_experts, activation, activation_scales, output, rows, cols);
+    } else if (ilp == 8) {
+        iq4_nl_q8_0_act_gemv_experts_dp4a_smem_kernel<8><<<grid, threads, 0, stream>>>(
+            w_experts, activation, activation_scales, output, rows, cols);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Task G: expert-batched launchers.
 //
@@ -2199,7 +2367,9 @@ inline bool launch_iq2_s_gemv_q8_k_experts_f32(
     if (threads < 32 || threads % 32 != 0) {
         throw std::runtime_error("IQ2_S x Q8_K expert-batched GEMV threads must be a multiple of 32");
     }
-    const int ilp = lowbit_expert_gemv_ilp();
+    // Bare ILP is worth ~5% on this kernel and ILP=4 is its optimum (ILP=8
+    // regresses to the sequential speed), so the requested depth is capped.
+    const int ilp = lowbit_expert_gemv_ilp() > 4 ? 4 : lowbit_expert_gemv_ilp();
     if (ilp >= 2 && launch_iq2_s_gemv_q8_k_experts_f32_ilp(
             w_experts, experts, rows, cols, activation, activation_scales, output,
             stream, threads, ilp)) {
@@ -2273,10 +2443,17 @@ inline bool launch_iq4_nl_gemv_q8_0_experts_f32(
         throw std::runtime_error("IQ4_NL x Q8_0 expert-batched GEMV threads must be a multiple of 32");
     }
     const int ilp = lowbit_expert_gemv_ilp();
-    if (ilp >= 2 && launch_iq4_nl_gemv_q8_0_experts_f32_ilp(
-            w_experts, experts, rows, cols, activation, activation_scales, output,
-            stream, threads, ilp)) {
-        return true;
+    if (ilp >= 2) {
+        if (launch_iq4_nl_gemv_q8_0_experts_f32_smem(
+                w_experts, experts, rows, cols, activation, activation_scales, output,
+                stream, threads, ilp)) {
+            return true;
+        }
+        if (launch_iq4_nl_gemv_q8_0_experts_f32_ilp(
+                w_experts, experts, rows, cols, activation, activation_scales, output,
+                stream, threads, ilp)) {
+            return true;
+        }
     }
     constexpr int rows_per_warp = 2;
     const int warps = threads / 32;

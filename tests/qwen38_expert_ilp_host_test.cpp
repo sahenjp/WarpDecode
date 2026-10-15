@@ -81,6 +81,29 @@ int8_t iq4_lut(uint8_t nibble) {
     return lut[nibble & 0x0f];
 }
 
+// The shared-memory kernel (Task W2) fills
+//   lut[i] = (int8_t)iq4_nl_lut_value((uint8_t)i)      for i in 0..15
+// and then reads lut[nibble] instead of going through the codebook switch. i is
+// already in 0..15, so iq4_nl_lut_value(i) is lut[i] and pack4_smem has to equal
+// pack4 for every 4-nibble group; the loop in main() checks all 65536 of them.
+uint32_t pack4_codebook(uint32_t nibbles) {
+    uint32_t out = 0;
+    for (int i = 0; i < 4; ++i) {
+        out |= static_cast<uint32_t>(static_cast<uint8_t>(
+                   iq4_lut(static_cast<uint8_t>((nibbles >> (8 * i)) & 0x0fu)))) << (8 * i);
+    }
+    return out;
+}
+
+uint32_t pack4_shared_lut(uint32_t nibbles, const int8_t * lut) {
+    uint32_t out = 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint8_t nibble = static_cast<uint8_t>((nibbles >> (8 * i)) & 0x0fu);
+        out |= static_cast<uint32_t>(static_cast<uint8_t>(lut[nibble])) << (8 * i);
+    }
+    return out;
+}
+
 // The reference reads the activation scale as a half.
 float iq4_scale_i8(const int8_t * act_scales) {
     uint16_t h = 0;
@@ -336,6 +359,25 @@ int main() {
                                          20, 0, 0, 4);
             check(!same_iq4(ref, got), "IQ4_NL positive control did not change the chain");
         }
+    }
+
+    // Task W2: the shared-memory codebook is a copy of the constexpr table, so
+    // the expansion it feeds to __dp4a must be identical for every input.
+    {
+        int8_t lut[16];
+        for (int i = 0; i < 16; ++i) {
+            lut[i] = static_cast<int8_t>(iq4_lut(static_cast<uint8_t>(i)));
+        }
+        int mismatched = 0;
+        for (uint32_t n = 0; n < 65536u; ++n) {
+            if (pack4_codebook(n) != pack4_shared_lut(n, lut)) ++mismatched;
+        }
+        check(mismatched == 0, "shared-memory codebook differs from the constexpr table");
+        check(pack4_shared_lut(0x00000000u, lut) == pack4_codebook(0x00000000u),
+              "shared-memory codebook nibble 0");
+        check(pack4_shared_lut(0x0f0f0f0fu, lut) == pack4_codebook(0x0f0f0f0fu),
+              "shared-memory codebook nibble 15");
+        std::printf("shared-LUT 4-nibble groups compared: 65536\n");
     }
 
     // IQ2_S gate/up: 10 superblocks per row of 2560 columns.
