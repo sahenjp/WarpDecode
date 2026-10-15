@@ -70,6 +70,10 @@ bash tests/qwen38_hc_dp4a_host_check.sh
 # Task P: GDN の F32 GEMV を warp 並列化しても ggml_vec_dot_f32 順序が変わらないことを確認する
 bash tests/qwen38_gdn_f32_gemv_host_check.sh
 
+# Task V: Q8_0 x Q8_0 exact GEMV を PIPE 段のソフトウェアパイプラインにしても
+# float 加算順序が変わらないこと (短い行・末尾のクランプ・スカラーテールを含む) を確認する
+bash tests/qwen38_hc_q8_pipe_host_check.sh
+
 # Task R: HC mix の legacy F16 パスを attn/ffn 両サイトで安全に止められること
 # (述語の安全条件 + 実サイトがその述語を通っていること) を確認する
 bash tests/qwen38_hc_legacy_skip_host_check.sh

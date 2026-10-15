@@ -534,6 +534,128 @@ __global__ void q38_hc_q8_0_q8_0_exact_gemv_f32_kernel(
     if (lane == 0) output[row] = __fadd_rn(s0, s1);
 }
 
+// ---------------------------------------------------------------------------
+// Task V: PIPE-deep software pipeline of the dp4a kernel above.
+//
+// The per-token profile (docs/CEILING.md) showed that the shipped kernel spends
+// almost exactly one memory round trip per block, i.e. the loads for block b+1
+// are not issued until the FMA of block b has consumed its operands. The
+// accumulators cannot be reassociated (the reference order is one
+// __fmaf_rn(scale_b, dot_b, acc) per block), so the only legal headroom is
+// memory-level parallelism: fetch the operands of the next PIPE blocks into
+// registers before issuing that many FMAs.
+//
+// Same loads, same __dp4a, same __fmaf_rn chain, same closing tree as
+// q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_kernel(); the register file is the only
+// thing that changes. Long rows (the [320, 10240] down projection) gain ~1.5x,
+// short rows lose a few percent, so the launcher only takes this path when the
+// row is at least kQ38HcQ8PipeMinBlocks blocks long.
+// ---------------------------------------------------------------------------
+constexpr int kQ38HcQ8PipeMinBlocks = 32;
+// ...and only while the row count leaves the SMs underfilled. A 8192-row
+// projection already has 76 warps per SM and hides the latency by itself; there
+// the pipeline's extra registers and prefetch instructions are a 23-32% loss
+// (measured on A100: [8192, 2560] 41.1 -> 55.5 us, [2560, 6144] 29.3 -> 37.8 us
+// with the pipeline enabled). Below the threshold the same kernel is 1.2-1.4x
+// faster than the plain dp4a kernel.
+constexpr int kQ38HcQ8PipeMaxRows = 1024;
+
+template <int PIPE>
+__global__ void q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_pipe_kernel(
+        const uint8_t * __restrict__ weight,
+        const int8_t * __restrict__ activation,
+        const __half * __restrict__ activation_scales,
+        float * __restrict__ output,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    if (row >= rows) return;
+
+    const int blocks_per_row = cols >> 5;
+    const uint8_t * row_ptr =
+        weight + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) * 34u;
+    float accumulator = 0.0f;
+    if (lane < 8) {
+        const int base = lane << 2;
+        unsigned packed[PIPE];
+        int act[PIPE];
+        float scale[PIPE];
+        const int prime = blocks_per_row < PIPE ? blocks_per_row : PIPE;
+#pragma unroll
+        for (int k = 0; k < PIPE; ++k) {
+            const int b = k < prime ? k : prime - 1;
+            const uint8_t * block = row_ptr + static_cast<size_t>(b) * 34u;
+            const uint16_t * w16 = reinterpret_cast<const uint16_t *>(block + 2 + base);
+            packed[k] = static_cast<unsigned>(w16[0]) | (static_cast<unsigned>(w16[1]) << 16);
+            act[k] = *reinterpret_cast<const int *>(
+                activation + static_cast<size_t>(b) * 32u + static_cast<size_t>(base));
+            scale[k] = __fmul_rn(lowbit_half(block), __half2float(activation_scales[b]));
+        }
+        int b = 0;
+        while (b + PIPE <= blocks_per_row) {
+            unsigned next_packed[PIPE];
+            int next_act[PIPE];
+            float next_scale[PIPE];
+            // Clamping the read index keeps every load inside this row, so the
+            // last row of the matrix cannot run past the allocation. The value
+            // is never consumed: this window is only used when the loop repeats.
+#pragma unroll
+            for (int k = 0; k < PIPE; ++k) {
+                const int nb = b + PIPE + k;
+                const int cb = nb < blocks_per_row ? nb : blocks_per_row - 1;
+                const uint8_t * block = row_ptr + static_cast<size_t>(cb) * 34u;
+                const uint16_t * w16 = reinterpret_cast<const uint16_t *>(block + 2 + base);
+                next_packed[k] = static_cast<unsigned>(w16[0]) | (static_cast<unsigned>(w16[1]) << 16);
+                next_act[k] = *reinterpret_cast<const int *>(
+                    activation + static_cast<size_t>(cb) * 32u + static_cast<size_t>(base));
+                next_scale[k] = __fmul_rn(lowbit_half(block), __half2float(activation_scales[cb]));
+            }
+#pragma unroll
+            for (int k = 0; k < PIPE; ++k) {
+                const int dot = lowbit_dp4a(act[k], static_cast<int>(packed[k]), 0);
+                accumulator = __fmaf_rn(scale[k], static_cast<float>(dot), accumulator);
+            }
+#pragma unroll
+            for (int k = 0; k < PIPE; ++k) {
+                packed[k] = next_packed[k];
+                act[k] = next_act[k];
+                scale[k] = next_scale[k];
+            }
+            b += PIPE;
+        }
+        for (; b < blocks_per_row; ++b) {
+            const uint8_t * block = row_ptr + static_cast<size_t>(b) * 34u;
+            const uint16_t * w16 = reinterpret_cast<const uint16_t *>(block + 2 + base);
+            const unsigned pk = static_cast<unsigned>(w16[0]) | (static_cast<unsigned>(w16[1]) << 16);
+            const int aq = *reinterpret_cast<const int *>(
+                activation + static_cast<size_t>(b) * 32u + static_cast<size_t>(base));
+            const int dot = lowbit_dp4a(aq, static_cast<int>(pk), 0);
+            accumulator = __fmaf_rn(
+                __fmul_rn(lowbit_half(block), __half2float(activation_scales[b])),
+                static_cast<float>(dot), accumulator);
+        }
+    }
+
+    const float a0 = __shfl_sync(0xffffffffu, accumulator, 0);
+    const float a1 = __shfl_sync(0xffffffffu, accumulator, 1);
+    const float a2 = __shfl_sync(0xffffffffu, accumulator, 2);
+    const float a3 = __shfl_sync(0xffffffffu, accumulator, 3);
+    const float a4 = __shfl_sync(0xffffffffu, accumulator, 4);
+    const float a5 = __shfl_sync(0xffffffffu, accumulator, 5);
+    const float a6 = __shfl_sync(0xffffffffu, accumulator, 6);
+    const float a7 = __shfl_sync(0xffffffffu, accumulator, 7);
+    const float r0 = __fadd_rn(a4, a0);
+    const float r1 = __fadd_rn(a5, a1);
+    const float r2 = __fadd_rn(a6, a2);
+    const float r3 = __fadd_rn(a7, a3);
+    const float s0 = __fadd_rn(r0, r2);
+    const float s1 = __fadd_rn(r1, r3);
+    if (lane == 0) output[row] = __fadd_rn(s0, s1);
+}
+
 __device__ inline float q38_hc_ggml_avx2_exp_f32(float x) {
     constexpr float r = 0x1.8p23f;
     const float z = __fmaf_rn(x, 0x1.715476p+0f, r);
@@ -881,8 +1003,16 @@ inline bool q38_hc_q8_down_dp4a_enabled() {
     return enabled;
 }
 
-// One-warp-per-row dispatch for the exact Q8_0 x Q8_0 dot. Both kernels below
-// accumulate in the same order, so the switch is a pure speed A/B.
+// Task V (WARODECODE_HC_Q8_PIPE, default ON): the PIPE-deep dp4a kernel above.
+// Long rows are memory-latency bound with one round trip per block, so fetching
+// the next PIPE blocks' operands before issuing the FMAs is the whole win.
+inline bool q38_hc_q8_pipe_enabled() {
+    static const bool enabled = q38_hc_env_flag("WARODECODE_HC_Q8_PIPE", true);
+    return enabled;
+}
+
+// One-warp-per-row dispatch for the exact Q8_0 x Q8_0 dot. All three kernels
+// below accumulate in the same order, so the switch is a pure speed A/B.
 inline void q38_hc_launch_exact_q8_0_gemv_f32(
         const uint8_t * weight,
         const int8_t * activation,
@@ -895,6 +1025,12 @@ inline void q38_hc_launch_exact_q8_0_gemv_f32(
     constexpr int warps = threads / 32;
     const int blocks = (rows + warps - 1) / warps;
     if (q38_hc_q8_down_dp4a_enabled() && cols % 32 == 0) {
+        if (q38_hc_q8_pipe_enabled() && (cols >> 5) >= kQ38HcQ8PipeMinBlocks &&
+            rows <= kQ38HcQ8PipeMaxRows) {
+            q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_pipe_kernel<16><<<blocks, threads, 0, stream>>>(
+                weight, activation, activation_scales, output, rows, cols);
+            return;
+        }
         q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_kernel<<<blocks, threads, 0, stream>>>(
             weight, activation, activation_scales, output, rows, cols);
         return;
@@ -1021,6 +1157,82 @@ __global__ void q38_hc_dense_gemv_f32_avx2_warp_kernel(
     }
 }
 
+// Task V: PIPE-deep form of q38_hc_dense_gemv_f32_avx2_warp_kernel().
+//
+// The inject projection is [hc, hc * n_embd] = [4, 10240] for the pinned model,
+// so the warp kernel launches four warps in total and each of them walks 320
+// steps of a serial __fmaf_rn chain. Measured at 5.9 GB/s. The FMA chain itself
+// cannot be shortened, but the two loads of step i+1 do not depend on step i, so
+// issuing PIPE of them ahead of the chain turns the walk into a pipelined one.
+// Same loads, same __fmaf_rn order, same closing shuffle tree.
+template <int PIPE>
+__global__ void q38_hc_dense_gemv_f32_avx2_warp_pipe_kernel(
+        const float * __restrict__ w,
+        const float * __restrict__ x,
+        float * __restrict__ y,
+        int rows,
+        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+
+    const int j = lane >> 3;
+    const int l = lane & 7;
+    const float * row_ptr = w + static_cast<size_t>(row) * static_cast<size_t>(cols);
+    const int steps = cols >> 5;
+
+    float acc = 0.0f;
+    float weight[PIPE];
+    float value[PIPE];
+    const int prime = steps < PIPE ? steps : PIPE;
+#pragma unroll
+    for (int k = 0; k < PIPE; ++k) {
+        const int s = k < prime ? k : prime - 1;
+        const int c = s * 32 + j * 8 + l;
+        weight[k] = row_ptr[c];
+        value[k] = x[c];
+    }
+    int s = 0;
+    while (s + PIPE <= steps) {
+        float next_weight[PIPE];
+        float next_value[PIPE];
+#pragma unroll
+        for (int k = 0; k < PIPE; ++k) {
+            const int ns = s + PIPE + k;
+            const int cs = ns < steps ? ns : steps - 1;
+            const int c = cs * 32 + j * 8 + l;
+            next_weight[k] = row_ptr[c];
+            next_value[k] = x[c];
+        }
+#pragma unroll
+        for (int k = 0; k < PIPE; ++k) acc = __fmaf_rn(weight[k], value[k], acc);
+#pragma unroll
+        for (int k = 0; k < PIPE; ++k) {
+            weight[k] = next_weight[k];
+            value[k] = next_value[k];
+        }
+        s += PIPE;
+    }
+    for (; s < steps; ++s) {
+        const int c = s * 32 + j * 8 + l;
+        acc = __fmaf_rn(row_ptr[c], x[c], acc);
+    }
+
+    acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, 16));
+    const float r1 = __shfl_sync(0xffffffffu, acc, (lane & 7) + 8);
+    if (lane < 8) acc = __fadd_rn(acc, r1);
+    const float r4 = __shfl_sync(0xffffffffu, acc, (lane & 3) + 4);
+    if (lane < 4) acc = __fadd_rn(acc, r4);
+    const float t1 = __shfl_sync(0xffffffffu, acc, 1);
+    const float t2 = __shfl_sync(0xffffffffu, acc, 2);
+    const float t3 = __shfl_sync(0xffffffffu, acc, 3);
+    if (lane == 0) {
+        const float h0 = __fadd_rn(acc, t1);
+        const float h1 = __fadd_rn(t2, t3);
+        y[row] = __fadd_rn(h0, h1);
+    }
+}
+
 // One ggml_vec_dot_f32 per row of the F32 inject weight, one thread per row.
 __global__ void q38_hc_dense_gemv_f32_avx2_kernel(
         const float * __restrict__ w,
@@ -1073,6 +1285,11 @@ inline void q38_hc_launch_dense_gemv_f32(
             // row as well: the HC inject weight has hc = 4 rows, and giving each
             // row its own block spreads them over four SMs instead of one.
             constexpr int warps = 1;
+            if (q38_hc_q8_pipe_enabled()) {
+                q38_hc_dense_gemv_f32_avx2_warp_pipe_kernel<16><<<
+                    (rows + warps - 1) / warps, warps * 32, 0, stream>>>(w, x, y, rows, cols);
+                return;
+            }
             q38_hc_dense_gemv_f32_avx2_warp_kernel<<<(rows + warps - 1) / warps, warps * 32, 0, stream>>>(
                 w, x, y, rows, cols);
             return;

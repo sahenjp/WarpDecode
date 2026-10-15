@@ -1480,6 +1480,20 @@ inline void q38_moe_quantize_activation_q8_0(
         input, elements, quantized, scales);
 }
 
+// Task V (WARODECODE_SHEXP_GEMV_FAST, default ON).
+//
+// The shared expert's gate/up/down projections are Q8_0 x Q8_0 with exactly the
+// layout the HC mix / GDN / QSA projections use, but this call site kept the
+// scalar kernel while every other caller already went through
+// q38_hc_launch_exact_q8_0_gemv_f32(), which selects the dp4a and pipelined
+// twins. The three kernels accumulate in the same order, so the switch is a
+// pure speed A/B: measured 32.4 -> 8.5 us for [640, 2560] and 14.4 -> 6.2 us for
+// [2560, 640] on A100 (tests/qwen38_hc_gemv_bench.cu).
+inline bool q38_moe_shexp_gemv_fast_enabled() {
+    static const bool enabled = q38_moe_env_flag("WARODECODE_SHEXP_GEMV_FAST", true);
+    return enabled;
+}
+
 // Q8_0 weight x Q8_0 activation integer dot with an F32 output, in the same
 // accumulation order the ggml SIMD kernels use.
 inline void q38_moe_gemv_q8_0_exact(
@@ -1488,6 +1502,12 @@ inline void q38_moe_gemv_q8_0_exact(
         const __half * activation_scales,
         float * output,
         cudaStream_t stream) {
+    if (q38_moe_shexp_gemv_fast_enabled()) {
+        q38_hc_launch_exact_q8_0_gemv_f32(
+            weights.data, activation, activation_scales, output,
+            weights.rows, weights.cols, stream);
+        return;
+    }
     constexpr int threads = 256;
     constexpr int warps = threads / 32;
     const int blocks = (weights.rows + warps - 1) / warps;
