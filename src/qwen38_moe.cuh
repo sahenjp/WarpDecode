@@ -2335,9 +2335,9 @@ inline void q38_moe_select_experts_f32_x(
 
     {
         Q38MoeKernelScope topk_scope(kQ38MoeSiteRouterTopk, stream);
-        q38_topk_softmax_kernel<<<1, 1, 0, stream>>>(
+        q38_launch_topk_softmax(
             scratch.d_logits(), scratch.n_experts(), scratch.k(), expert_scale,
-            scratch.d_ids(), scratch.d_weights());
+            scratch.d_ids(), scratch.d_weights(), stream);
     }
 
     cudaError_t e = cudaSuccess;

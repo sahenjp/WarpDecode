@@ -357,6 +357,192 @@ date -u
 echo STEP_E_DONE
 """
 
+EMIT3 = '''#!/usr/bin/env python3
+"""Merge one interleaved A/B (ab3) run into the results jsonl."""
+import json, pathlib, sys
+
+label, kind, round_s, wall_s, max_vram, max_apps, pids, outfile, results = sys.argv[1:10]
+ref = json.loads(pathlib.Path("${WORK}/reference_tokens_64.json").read_text())["token_ids"]
+text = pathlib.Path(outfile).read_text(errors="replace")
+rec = {
+    "label": label,
+    "kind": kind,
+    "round": int(round_s),
+    "wall_s": float(wall_s),
+    "max_vram_mib": int(max_vram) if max_vram.isdigit() else None,
+    "max_gpu_apps": int(max_apps) if max_apps.isdigit() else None,
+    "gpu_app_pids": sorted({p for p in pids.split() if p}),
+}
+if kind == "engine":
+    rows = [json.loads(l) for l in text.splitlines() if l.startswith('{"engine":"warodecode-qwen38"')]
+    if not rows:
+        print("NO_ENGINE_JSON"); sys.exit(1)
+    j = rows[-1]
+    for key in ("tok_s", "decode_seconds", "decode_tokens", "seconds", "bench_repeats", "ctx",
+                "cuda_graph", "head_q8_k", "kernel_family"):
+        rec[key] = j.get(key)
+    rec["reps_tok_s"] = [j.get("tok_s")]
+    ids = j.get("token_ids", [])
+else:
+    rows = [json.loads(l.split("=", 1)[1]) for l in text.splitlines() if l.startswith("LLAMA_AB=")]
+    if not rows:
+        print("NO_LLAMA_JSON"); sys.exit(1)
+    rec["reps_tok_s"] = [r["tok_s"] for r in rows]
+    rec["reps_seconds"] = [r["decode_seconds"] for r in rows]
+    j = rows[-1]
+    for key in ("n_gpu_layers", "moe_cpu_layers", "load_mode", "threads", "ctx", "ctx_seconds"):
+        rec[key] = j.get(key)
+    # best-of-N over the in-process repetitions, symmetric with the engine's
+    # --bench-repeat (which also reports its fastest repeat)
+    rec["tok_s"] = min(rec["reps_tok_s"])
+    rec["tok_s_last"] = rec["reps_tok_s"][-1]
+    rec["decode_seconds"] = min(rec["reps_seconds"])
+    rec["decode_tokens"] = j.get("decode_tokens")
+    ids = j.get("token_ids", [])
+pref = next((i for i, (a, b) in enumerate(zip(ref, ids)) if a != b), min(len(ref), len(ids)))
+rec["matched_prefix"] = pref
+rec["token_match"] = (pref == len(ref))
+with pathlib.Path(results).open("a") as handle:
+    handle.write(json.dumps(rec) + chr(10))
+print(json.dumps(rec))
+'''
+
+STEP_AB3 = """#!/bin/bash
+# Interleaved A/B with a GPU-emptiness guard before every run.
+#
+#   TASKL_ROUNDS  rounds (default 3); even rounds run the pairs in reverse order
+#   TASKL_REPS    repetitions inside one process (default 3)
+#   TASKL_CACHES  engine expert cache MiB, paired position by position with ...
+#   TASKL_KS      llama.cpp --keep-moe-gpu-last values (VRAM budget pairing)
+W=${WORK}
+R=$W/ab3
+mkdir -p $R
+LOG=$W/stepAB3.log
+exec > "$LOG" 2>&1
+set -x
+date -u
+MODEL=${MODEL}
+ENGINE=$W/warodecode/build-sm${ARCH}/warodecode
+LLAMA=$W/llama.cpp/build-cuda-sm${ARCH}/bin/taskl-llama-decode
+EMIT=$W/taskl_ab3_emit.py
+RESULTS=$R/taskl_ab3.jsonl
+ROUNDS=${TASKL_ROUNDS:-3}
+REPS=${TASKL_REPS:-3}
+CACHES=${TASKL_CACHES:-8000,20000,30000}
+KS=${TASKL_KS:-0,16,24}
+: > "$RESULTS"
+md5sum $LLAMA $ENGINE
+nvidia-smi --query-gpu=name,memory.total,memory.used,clocks.sm,clocks.max.sm,power.draw --format=csv,noheader
+[ -f $W/engine_revision.txt ] && cat $W/engine_revision.txt
+
+maxvram() { sort -n "$1" 2>/dev/null | tail -1; }
+gpu_apps() { nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ' | grep -v '^$'; }
+
+wait_gpu_free() {
+  local waited=0
+  while [ "$waited" -lt 1800 ]; do
+    local a=$(gpu_apps | paste -sd, -)
+    if [ -z "$a" ]; then echo "GPU_FREE waited_s=$waited"; return 0; fi
+    echo "GPU_WAIT foreign=$a waited_s=$waited"; sleep 15; waited=$((waited+15))
+  done
+  echo "GPU_BUSY_TIMEOUT"; return 1
+}
+
+run_one() {   # run_one <label> <kind> <round> <command...>
+  local label=$1; shift
+  local kind=$1; shift
+  local rnd=$1; shift
+  local out=$R/${label}_r${rnd}.out
+  local samples=$R/${label}_r${rnd}.vram
+  local procs=$R/${label}_r${rnd}.procs
+  local stop=$R/${label}_r${rnd}.stop
+  if ! wait_gpu_free; then echo "SKIP $label r$rnd (GPU stayed busy)"; return 1; fi
+  rm -f "$stop"; : > "$samples"; : > "$procs"
+  ( while [ ! -f "$stop" ]; do
+      nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits >> "$samples"
+      nvidia-smi --query-compute-apps=pid --format=csv,noheader >> "$procs"
+      sleep 1
+    done ) &
+  local sampler=$!
+  local t0=$(date +%s.%N)
+  "$@" > "$out" 2> $R/${label}_r${rnd}.err
+  local rc=$?
+  local t1=$(date +%s.%N)
+  touch "$stop"; wait $sampler 2>/dev/null
+  local wall=$(echo "$t1 - $t0" | bc)
+  local maxapps=$(sort -n $procs 2>/dev/null | tail -1)
+  echo "RUN $label round=$rnd rc=$rc wall_s=$wall max_vram_mib=$(maxvram $samples) max_gpu_apps=$maxapps pids=$(sort -u $procs | paste -sd, -)"
+  if [ "$rc" -ne 0 ]; then echo "FAILED $label r$rnd"; tail -5 $R/${label}_r${rnd}.err; return 1; fi
+  python3 "$EMIT" "$label" "$kind" "$rnd" "$wall" "$(maxvram $samples)" "$maxapps" "$(sort -u $procs | paste -sd' ' -)" "$out" "$RESULTS"
+}
+
+engine_run() { local label=$1 rnd=$2 mib=$3
+  run_one "$label" engine "$rnd" env WARODECODE_EXPERT_CACHE_MIB=$mib $ENGINE --model $MODEL --ctx 128 --device 0 --start-token 1 --no-graph --no-autotune --generate 64 --bench-repeat $REPS
+}
+llama_run() { local label=$1 rnd=$2 k=$3
+  run_one "$label" llama "$rnd" $LLAMA $MODEL 128 64 99 --keep-moe-gpu-last $k --threads 12 --reps $REPS
+}
+
+IFS=',' read -ra CA <<< "$CACHES"
+IFS=',' read -ra KA <<< "$KS"
+[ "${#CA[@]}" = "${#KA[@]}" ] || { echo "CACHES/KS length mismatch"; echo STEP_AB3_DONE; exit 1; }
+
+for rnd in $(seq 1 $ROUNDS); do
+  echo "===== ROUND $rnd ====="
+  if [ $((rnd % 2)) -eq 0 ]; then
+    for ((i=${#CA[@]}-1; i>=0; i--)); do
+      llama_run "llama_k${KA[$i]}" $rnd "${KA[$i]}"
+      engine_run "engine_${CA[$i]}" $rnd "${CA[$i]}"
+    done
+  else
+    for ((i=0; i<${#CA[@]}; i++)); do
+      engine_run "engine_${CA[$i]}" $rnd "${CA[$i]}"
+      llama_run "llama_k${KA[$i]}" $rnd "${KA[$i]}"
+    done
+  fi
+done
+nvidia-smi --query-gpu=name,memory.used --format=csv,noheader
+date -u
+echo STEP_AB3_DONE
+"""
+
+
+def phase_ab3(args):
+    with tempfile.TemporaryDirectory(prefix="taskl-") as tmp:
+        tmp_path = pathlib.Path(tmp)
+        emit_path = tmp_path / "taskl_ab3_emit.py"
+        emit_path.write_text(render(EMIT3))
+        upload(emit_path, WORK + "/taskl_ab3_emit.py")
+        script = (render(STEP_AB3)
+                  .replace("${TASKL_ROUNDS:-3}", "${TASKL_ROUNDS:-%d}" % args.rounds)
+                  .replace("${TASKL_REPS:-3}", "${TASKL_REPS:-%d}" % args.reps)
+                  .replace("${TASKL_CACHES:-8000,20000,30000}", "${TASKL_CACHES:-%s}" % args.engine_caches)
+                  .replace("${TASKL_KS:-0,16,24}", "${TASKL_KS:-%s}" % args.llama_ks))
+        local = tmp_path / "taskl_stepAB3.sh"
+        local.write_text(script)
+        upload(local, WORK + "_taskl_stepAB3.sh")
+    launch("taskl_stepAB3.sh", "stepAB3.log")
+    return wait_for_log(WORK + "/stepAB3.log", pathlib.Path("/tmp/taskl_stepAB3.log"),
+                        "STEP_AB3_DONE", args.timeout, "ab3")
+
+
+def collect_ab3(args):
+    local = RESULT_JSONL.parent / "taskl_ab3_results.jsonl"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    download(WORK + "/ab3/taskl_ab3.jsonl", local)
+    if not local.exists():
+        print("no ab3 results yet")
+        return
+    rows = [json.loads(l) for l in local.read_text().splitlines() if l.strip()]
+    print("")
+    print("%-16s %5s %8s %9s %8s %7s %s" % ("label", "round", "tok/s", "decode_s", "wall_s", "vram", "match"))
+    for row in rows:
+        print("%-16s %5s %8.3f %9.3f %8.1f %7s %d/64" % (
+            row["label"], row["round"], row["tok_s"], row["decode_seconds"], row["wall_s"],
+            row["max_vram_mib"] if row["max_vram_mib"] is not None else "-", row["matched_prefix"]))
+
+
+
 def run(cmd, quiet=False):
     proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if not quiet:
@@ -375,30 +561,51 @@ def download(remote, local):
                    text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def exec_file(path):
-    run(CLI + ["exec", "-s", SESSION, "--timeout", "300", "-f", str(path)], quiet=True)
+def exec_file(path, quiet=True):
+    return run(CLI + ["exec", "-s", SESSION, "--timeout", "300", "-f", str(path)], quiet=quiet)
 
 
 def exec_inline(code):
-    run(CLI + ["exec", "-s", SESSION, "--timeout", "120", "-c", code], quiet=True)
+    # google-colab-cli has no "exec -c" in the pinned version, so every snippet
+    # goes through a temporary file (the CLI uploads it and runs it in the VM).
+    with tempfile.TemporaryDirectory(prefix="taskl-inline-") as tmp:
+        path = pathlib.Path(tmp) / "inline_snippet.py"
+        path.write_text(code)
+        exec_file(path)
 
 
-def launch(shell_name, log_name):
+def launch(shell_name, log_name, attempts=3):
+    """Start the detached shell on the VM and confirm that it really started.
+
+    A second client on the same Colab session can cut an exec short between the
+    log cleanup and the Popen, so the starter's "STARTED" line is required and
+    the launch is retried when it is missing.
+    """
     starter = pathlib.Path(tempfile.mkdtemp(prefix="taskl-launch-")) / "start.py"
-    starter.write_text(
-        "import subprocess, pathlib\\n"
-        "dst = pathlib.Path(%r)\\n"
-        "dst.write_text(pathlib.Path(%r).read_text()); dst.chmod(0o755)\\n"
-        "pathlib.Path(%r).unlink(missing_ok=True)\\n"
-        "p = subprocess.Popen(['bash', str(dst)], start_new_session=True)\\n"
-        "pathlib.Path(%r).write_text(str(p.pid))\\n"
-        "print('STARTED', p.pid)\\n"
-        % (WORK + "/" + shell_name, WORK + "_" + shell_name, WORK + "/" + log_name,
-           WORK + "/" + shell_name.replace(".sh", ".pid")))
-    exec_file(starter)
+    lines = [
+        "import subprocess, pathlib",
+        "dst = pathlib.Path(%r)" % (WORK + "/" + shell_name),
+        "dst.write_text(pathlib.Path(%r).read_text()); dst.chmod(0o755)" % (WORK + "_" + shell_name),
+        "pathlib.Path(%r).unlink(missing_ok=True)" % (WORK + "/" + log_name),
+        "p = subprocess.Popen(['bash', str(dst)], start_new_session=True)",
+        "pathlib.Path(%r).write_text(str(p.pid))" % (WORK + "/" + shell_name.replace(".sh", ".pid")),
+        "print('STARTED', p.pid)",
+    ]
+    starter.write_text(chr(10).join(lines) + chr(10))
+    for attempt in range(1, attempts + 1):
+        output = exec_file(starter) or ""
+        if "STARTED" in output:
+            print("+ launched %s (%s)" % (shell_name, output.strip().splitlines()[-1]), flush=True)
+            return True
+        print("+ launch attempt %d for %s produced no STARTED line" % (attempt, shell_name), flush=True)
+        time.sleep(15)
+    raise RuntimeError("could not start %s on the VM" % shell_name)
 
 
 def wait_for_log(remote, local, marker, timeout_s, label):
+    # A log left over from an earlier session would let the marker match before
+    # the VM has written anything, so the local copy always starts empty.
+    pathlib.Path(local).unlink(missing_ok=True)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         download(remote, local)
@@ -413,8 +620,34 @@ def wait_for_log(remote, local, marker, timeout_s, label):
     return False
 
 
+def revision_text():
+    """Identity of the uploaded tree: commit, dirty state and a src hash."""
+    def git(*args):
+        proc = subprocess.run(["git", "-C", str(ROOT), *args], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return proc.stdout.strip()
+
+    lines = ["rev=" + git("rev-parse", "HEAD"),
+             "subject=" + git("log", "-1", "--format=%s"),
+             "date=" + git("log", "-1", "--format=%cI")]
+    status = git("status", "--short")
+    lines.append("dirty=" + ("yes" if status else "no"))
+    lines.extend("status " + line for line in status.splitlines())
+    digest = hashlib.sha256()
+    for name in ("src", "CMakeLists.txt"):
+        entry = ROOT / name
+        files = sorted(entry.rglob("*")) if entry.is_dir() else [entry]
+        for file in files:
+            if file.is_file():
+                digest.update(str(file.relative_to(ROOT)).encode())
+                digest.update(file.read_bytes())
+    lines.append("engine_src_sha256=" + digest.hexdigest())
+    return "\n".join(lines) + "\n"
+
+
 def make_source_archive(path):
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("REVISION.txt", revision_text())
         for name in ("src", "tests", "tools", "bench"):
             for file in (ROOT / name).rglob("*"):
                 if file.is_file() and "qwen38-fixture" not in file.parts:
@@ -523,6 +756,7 @@ PHASES = {
     "probe": phase_probe,
     "matrix": phase_matrix,
     "matrix_big": phase_matrix_big,
+    "ab3": phase_ab3,
 }
 
 
@@ -538,7 +772,12 @@ def main() -> None:
     parser.add_argument("--llama-k2", type=int, default=16,
                         help="llama.cpp --keep-moe-gpu-last matched to the 16000 MiB cache")
     parser.add_argument("--timeout", type=int, default=5400, help="per phase timeout in seconds")
+    parser.add_argument("--engine-caches", default="8000,20000,30000",
+                        help="engine WARODECODE_EXPERT_CACHE_MIB values, paired with --llama-ks")
+    parser.add_argument("--llama-ks", default="0,16,24",
+                        help="llama.cpp --keep-moe-gpu-last values, paired with --engine-caches")
     parser.add_argument("--collect", action="store_true", help="only download and print results")
+    parser.add_argument("--collect-ab3", action="store_true", help="download + print the ab3 results")
     args = parser.parse_args()
 
     if hashlib.sha256(REFERENCE.read_bytes()).hexdigest() != REFERENCE_SHA256:
@@ -552,7 +791,11 @@ def main() -> None:
                 continue
             print("+ phase %s" % name, flush=True)
             PHASES[name](args)
-    if args.collect or args.phases != "none":
+    if args.collect:
+        collect(args)
+    if args.collect_ab3 or (args.phases != "none" and "ab3" in args.phases):
+        collect_ab3(args)
+    elif args.phases != "none":
         collect(args)
 
 

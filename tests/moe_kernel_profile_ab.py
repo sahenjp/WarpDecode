@@ -46,6 +46,21 @@ def cases(cache_mib: int, matrix: str) -> list[dict]:
                 WARODECODE_EXPERT_STATS="1")
     off = dict(base, WARODECODE_ROUTER_F32_WARP="0",
                WARODECODE_ROUTER_TOPK_PARALLEL="0", WARODECODE_SHEXP_GATE_WARP="0")
+    if matrix == "opt3":
+        return [
+            {"name": "base", "env": dict(off),
+             "note": "all three Task S kernel switches off (the pre-task path)"},
+            {"name": "opt", "env": dict(base),
+             "note": "all three switches on (the new default tree)"},
+            {"name": "prof-opt", "env": dict(prof),
+             "note": "kernel profile with all three switches on"},
+            {"name": "prof-opt-skip", "env": dict(prof, WARODECODE_EXPERT_IO_SKIP="1"),
+             "note": "DIAGNOSTIC: no pread/DMA - the case Task Q called 64.5 ms"},
+            {"name": "opt-g2", "env": dict(base, WARODECODE_MOE_BATCH_GROUPS="2"),
+             "note": "expert pass split into 2 prefix groups (DMA overlap)"},
+            {"name": "opt-g5", "env": dict(base, WARODECODE_MOE_BATCH_GROUPS="5"),
+             "note": "expert pass split into 5 prefix groups"},
+        ]
     if matrix == "opt2":
         return [
             {"name": "base", "env": dict(off),
@@ -181,7 +196,7 @@ def main() -> int:
     ap.add_argument("--ref", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--cache-mib", type=int, default=20000)
-    ap.add_argument("--matrix", default="profile", choices=("profile", "opt", "opt2"))
+    ap.add_argument("--matrix", default="profile", choices=("profile", "opt", "opt2", "opt3"))
     ap.add_argument("--skip-warm", action="store_true")
     args = ap.parse_args()
 
