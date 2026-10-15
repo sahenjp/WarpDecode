@@ -366,6 +366,82 @@ struct Qwen38Trace {
     }
 };
 
+// Multi-block argmax over the vocabulary. The single-block kernel below walks
+// 248,320 logits with 256 threads on one SM, so every one of its ~970 loads per
+// thread is an exposed DRAM latency: measured at 532 us per token on A100
+// (ncu, 2026-10-15) against a ~1 us memory floor for the same 993 KB.
+//
+// This twin spreads the same scan over one block per SM with a grid stride and
+// combines (value, index) through a packed 64-bit key: the float bits are mapped
+// to their IEEE-monotone unsigned order in the high half and the *inverted* index
+// in the low half, so a plain unsigned max picks the largest value and, on a tie,
+// the smallest index - exactly the reference's "v > best.v || (v == best.v &&
+// i < best.i)" starting from {-FLT_MAX, 0}. The identity element of that max is
+// therefore key(-FLT_MAX, 0), not 0, because the reference never promotes a logit
+// that is exactly -FLT_MAX over index 0.
+__device__ __forceinline__ unsigned long long q38_argmax_key(float v, int i) {
+    const unsigned u = __float_as_uint(v);
+    const unsigned monotone = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return (static_cast<unsigned long long>(monotone) << 32) |
+           static_cast<unsigned>(~static_cast<unsigned>(i));
+}
+
+__device__ __forceinline__ unsigned long long q38_argmax_identity_key() {
+    return q38_argmax_key(-3.402823466e+38F, 0);
+}
+
+__global__ void q38_argmax_multi_kernel(
+        const float * __restrict__ logits,
+        int n,
+        unsigned long long * __restrict__ best_key,
+        int * __restrict__ nonfinite) {
+    unsigned long long local = 0;
+    int local_nonfinite = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        const float v = logits[i];
+        if (!::isfinite(v)) {
+            local_nonfinite = 1;
+            continue;
+        }
+        const unsigned long long key = q38_argmax_key(v, i);
+        if (key > local) local = key;
+    }
+    __shared__ unsigned long long sm_key[256];
+    __shared__ int sm_nonfinite[256];
+    sm_key[threadIdx.x] = local;
+    sm_nonfinite[threadIdx.x] = local_nonfinite;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            if (sm_key[threadIdx.x + stride] > sm_key[threadIdx.x]) {
+                sm_key[threadIdx.x] = sm_key[threadIdx.x + stride];
+            }
+            sm_nonfinite[threadIdx.x] |= sm_nonfinite[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        if (sm_key[0] != 0) atomicMax(best_key, sm_key[0]);
+        if (sm_nonfinite[0]) atomicOr(nonfinite, 1);
+    }
+}
+
+// The number of blocks the multi-block argmax uses: one per SM keeps the scan
+// wide without oversubscribing the rest of the token.
+inline int q38_argmax_blocks(int n) {
+    if (n <= 0) return 1;
+    int device = 0;
+    int sms = 0;
+    if (cudaGetDevice(&device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+        sms > 0) {
+        const int needed = (n + 255) / 256;
+        return sms < needed ? sms : needed;
+    }
+    return (n + 255) / 256 < 256 ? (n + 255) / 256 : 256;
+}
+
 __global__ void q38_argmax_kernel(
         const float * __restrict__ logits,
         int n,
@@ -1000,6 +1076,16 @@ public:
             reinterpret_cast<void **>(&logits_),
             static_cast<size_t>(rt_.vocab) * sizeof(float));
         if (e != cudaSuccess) throw std::runtime_error("cudaMalloc Qwen3.8 logits failed");
+        e = cudaMallocHost(reinterpret_cast<void **>(&host_argmax_key_), sizeof(unsigned long long));
+        if (e != cudaSuccess) {
+            throw std::runtime_error(std::string("Qwen3.8 argmax key host alloc failed: ") +
+                                     cudaGetErrorString(e));
+        }
+        e = cudaMalloc(reinterpret_cast<void **>(&argmax_key_), sizeof(unsigned long long));
+        if (e != cudaSuccess) {
+            throw std::runtime_error(std::string("Qwen3.8 argmax key alloc failed: ") +
+                                     cudaGetErrorString(e));
+        }
         e = cudaMalloc(reinterpret_cast<void **>(&next_token_), sizeof(int));
         if (e != cudaSuccess) throw std::runtime_error("cudaMalloc Qwen3.8 next token failed");
         e = cudaMalloc(reinterpret_cast<void **>(&has_nonfinite_), sizeof(int));
@@ -1020,6 +1106,8 @@ public:
 
     ~Qwen38Decoder() {
         if (logits_) cudaFree(logits_);
+        if (argmax_key_) cudaFree(argmax_key_);
+        if (host_argmax_key_) cudaFreeHost(host_argmax_key_);
         if (next_token_) cudaFree(next_token_);
         if (has_nonfinite_) cudaFree(has_nonfinite_);
         if (host_next_token_) cudaFreeHost(host_next_token_);
@@ -3410,8 +3498,16 @@ public:
         } else {
             launch_lowbit_gemv_float(rt_.output, head, logits_, stream);
         }
-        q38_argmax_kernel<<<1, 256, 0, stream>>>(
-            logits_, rt_.vocab, next_token_, has_nonfinite_);
+        {
+            static const unsigned long long identity = q38_argmax_identity_key();
+            WD_CUDA(cudaMemcpyAsync(argmax_key_, &identity, sizeof(identity),
+                                    cudaMemcpyHostToDevice, stream));
+            const int zero = 0;
+            WD_CUDA(cudaMemcpyAsync(has_nonfinite_, &zero, sizeof(zero),
+                                    cudaMemcpyHostToDevice, stream));
+            q38_argmax_multi_kernel<<<q38_argmax_blocks(rt_.vocab), 256, 0, stream>>>(
+                logits_, rt_.vocab, argmax_key_, has_nonfinite_);
+        }
         profile_.mark_end(kQwen38StageHead, stream);
 
         profile_.mark_begin(kQwen38StageSync, stream);
@@ -3424,9 +3520,9 @@ public:
         }
 
         cudaError_t e = cudaMemcpyAsync(
-            host_next_token_, next_token_, sizeof(int),
+            host_argmax_key_, argmax_key_, sizeof(unsigned long long),
             cudaMemcpyDeviceToHost, stream);
-        if (e != cudaSuccess) throw std::runtime_error("copy Qwen3.8 next token failed");
+        if (e != cudaSuccess) throw std::runtime_error("copy Qwen3.8 argmax key failed");
         e = cudaMemcpyAsync(
             host_has_nonfinite_, has_nonfinite_, sizeof(int),
             cudaMemcpyDeviceToHost, stream);
@@ -3436,6 +3532,14 @@ public:
             throw std::runtime_error(std::string("Qwen3.8 step sync failed: ") + cudaGetErrorString(e));
         }
         profile_.mark_end(kQwen38StageSync, stream);
+        // The packed key holds the IEEE-monotone order of the winning logit in its
+        // high half and the inverted token id in its low half; the identity (no
+        // finite logit beat -FLT_MAX at index 0) keeps token 0.
+        {
+            const unsigned long long key = *host_argmax_key_;
+            const unsigned low = static_cast<unsigned>(key & 0xffffffffu);
+            *host_next_token_ = (key == 0) ? 0 : static_cast<int>(~low);
+        }
         profile_.mark_end(kQwen38StageToken, stream);
         // Every recorded event is complete now, so the elapsed reads cannot fail
         // with cudaErrorNotReady.
@@ -3755,6 +3859,8 @@ private:
     Qwen38StageProfiler profile_;
     Qwen38Trace * active_trace_ = nullptr;
     float * logits_ = nullptr;
+    unsigned long long * argmax_key_ = nullptr;
+    unsigned long long * host_argmax_key_ = nullptr;
     int * next_token_ = nullptr;
     int * has_nonfinite_ = nullptr;
     int * host_next_token_ = nullptr;

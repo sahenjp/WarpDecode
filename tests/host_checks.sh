@@ -81,6 +81,10 @@ bash tests/qwen38_hc_legacy_skip_host_check.sh
 # Task G: expert 統合 MoE の加算順序と index 対応が従来と bit 一致することを確認する
 bash tests/moe_fused_grid_host_check.sh
 
+# argmax をマルチブロック + 単調キー化しても、参照スキャンと同じトークン・同じ
+# non-finite 判定になることを確認する
+bash tests/qwen38_argmax_host_check.sh
+
 # Task W: routed expert の IQ2_S / IQ4_NL GEMV を ILP 段のソフトウェアパイプラインにしても
 # アキュムレータが消費する順序と float チェーンが変わらないこと (短い行・グループ/テール境界を含む)
 # を確認する
