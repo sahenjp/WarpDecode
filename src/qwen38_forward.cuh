@@ -3503,22 +3503,12 @@ public:
         } else {
             launch_lowbit_gemv_float(rt_.output, head, logits_, stream);
         }
-        {
-            static const unsigned long long identity = q38_argmax_identity_key();
-            const int zero = 0;
-            cudaError_t key_error = cudaMemcpyAsync(argmax_key_, &identity, sizeof(identity),
-                                                    cudaMemcpyHostToDevice, stream);
-            if (key_error == cudaSuccess) {
-                key_error = cudaMemcpyAsync(has_nonfinite_, &zero, sizeof(zero),
-                                            cudaMemcpyHostToDevice, stream);
-            }
-            if (key_error != cudaSuccess) {
-                throw std::runtime_error(std::string("Qwen3.8 argmax reset failed: ") +
-                                         cudaGetErrorString(key_error));
-            }
-            q38_argmax_multi_kernel<<<q38_argmax_blocks(rt_.vocab), 256, 0, stream>>>(
-                logits_, rt_.vocab, argmax_key_, has_nonfinite_);
-        }
+        // The multi-block twin (q38_argmax_multi_kernel) is kept below for
+        // reference: it is bit-identical and 64/64 on device, but on A100 the
+        // 64-token bench regressed from 26.6 to 15.1 tok/s with it in place and
+        // the cause was never isolated, so the shipped single-block kernel stays.
+        q38_argmax_kernel<<<1, 256, 0, stream>>>(
+            logits_, rt_.vocab, next_token_, has_nonfinite_);
         profile_.mark_end(kQwen38StageHead, stream);
 
         profile_.mark_begin(kQwen38StageSync, stream);
@@ -3531,9 +3521,9 @@ public:
         }
 
         cudaError_t e = cudaMemcpyAsync(
-            host_argmax_key_, argmax_key_, sizeof(unsigned long long),
+            host_next_token_, next_token_, sizeof(int),
             cudaMemcpyDeviceToHost, stream);
-        if (e != cudaSuccess) throw std::runtime_error("copy Qwen3.8 argmax key failed");
+        if (e != cudaSuccess) throw std::runtime_error("copy Qwen3.8 next token failed");
         e = cudaMemcpyAsync(
             host_has_nonfinite_, has_nonfinite_, sizeof(int),
             cudaMemcpyDeviceToHost, stream);
@@ -3543,14 +3533,6 @@ public:
             throw std::runtime_error(std::string("Qwen3.8 step sync failed: ") + cudaGetErrorString(e));
         }
         profile_.mark_end(kQwen38StageSync, stream);
-        // The packed key holds the IEEE-monotone order of the winning logit in its
-        // high half and the inverted token id in its low half; the identity (no
-        // finite logit beat -FLT_MAX at index 0) keeps token 0.
-        {
-            const unsigned long long key = *host_argmax_key_;
-            const unsigned low = static_cast<unsigned>(key & 0xffffffffu);
-            *host_next_token_ = (key == 0) ? 0 : static_cast<int>(~low);
-        }
         profile_.mark_end(kQwen38StageToken, stream);
         // Every recorded event is complete now, so the elapsed reads cannot fail
         // with cudaErrorNotReady.

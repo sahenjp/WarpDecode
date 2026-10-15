@@ -75,31 +75,41 @@ inline Qwen38Tuning qwen38_tuning_for_gpu(int sm, int memory_mib) {
     t.qsa_block_budget = 512;
     t.qsa_token_budget = 2048;
 
+    // Expert cache sizing. The old tier table gave an 80 GB A100 only 8 GiB and a
+    // 120 GB card 16 GiB; measured on A100-80GB that is 15.06 tok/s against 26.64
+    // tok/s at 20 GiB and 26.71 at 50 GiB, i.e. the default cost 1.77x out of the
+    // box. The cache only has to cover the (layer, expert) pairs a run touches
+    // (7,448 pairs = 14.7 GB for a 64-token run), and anything beyond that is
+    // free - allocation is lazy, so a large default costs nothing at load.
+    //
+    // 75% of the card minus 8 GiB leaves room for the resident weights, workspace
+    // and a desktop session: 40 GB -> 22 GiB, 80 GB -> 52 GiB, and the clamp keeps
+    // small cards at their old behaviour.
+    {
+        long long cache = static_cast<long long>(memory_mib) * 3 / 4 - 8 * 1024;
+        if (cache < 512) cache = 512;
+        if (cache > 64 * 1024) cache = 64 * 1024;
+        t.expert_cache_mib = static_cast<int>(cache);
+    }
     if (memory_mib >= 120 * 1024) {
         t.ple_hot_cache_mib = 512;
-        t.expert_cache_mib = 16 * 1024;
         t.expert_prefetch_depth = 3;
     } else if (memory_mib >= 72 * 1024) {
         t.ple_hot_cache_mib = 256;
-        t.expert_cache_mib = 8 * 1024;
         t.expert_prefetch_depth = 2;
     } else if (memory_mib >= 40 * 1024) {
         t.ple_hot_cache_mib = 192;
-        t.expert_cache_mib = 4 * 1024;
         t.expert_prefetch_depth = 2;
     } else if (memory_mib >= 20 * 1024) {
         t.ple_hot_cache_mib = 128;
-        t.expert_cache_mib = 1536;
         t.expert_prefetch_depth = 1;
     } else {
         t.ple_hot_cache_mib = 64;
-        t.expert_cache_mib = 512;
         t.expert_prefetch_depth = 1;
     }
 
-    // Diagnostic override: the cache holds roughly 1.7 layers at the 1536 MiB
-    // default, so the first eviction happens inside layer 2. Bumping it moves
-    // that boundary and makes cache-related divergence easy to spot.
+    // Explicit override (WARODECODE_EXPERT_CACHE_MIB=20000 etc). Also the knob the
+    // A/B harnesses use to compare cache sizes.
     if (const char * v = std::getenv("WARODECODE_EXPERT_CACHE_MIB")) {
         const int mib = std::atoi(v);
         if (mib > 0) t.expert_cache_mib = mib;
