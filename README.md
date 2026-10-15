@@ -25,20 +25,24 @@ cmake --build build -j8 --target warodecode
 
 | モデル | 対応 |
 |---|---|
-| Qwen3.8-Flash-Next (qwen4exp) | **完全対応**（CPU オラクルと 64/64 一致） |
-| llama / qwen2 / qwen3 の dense | **全 2D テンソルが Q4_0 の GGUF のみ** |
-| それ以外（Q4_K_M, Q5_K_M など k-quant） | 未対応 |
+| Qwen3.8-Flash-Next (qwen4exp) | **完全対応**（CPU オラクルと 64/64 一致、プロンプト・対話も可） |
+| llama / qwen2 / qwen3 の dense | **動作**（Q4_0 はそのまま、Q6_K / Q8_0 / Q4_1 / F16 / F32 は読み込み時に **Q8_0 へ詰め直して**実行） |
+| Q4_K_M / Q5_K_M など k-quant | 未対応 |
+| dense モデルでの `--prompt` / `-i` | 未対応（`--start-token` からの生成とベンチのみ） |
 
-llama.cpp が配る「Q4_0」の GGUF でも、出力ヘッドが Q6_K、モデルによっては
-`ffn_down` が Q8_0 になっています（実測: [複数モデルでの動作テスト](docs/MULTI_MODEL_TEST.md)）。
-その場合は全テンソルを Q4_0 にそろえると動きます:
+dense モデルの実測（A100 80GB・64 トークン・llama.cpp mainline `-ngl 99` と同時計測）:
 
-```bash
-llama-quantize in.gguf out.gguf Q4_0     # 全テンソルを Q4_0 に
-./build/warodecode -m out.gguf -p "..." -n 64
-```
+| モデル | 本エンジン | llama.cpp |
+|---|---:|---:|
+| Qwen2.5-0.5B-Q4_0 | 248.8 tok/s | 555.7 |
+| TinyLlama-1.1B-Q4_0 | 230.9 tok/s | 539.6 |
+| Llama-3.2-1B-Q4_0 | 245.8 tok/s | 577.8 |
+| Qwen2.5-1.5B-Q4_0 | 157.5 tok/s | 360.4 |
 
-未対応の型・アーキテクチャのときは、型名と回避策を出して止まります。
+小型 dense モデルは llama.cpp が約 2.2 倍速い（全重みが VRAM に載る領域は llama.cpp の
+得意分野）。本エンジンの本命は VRAM に収まらない MoE で、そちらは 64/64 一致で上回ります。
+詳細: [複数モデルでの動作テスト](docs/MULTI_MODEL_TEST.md)。未対応の型・アーキテクチャの
+ときは、型名と対応一覧を出して止まります。
 
 ### expert cache は VRAM から自動決定
 

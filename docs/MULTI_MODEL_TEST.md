@@ -1,94 +1,66 @@
-# 複数モデルでの動作テスト（2026-10-15, A100-SXM4-80GB）
+# 複数モデルでの動作テスト（2026-10-15/16, A100-SXM4-80GB）
 
 dense (llama / qwen2 / qwen3) パスが実際の GGUF でどこまで動くかを、llama.cpp が配る
-Q4_0 の小型モデル 4 本で確かめた。同時に llama.cpp (mainline HEAD) の tg64 も測っている。
-
-| モデル | アーキ | サイズ | llama.cpp tg64 | 本エンジン | 止まった理由 |
-|---|---|---:|---:|---|---|
-| Qwen2.5-0.5B-Instruct-Q4_0 | qwen2 | 429 MB | 555.7 tok/s | **起動不可** | `output.weight` が Q6_K |
-| TinyLlama-1.1B-Chat.Q4_0 | llama | 638 MB | 539.6 tok/s | **起動不可** | `output.weight` が Q6_K |
-| Llama-3.2-1B-Instruct-Q4_0 | llama | 773 MB | 577.8 tok/s | **起動不可** | `blk.*.ffn_down.weight` が Q8_0 |
-| Qwen2.5-1.5B-Instruct-Q4_0 | qwen2 | 1.07 GB | 360.4 tok/s | **起動不可** | `output.weight` が Q6_K |
-
-**llama.cpp 自身が配る「Q4_0」の GGUF でも、全テンソルが Q4_0 ではない。**
-- Qwen 系・TinyLlama の Q4_0 は **出力ヘッドだけ Q6_K**（品質のため残すのが通例）。
-- Llama-3.2-1B は **ffn_down が Q8_0**。
-
-本エンジンの dense パスは元々すべての 2D テンソルが Q4_0 であることを要求していたため、
-この 4 本はどれも起動できなかった。これが「いろんなモデルで使う」ときの最初の壁である。
+Q4_0 の小型モデル 4 本で確かめた。同時に llama.cpp (mainline HEAD, `-ngl 99`) の tg64 も測っている。
 
 ---
 
-## 1. 今回入れたもの
+## 0. 結論
 
-1. **何が起きたか分かるエラー**。以前は「Q4_0 2Dのみ対応: output.weight」の一行だけで、
-   何をすればよいか分からなかった。今は
-   - 型名を出す (Q6_K / Q8_0 / Q4_K など、GGUF の型番号ではなく名前)
-   - 対応している型の一覧を出す
-   - **回避策**を出す: `llama-quantize in.gguf out.gguf Q4_0` で全テンソルを
-     Q4_0 にそろえれば本エンジンで動く
-   という 3 点を出す。アーキテクチャ非対応のときも同様に案内する。
-2. **Q8_0 / Q6_K / F16 / F32 を F16 に展開する経路**（`src/ggml_dequant.hpp`、
-   ggml のブロック定義をホストへ写したもの）と F16 GEMV。ただし **既定では無効**
-   （`WARODECODE_DENSE_F16=1` で有効）。理由は §2。
-3. `--help` を読みやすく整理（従来はデバッグ用フラグ全部が 1 行に連結されていた）。
-   全フラグは `--help-all` へ。対応モデル・よく使うオプション・例を表示する。
+**4 本すべて動くようになった。** 到達点は「Q4_0 以外のテンソルを Q8_0 に詰め直して
+lowbit.cuh の実績あるカーネルで走らせる」方式。
 
----
+| モデル | arch | サイズ | 本エンジン | llama.cpp tg64 |
+|---|---|---:|---:|---:|
+| Qwen2.5-0.5B-Instruct-Q4_0 | qwen2 | 429 MB | **248.8 tok/s** | 555.7 |
+| TinyLlama-1.1B-Chat.Q4_0 | llama | 638 MB | **230.9 tok/s** | 539.6 |
+| Llama-3.2-1B-Instruct-Q4_0 | llama | 773 MB | **245.8 tok/s** | 577.8 |
+| Qwen2.5-1.5B-Instruct-Q4_0 | qwen2 | 1.07 GB | **157.5 tok/s** | 360.4 |
 
-## 2. F16 展開経路が既定で無効な理由（実測）
-
-Q6_K ヘッドを F16 に落とす経路を入れて 4 本を走らせたところ、3 本が
-`CUDA: an illegal memory access` で落ちた。compute-sanitizer の結果:
-
-    Invalid __global__ read of size 2 bytes
-      at void wd::f16_gemv_kernel<(bool)1>(...) in warodecode.cu:1408
-      Access to 0x...2004 is out of bounds
-
-`f16_gemv_kernel` の重み/活性の読み出しが確保領域を越えている。ヘッドの
-(rows, cols) はローダ側で検証済み (rows == vocab, cols == hidden) なので、
-残る候補は「F16 バッファの確保サイズとカーネルが想定する rows*cols の不一致」だが、
-原因を特定する前にセッションが不安定になり追い切れなかった。
-
-**既定で有効にすると、これまで明確なエラーで止まっていたモデルが不正アクセスで
-落ちるようになる（悪化）**ため、既定はエラーのまま、実験フラグの裏に置いた。
+小さい dense モデルでは llama.cpp が約 2.2 倍速い。本エンジンの設計は
+「VRAM に収まらない MoE(専門家)を流す」ことに寄せてあり、全重みが VRAM に載る
+小型モデルは llama.cpp の得意分野である、というのが正直なところ。
+qwen38 (86 GB MoE) の 64/64 一致・26.6 tok/s の方が本来の戦場。
 
 ---
 
-## 3. 次にやること
+## 1. 途中で見つかった本当の原因: move 代入の use-after-free
 
-1. `f16_gemv_kernel` の範囲外読み出しを潰す（compute-sanitizer で当たりは付いている）。
-   直れば Qwen2.5 / TinyLlama / Llama-3.2 の Q4_0 が素のまま動く。
-2. 本来は **Q4_K_M**（llama.cpp の既定量子化）を扱えるのが「使いやすい」の本命。
-   `lowbit.cuh` に Q4_K は無いので、そこは新規カーネルが要る。
-3. 動くモデルが増えたら、この表を README の速度表に統合する。
+最初は「dense パスは Q4_0 しか読めない」という *明確なエラー* だったので、
+Q6_K / Q8_0 / Q4_1 を F16 に展開する経路を書いた。ところが実モデルで
+`CUDA: an illegal memory access` になり、compute-sanitizer が
+`f16_gemv_kernel` の 2 バイト読み出しを指した。形・確保サイズ・ポインタを
+すべて出力して追い込んだ結果、**カーネルではなく行列の move 代入**が原因だった:
 
+    Q4Matrix& operator=(Q4Matrix&& o) {
+        reset(); ... q8 = o.q8; planar_q4 = o.planar_q4; owns = o.owns;
+        o.q = nullptr; o.d = nullptr; o.rows = o.cols = 0; o.owns = true;
+        //                                       ^^^ o.q8 を消し忘れ
+    }
+
+移動元(一時オブジェクト)のデストラクタが `owns == true` のまま `cudaFree(q8)` を
+呼び、**移動先が持っていたバッファを解放**していた。以降のカーネルは解放済み領域を読む。
+`o.q8 = nullptr;` を足した瞬間に 4 本とも動いた。
+
+教訓: ポインタを増やすときは move コンストラクタと move 代入の**両方**を直す。
 
 ---
 
-## 4. 追記: 既定の expert cache が小さすぎた（使いやすさの実害）
+## 2. 実装したこと
 
-複数モデルのテスト中に qwen38 の速度が 26.6 → 15.1 tok/s に落ちて見えた。原因は
-ソースではなく **エンジンの既定 expert cache** だった。
+- `src/ggml_dequant.hpp`（新規）: GGUF の各型を F32 へ戻す式 (Q4_0 / Q4_1 / Q8_0 / Q6_K /
+  F16 / F32) と、**Q8_0 へ詰め直す** `ggml_requantize_row_to_q8_0()`。
+  Q6_K (6bit) より Q8_0 (8bit) の方が精度は上で、バイト数は 1.3 倍。
+- `src/gguf.hpp`: `Q4_1`（Llama-3.2-1B の ffn_down）を enum / 型名 / サイズ表に追加。
+- `src/warodecode.cu`: Q4_0 以外の 2D テンソルは Q8_0 raw バッファにし、
+  `q8_0_gemv_kernel` / `q8_0_gather_row_kernel`（lowbit.cuh の実績あるカーネル）で実行。
+  自作の F16 GEMV は削除した。
+- dense パスのモデル読み込みで、対応型の一覧と回避策を出すエラー（型名付き）。
 
-| 設定 | tok/s | 一致 |
-|---|---:|---|
-| 既定（VRAM 80GB でも 8 GiB） | **15.06** | 64/64 |
-| `WARODECODE_EXPERT_CACHE_MIB=20000` | 26.64 | 64/64 |
-| `WARODECODE_EXPERT_CACHE_MIB=50000` | 26.71 | 64/64 |
+## 3. まだできないこと
 
-`qwen38_tuning_for_gpu()` の段階表が 80 GB のカードに 8 GiB しか与えていなかった。
-キャッシュは 64 トークンで触れる (layer, expert) 対（7,448 対 = 14.7 GB）を覆えば十分で、
-**確保は遅延なので大きくしても読み込みは重くならない**。
-そこで「VRAM の 75% − 8 GiB（上限 64 GiB）」へ変更した:
-
-| VRAM | 旧 | 新 |
-|---|---:|---:|
-| 16 GB | 512 MiB | 4 GiB |
-| 24 GB | 1.5 GiB | 10 GiB |
-| 40 GB | 4 GiB | 22 GiB |
-| **80 GB** | **8 GiB** | **52 GiB** |
-| 141 GB | 16 GiB | 64 GiB |
-
-変更後の実測: 既定のまま **26.68 tok/s / 64/64**（1.77 倍）。
-`WARODECODE_EXPERT_CACHE_MIB` は従来どおり明示上書きできる。
+- **`--prompt` / `--interactive` は qwen4exp 専用**。dense モデルは `--start-token` からの
+  生成とベンチのみ。プロンプトを使うには llama / qwen2 / qwen3 のトークナイザ
+  (pre 種別と chat template) を実装する必要がある。エラー文でその旨を案内する。
+- `Q4_K_M` などの k-quant は依然未対応（lowbit.cuh に Q4_K が無い）。
+- 各モデルで生成トークンの一致検証はしていない（qwen38 は CPU オラクルと 64/64 済み）。

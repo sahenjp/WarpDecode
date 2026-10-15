@@ -15,6 +15,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 namespace wd {
@@ -40,12 +41,13 @@ inline uint16_t ggml_load_u16(const uint8_t * p) {
 
 // dense パスが F16 経由で扱える型か。ブロック量子化の型は列数がブロック長の
 // 倍数である必要がある (満たさない場合は呼び出し側が明示的に失敗させる)。
-inline bool ggml_type_as_f16_supported(GgmlType type) {
+inline bool ggml_type_requantizable(GgmlType type) {
     switch (type) {
         case GgmlType::F32:
         case GgmlType::F16:
         case GgmlType::Q8_0:
         case GgmlType::Q6_K:
+        case GgmlType::Q4_1:
             return true;
         default:
             return false;
@@ -58,6 +60,7 @@ inline int ggml_type_block_size(GgmlType type) {
         case GgmlType::F16: return 1;
         case GgmlType::Q8_0: return 32;
         case GgmlType::Q6_K: return 256;
+        case GgmlType::Q4_1: return 32;
         default: return 0;
     }
 }
@@ -68,6 +71,7 @@ inline int ggml_type_block_bytes(GgmlType type) {
         case GgmlType::F16: return 2;
         case GgmlType::Q8_0: return 34;
         case GgmlType::Q6_K: return 210;
+        case GgmlType::Q4_1: return 20;
         default: return 0;
     }
 }
@@ -141,6 +145,85 @@ inline void ggml_dequant_to_f16(GgmlType type, const uint8_t * src, uint16_t * d
         }
         default:
             throw std::runtime_error(std::string("F16 へ展開できない型です: ") + ggml_type_name(type));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q8_0 への再量子化
+//
+// dense パスは Q4_0 の planar カーネルしか持たないが、llama.cpp が配る GGUF は
+// output.weight が Q6_K / Q8_0、Llama-3.2-1B は token_embd が Q6_K で
+// ffn_down が Q4_1、というように混ざっている。Q4_0 以外の 2D テンソルは
+// 一度 F32 に戻してから **Q8_0** に詰め直し、lowbit.cuh の実績ある
+// q8_0_gemv_kernel / q8_0_gather_row_kernel で走らせる。
+// Q8_0 は 8bit なので元が Q6_K でも精度は落ちない (バイト数は 1.3 倍)。
+// ---------------------------------------------------------------------------
+
+inline float ggml_q8_0_value(const uint8_t * blk, int i) {
+    const float d = ggml_half_to_float(ggml_load_u16(blk));
+    return d * static_cast<float>(static_cast<int8_t>(blk[2 + (i & 31)]));
+}
+
+inline float ggml_q4_0_value(const uint8_t * blk, int i) {
+    const float d = ggml_half_to_float(ggml_load_u16(blk));
+    const uint8_t byte = blk[2 + (i & 15)];
+    const int q = (i < 16) ? (byte & 0x0f) : (byte >> 4);
+    return d * static_cast<float>(q - 8);
+}
+
+inline float ggml_q4_1_value(const uint8_t * blk, int i) {
+    const float d = ggml_half_to_float(ggml_load_u16(blk));
+    const float m = ggml_half_to_float(ggml_load_u16(blk + 2));
+    const uint8_t byte = blk[4 + (i & 15)];
+    const int q = (i < 16) ? (byte & 0x0f) : (byte >> 4);
+    return d * static_cast<float>(q) + m;
+}
+
+// ブロック先頭ポインタとブロック内位置から 1 値を返す。
+inline float ggml_dequant_value_f32(GgmlType type, const uint8_t * block, int index_in_block) {
+    switch (type) {
+        case GgmlType::F32:
+            return reinterpret_cast<const float *>(block)[index_in_block];
+        case GgmlType::F16:
+            return ggml_half_to_float(reinterpret_cast<const uint16_t *>(block)[index_in_block]);
+        case GgmlType::Q4_0: return ggml_q4_0_value(block, index_in_block);
+        case GgmlType::Q4_1: return ggml_q4_1_value(block, index_in_block);
+        case GgmlType::Q8_0: return ggml_q8_0_value(block, index_in_block);
+        case GgmlType::Q6_K: return ggml_q6_k_value(block, index_in_block);
+        default:
+            throw std::runtime_error(std::string("再量子化できない型です: ") + ggml_type_name(type));
+    }
+}
+
+// 1 行 (cols 値) を Q8_0 ブロック列 (cols/32 * 34 バイト) へ。
+inline void ggml_requantize_row_to_q8_0(GgmlType type, const uint8_t * src,
+                                        uint8_t * dst, int64_t cols) {
+    const int block = ggml_type_block_size(type);
+    const int block_bytes = ggml_type_block_bytes(type);
+    if (block <= 1) throw std::runtime_error("1 要素ブロックの型は再量子化対象外です");
+    if (cols % 32 != 0) {
+        throw std::runtime_error("Q8_0 へ詰め直すには列数が 32 の倍数である必要があります: " +
+                                 std::to_string(cols));
+    }
+    for (int64_t b = 0; b < cols / 32; ++b) {
+        float v[32];
+        for (int i = 0; i < 32; ++i) {
+            const int64_t index = b * 32 + i;
+            const uint8_t * bp = src + (index / block) * block_bytes;
+            v[i] = ggml_dequant_value_f32(type, bp, static_cast<int>(index % block));
+        }
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(v[i]));
+        const float d = amax / 127.0f;
+        uint8_t * out = dst + b * 34;
+        const __half dh = __float2half(d);
+        std::memcpy(out, &dh, sizeof(uint16_t));
+        for (int i = 0; i < 32; ++i) {
+            int q = (d == 0.0f) ? 0 : static_cast<int>(std::lround(v[i] / d));
+            if (q > 127) q = 127;
+            if (q < -128) q = -128;
+            out[2 + i] = static_cast<uint8_t>(static_cast<int8_t>(q));
+        }
     }
 }
 

@@ -27,6 +27,7 @@ enum class GgmlType : uint32_t {
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,
+    Q4_1 = 3,
     Q8_0 = 8,
     Q6_K = 14,
     IQ3_XXS = 18,
@@ -43,6 +44,7 @@ inline const char * ggml_type_name(GgmlType type) {
         case GgmlType::F32: return "F32";
         case GgmlType::F16: return "F16";
         case GgmlType::Q4_0: return "Q4_0";
+        case GgmlType::Q4_1: return "Q4_1";
         case GgmlType::Q8_0: return "Q8_0";
         case GgmlType::Q6_K: return "Q6_K";
         case GgmlType::IQ3_XXS: return "IQ3_XXS";
@@ -277,6 +279,7 @@ struct TensorInfo {
             case GgmlType::F16:    return static_cast<size_t>(n * 2);
             case GgmlType::BF16:   return static_cast<size_t>(n * 2);
             case GgmlType::Q4_0:   return blocked(32, 18, "Q4_0");
+            case GgmlType::Q4_1:   return blocked(32, 20, "Q4_1");
             case GgmlType::Q8_0:   return blocked(32, 34, "Q8_0");
             case GgmlType::Q6_K:   return blocked(256, 210, "Q6_K");
             case GgmlType::IQ3_XXS:return blocked(256, 98, "IQ3_XXS");
