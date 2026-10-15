@@ -6,6 +6,40 @@ NVIDIA GPU上の **batch=1 LLM decode速度** に対象を絞り、llama.cppの�
 
 ライセンス: [MIT](LICENSE)
 
+## クイックスタート（CLI）
+
+```bash
+# 1) GPU 向けエンジンをビルド（CUDA が必要）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DWARODECODE_BUILD_ENGINE=ON -DCMAKE_CUDA_ARCHITECTURES=80
+cmake --build build -j8 --target warodecode
+
+# 2) モデルを指定して生成
+./build/warodecode -m model.gguf -p "こんにちは" -n 64      # プロンプトを渡す
+./build/warodecode -m model.gguf -i                          # 対話モード
+./build/warodecode -m model.gguf -n 64 --bench-repeat 3      # 速度だけ測る
+./build/warodecode --help                                    # よく使うオプション
+./build/warodecode --help-all                                # デバッグ用フラグ全部
+```
+
+### 動くモデル / 動かないモデル
+
+| モデル | 対応 |
+|---|---|
+| Qwen3.8-Flash-Next (qwen4exp) | **完全対応**（CPU オラクルと 64/64 一致） |
+| llama / qwen2 / qwen3 の dense | **全 2D テンソルが Q4_0 の GGUF のみ** |
+| それ以外（Q4_K_M, Q5_K_M など k-quant） | 未対応 |
+
+llama.cpp が配る「Q4_0」の GGUF でも、出力ヘッドが Q6_K、モデルによっては
+`ffn_down` が Q8_0 になっています（実測: [複数モデルでの動作テスト](docs/MULTI_MODEL_TEST.md)）。
+その場合は全テンソルを Q4_0 にそろえると動きます:
+
+```bash
+llama-quantize in.gguf out.gguf Q4_0     # 全テンソルを Q4_0 に
+./build/warodecode -m out.gguf -p "..." -n 64
+```
+
+未対応の型・アーキテクチャのときは、型名と回避策を出して止まります。
+
 ## まずTUIを起動
 
 CUDAが未導入でもTUIだけは起動できます。

@@ -386,8 +386,13 @@ __device__ __forceinline__ unsigned long long q38_argmax_key(float v, int i) {
            static_cast<unsigned>(~static_cast<unsigned>(i));
 }
 
-__device__ __forceinline__ unsigned long long q38_argmax_identity_key() {
-    return q38_argmax_key(-3.402823466e+38F, 0);
+// ホスト側で初期値を組み立てる (そのため __float_as_uint を使えない)。
+inline unsigned long long q38_argmax_identity_key() {
+    const float v = -3.402823466e+38F;
+    unsigned u = 0;
+    std::memcpy(&u, &v, sizeof(u));
+    const unsigned monotone = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return (static_cast<unsigned long long>(monotone) << 32) | 0xffffffffull;   // index 0 の反転
 }
 
 __global__ void q38_argmax_multi_kernel(
@@ -3500,11 +3505,17 @@ public:
         }
         {
             static const unsigned long long identity = q38_argmax_identity_key();
-            WD_CUDA(cudaMemcpyAsync(argmax_key_, &identity, sizeof(identity),
-                                    cudaMemcpyHostToDevice, stream));
             const int zero = 0;
-            WD_CUDA(cudaMemcpyAsync(has_nonfinite_, &zero, sizeof(zero),
-                                    cudaMemcpyHostToDevice, stream));
+            cudaError_t key_error = cudaMemcpyAsync(argmax_key_, &identity, sizeof(identity),
+                                                    cudaMemcpyHostToDevice, stream);
+            if (key_error == cudaSuccess) {
+                key_error = cudaMemcpyAsync(has_nonfinite_, &zero, sizeof(zero),
+                                            cudaMemcpyHostToDevice, stream);
+            }
+            if (key_error != cudaSuccess) {
+                throw std::runtime_error(std::string("Qwen3.8 argmax reset failed: ") +
+                                         cudaGetErrorString(key_error));
+            }
             q38_argmax_multi_kernel<<<q38_argmax_blocks(rt_.vocab), 256, 0, stream>>>(
                 logits_, rt_.vocab, argmax_key_, has_nonfinite_);
         }

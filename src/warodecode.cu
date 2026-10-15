@@ -1,4 +1,5 @@
 #include "gguf.hpp"
+#include "ggml_dequant.hpp"
 #include "gpu_arch.hpp"
 #include "lowbit.cuh"
 #include "qwen38_layout.hpp"
@@ -430,6 +431,45 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--mtp-draft") a.mtp_draft = std::stoi(need(i, "--mtp-draft"));
         else if (s == "--state-trace-position") a.state_trace_position = std::stoi(need(i, "--state-trace-position"));
         else if (s == "-h" || s == "--help") {
+            std::cout <<
+                "warodecode — batch=1 decode 専用の CUDA ランタイム\n"
+                "\n"
+                "使い方:\n"
+                "  warodecode --model <model.gguf> [options]\n"
+                "\n"
+                "モデルと生成:\n"
+                "  -m, --model <path>        GGUF ファイル (必須)\n"
+                "  -p, --prompt <text>       プロンプト (省略時は --start-token から生成)\n"
+                "  -f, --prompt-file <path>  プロンプトをファイルから\n"
+                "  -i, --interactive         対話モード\n"
+                "  -n, --generate <N>        生成トークン数 (既定 128)\n"
+                "  -c, --ctx <N>             context 長 (既定 4096)\n"
+                "      --chat-template       chat template を適用 (--no-chat-template で無効)\n"
+                "      --temp <T>            サンプリング温度 (0 で greedy)\n"
+                "      --stop-eos / --no-stop-eos\n"
+                "      --tokenize-only       トークナイズ結果だけ表示\n"
+                "\n"
+                "実行と計測:\n"
+                "      --device <N>          GPU 番号 (既定 0)\n"
+                "      --bench-repeat <N>    N 回まわして最速値を報告\n"
+                "      --no-graph / --no-autotune\n"
+                "      --mtp                 MTP 投機デコード (qwen4exp のみ)\n"
+                "      --stream-json <path>  トークンを JSON Lines で逐次出力\n"
+                "\n"
+                "対応モデル:\n"
+                "  qwen4exp   Qwen3.8-Flash-Next (IQ2_S / IQ3_S / IQ4_NL / Q8_0)\n"
+                "  dense      llama / qwen2 / qwen3 (Q4_0 量子化の GGUF のみ)\n"
+                "\n"
+                "例:\n"
+                "  warodecode -m Qwen2.5-0.5B-Instruct-Q4_0.gguf -p \"こんにちは\" -n 64\n"
+                "  warodecode -m model.gguf -i\n"
+                "  warodecode -m model.gguf -n 64 --bench-repeat 3\n"
+                "\n"
+                "環境変数 WARODECODE_* で最適化を切り替えられます (README と docs/ を参照)。\n"
+                "すべてのデバッグ用フラグ: warodecode --help-all\n";
+            std::exit(0);
+        }
+        else if (s == "--help-all") {
             std::cout << "text mode: --prompt/-p \"文字列\" | --prompt-file/-f path | --interactive/-i | -n N | -m model.gguf"
                          " [--no-display-prompt] [--temp 0] [--chat-template|--no-chat-template]"
                          " [--add-bos|--no-bos] [--stop-eos|--no-stop-eos] [--stream-json path]"
@@ -933,23 +973,37 @@ struct Q4Matrix {
     int cols = 0;
     uint8_t* q = nullptr;
     __half* d = nullptr;
+    // Q4_0 以外 (Q8_0 / Q6_K / F16 / F32) は F16 に展開してここへ置く。
+    // 重いが再量子化しないので値は元のまま。
+    __half* f16 = nullptr;
+    bool planar_q4 = true;
     bool owns = true;
 
     Q4Matrix() = default;
     Q4Matrix(const Q4Matrix&) = delete;
     Q4Matrix& operator=(const Q4Matrix&) = delete;
-    Q4Matrix(Q4Matrix&& o) noexcept : rows(o.rows), cols(o.cols), q(o.q), d(o.d), owns(o.owns) {
-        o.q = nullptr; o.d = nullptr; o.rows = o.cols = 0; o.owns = true;
+    Q4Matrix(Q4Matrix&& o) noexcept : rows(o.rows), cols(o.cols), q(o.q), d(o.d), f16(o.f16),
+                                      planar_q4(o.planar_q4), owns(o.owns) {
+        o.q = nullptr; o.d = nullptr; o.f16 = nullptr; o.rows = o.cols = 0; o.owns = true;
     }
     Q4Matrix& operator=(Q4Matrix&& o) noexcept {
         if (this != &o) {
-            reset(); rows = o.rows; cols = o.cols; q = o.q; d = o.d; owns = o.owns;
+            reset(); rows = o.rows; cols = o.cols; q = o.q; d = o.d; f16 = o.f16;
+            planar_q4 = o.planar_q4; owns = o.owns;
             o.q = nullptr; o.d = nullptr; o.rows = o.cols = 0; o.owns = true;
         }
         return *this;
     }
     ~Q4Matrix() { reset(); }
-    void reset() { if (owns) { if (q) cudaFree(q); if (d) cudaFree(d); } q = nullptr; d = nullptr; owns = true; }
+    void reset() {
+        if (owns) {
+            if (q) cudaFree(q);
+            if (d) cudaFree(d);
+            if (f16) cudaFree(f16);
+        }
+        q = nullptr; d = nullptr; f16 = nullptr; owns = true;
+        planar_q4 = true;
+    }
 };
 
 static uint16_t load_u16(const uint8_t* p) {
@@ -961,10 +1015,70 @@ struct HostPlanarQ4 {
     int cols = 0;
     std::vector<uint8_t> q;
     std::vector<uint16_t> d_bits;
+    // 非 Q4_0 テンソルは F16 (列優先の行メジャー) として持つ。
+    bool is_f16 = false;
+    std::vector<uint16_t> f16;
 };
 
 static HostPlanarQ4 planarize_q4(const TensorInfo& t) {
-    if (t.type != GgmlType::Q4_0 || t.dims.size() != 2) throw std::runtime_error("Q4_0 2Dのみ対応: " + t.name);
+    if (t.dims.size() != 2) {
+        throw std::runtime_error(
+            "dense パスは 2D の重みだけを扱えます: " + t.name + " は " +
+            std::to_string(t.dims.size()) + "D です");
+    }
+    if (t.type != GgmlType::Q4_0) {
+        // llama.cpp が配る Q4_0 の GGUF でも output.weight は Q6_K、
+        // Llama-3.2-1B の ffn_down は Q8_0 ということが普通にある。
+        // それらは F16 に展開して F16 GEMV で走らせる (再量子化しない)。
+        //
+        // ただしこの経路は 2026-10-15 時点で A100 上の実モデルで
+        // f16_gemv_kernel が範囲外読み出しを起こすことを compute-sanitizer で
+        // 確認しており、既定では有効にしない。WARODECODE_DENSE_F16=1 を明示した
+        // ときだけ通り、既定では「Q4_0 へ変換してください」と案内して止まる。
+        static const bool dense_f16_enabled = [] {
+            const char * v = std::getenv("WARODECODE_DENSE_F16");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (!dense_f16_enabled) {
+            throw std::runtime_error(
+                "dense パスは Q4_0 の 2D テンソルだけを扱えます: " + t.name + " は " +
+                ggml_type_name(t.type) + " です"
+                "\n  llama.cpp の convert_hf_to_gguf.py --outtype q4_0 で作った GGUF でも"
+                " output.weight は Q6_K、モデルによっては ffn_down が Q8_0 になります。"
+                "\n  llama-quantize で全テンソルを Q4_0 にそろえると本エンジンで動きます。"
+                "\n  (実験的な F16 展開経路は WARODECODE_DENSE_F16=1 で有効になりますが、"
+                "現時点では実モデルで不正アクセスが出るため非推奨です)");
+        }
+        if (!ggml_type_as_f16_supported(t.type)) {
+            throw std::runtime_error(
+                "このテンソルの型は未対応です: " + t.name + " は " + ggml_type_name(t.type) +
+                "\n  dense パスが扱える型: Q4_0 / Q8_0 / Q6_K / F16 / F32"
+                "\n  Q4_K_M や Q5_K_M などの k-quant は未対応です。"
+                "\n  llama.cpp の convert_hf_to_gguf.py --outtype q4_0 で作り直すか、"
+                "qwen4exp モデルを使ってください。");
+        }
+        const int cols = static_cast<int>(t.dims[0]);
+        const int rows = static_cast<int>(t.dims[1]);
+        const int block = ggml_type_block_size(t.type);
+        if (cols <= 0 || rows <= 0 || (block > 1 && cols % block != 0)) {
+            throw std::runtime_error(
+                "列数が量子化ブロック長の倍数ではありません: " + t.name + " cols=" +
+                std::to_string(cols) + " block=" + std::to_string(block));
+        }
+        HostPlanarQ4 h;
+        h.rows = rows;
+        h.cols = cols;
+        h.is_f16 = true;
+        h.f16.resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+        const size_t row_bytes = static_cast<size_t>(cols) / static_cast<size_t>(block) *
+                                 static_cast<size_t>(ggml_type_block_bytes(t.type));
+        for (int r = 0; r < rows; ++r) {
+            ggml_dequant_to_f16(t.type, t.data + static_cast<size_t>(r) * row_bytes,
+                                h.f16.data() + static_cast<size_t>(r) * static_cast<size_t>(cols),
+                                cols);
+        }
+        return h;
+    }
     const int cols = static_cast<int>(t.dims[0]);
     const int rows = static_cast<int>(t.dims[1]);
     if (cols <= 0 || rows <= 0 || cols % 32 != 0) throw std::runtime_error("Q4_0行形状が不正: " + t.name);
@@ -988,11 +1102,43 @@ static HostPlanarQ4 concat_q4(const std::vector<HostPlanarQ4>& xs) {
     if (xs.empty()) throw std::runtime_error("空のQ4連結");
     HostPlanarQ4 out;
     out.cols = xs.front().cols;
+    bool any_f16 = false;
+    for (const auto& x : xs) any_f16 = any_f16 || x.is_f16;
+    out.is_f16 = any_f16;
     for (const auto& x : xs) {
         if (x.cols != out.cols) throw std::runtime_error("Q4連結の列数が不一致");
+        if (x.rows > 0 && x.cols > 0 && x.is_f16 != any_f16) {
+            // promote が必要: F16 側はそのまま、Q4_0 側は F16 へ展開してから連結する
+        }
         out.rows += x.rows;
-        out.q.insert(out.q.end(), x.q.begin(), x.q.end());
-        out.d_bits.insert(out.d_bits.end(), x.d_bits.begin(), x.d_bits.end());
+    }
+    if (!any_f16) {
+        for (const auto& x : xs) {
+            out.q.insert(out.q.end(), x.q.begin(), x.q.end());
+            out.d_bits.insert(out.d_bits.end(), x.d_bits.begin(), x.d_bits.end());
+        }
+        return out;
+    }
+    for (const auto& x : xs) {
+        if (x.is_f16) {
+            out.f16.insert(out.f16.end(), x.f16.begin(), x.f16.end());
+        } else {
+            // Q4_0 の planar 表現 (16 ニブル + 1 スケール per 32 値) を F16 へ。
+            for (int r = 0; r < x.rows; ++r) {
+                for (int g = 0; g < x.cols / 32; ++g) {
+                    const size_t bi = static_cast<size_t>(r) * (x.cols / 32) + g;
+                    const float d = ggml_half_to_float(x.d_bits[bi]);
+                    // ggml Q4_0 の 1 ブロックは d + qs[16] で、値 i (0..15) が
+                    // qs[i] の下位ニブル、値 i+16 が qs[i] の上位ニブル。
+                    for (int i = 0; i < 32; ++i) {
+                        const uint8_t byte = x.q[bi * 16 + (i & 15)];
+                        const int nib = (i < 16) ? (byte & 0x0f) : (byte >> 4);
+                        const __half h = __float2half(d * static_cast<float>(nib - 8));
+                        std::memcpy(&out.f16.emplace_back(), &h, sizeof(uint16_t));
+                    }
+                }
+            }
+        }
     }
     return out;
 }
@@ -1000,6 +1146,13 @@ static HostPlanarQ4 concat_q4(const std::vector<HostPlanarQ4>& xs) {
 static Q4Matrix upload_q4(const HostPlanarQ4& h) {
     Q4Matrix out;
     out.rows = h.rows; out.cols = h.cols;
+    if (h.is_f16) {
+        out.planar_q4 = false;
+        WD_CUDA(cudaMalloc(reinterpret_cast<void**>(&out.f16), h.f16.size() * sizeof(uint16_t)));
+        WD_CUDA(cudaMemcpy(out.f16, h.f16.data(), h.f16.size() * sizeof(uint16_t),
+                           cudaMemcpyHostToDevice));
+        return out;
+    }
     WD_CUDA(cudaMalloc(reinterpret_cast<void**>(&out.q), h.q.size()));
     WD_CUDA(cudaMalloc(reinterpret_cast<void**>(&out.d), h.d_bits.size() * sizeof(uint16_t)));
     WD_CUDA(cudaMemcpy(out.q, h.q.data(), h.q.size(), cudaMemcpyHostToDevice));
@@ -1093,7 +1246,11 @@ static Model load_model(const GgufFile& g) {
     Model m;
     m.arch = g.string_meta("general.architecture");
     if (m.arch != "llama" && m.arch != "qwen2" && m.arch != "qwen3") {
-        throw std::runtime_error("現段階では llama/qwen2/qwen3 のdenseモデルのみ: " + m.arch);
+        throw std::runtime_error(
+            "未対応のアーキテクチャです: " + m.arch +
+            "\n  対応: qwen4exp (Qwen3.8-Flash-Next) / llama / qwen2 / qwen3 (Q4_0 の dense GGUF のみ)"
+            "\n  llama.cpp で変換した Q4_K_M などの k-quant は dense パスでは扱えません。"
+            "\n  Q4_0 の GGUF を用意するか、docs/ を参照してください。");
     }
     m.hidden = static_cast<int>(g.uint_meta(key(m.arch, "embedding_length")));
     m.layers = static_cast<int>(g.uint_meta(key(m.arch, "block_count")));
@@ -1168,6 +1325,8 @@ static Model load_model(const GgufFile& g) {
         m.output.cols = m.token_embd.cols;
         m.output.q = m.token_embd.q;
         m.output.d = m.token_embd.d;
+        m.output.f16 = m.token_embd.f16;
+        m.output.planar_q4 = m.token_embd.planar_q4;
         m.output.owns = false;
     }
     if (m.output.rows != m.vocab || m.output.cols != m.hidden) throw std::runtime_error("output形状が不一致");
@@ -1253,7 +1412,58 @@ __global__ void q4_gemv_2row_kernel(const uint8_t* __restrict__ q,
 static int g_q4_threads_half = 256;
 static int g_q4_threads_float = 256;
 
+// F16 重みの GEMV (Q4_0 以外のテンソル用)。1 warp = 1 行、レーンが 32 要素おきに
+// 足してから warp でまとめる。速度より「どの GGUF でも動く」ことを優先した経路。
+template <bool OUT_F32>
+__global__ void f16_gemv_kernel(const __half* __restrict__ w, const __half* __restrict__ x,
+                                void* __restrict__ y, int rows, int cols) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= rows) return;
+    const __half* rowp = w + static_cast<size_t>(row) * static_cast<size_t>(cols);
+    float acc = 0.0f;
+    for (int i = lane; i < cols; i += 32) {
+        acc = fmaf(__half2float(rowp[i]), __half2float(x[i]), acc);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        if constexpr (OUT_F32) {
+            static_cast<float*>(y)[row] = acc;
+        } else {
+            static_cast<__half*>(y)[row] = __float2half(acc);
+        }
+    }
+}
+
+__global__ void embedding_f16_kernel(const __half* __restrict__ w, int hidden,
+                                     const int* __restrict__ token, __half* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden) return;
+    out[i] = w[static_cast<size_t>(*token) * static_cast<size_t>(hidden) + i];
+}
+
+static inline void launch_f16_half(const Q4Matrix& w, const __half* x, __half* y, cudaStream_t s) {
+    const int threads = 256;
+    const int blocks = (w.rows + (threads / 32) - 1) / (threads / 32);
+    f16_gemv_kernel<false><<<blocks, threads, 0, s>>>(w.f16, x, y, w.rows, w.cols);
+}
+
+static inline void launch_f16_float(const Q4Matrix& w, const __half* x, float* y, cudaStream_t s) {
+    const int threads = 256;
+    const int blocks = (w.rows + (threads / 32) - 1) / (threads / 32);
+    f16_gemv_kernel<true><<<blocks, threads, 0, s>>>(w.f16, x, y, w.rows, w.cols);
+}
+
 static inline void launch_q4_half(const Q4Matrix& w, const __half* x, __half* y, const __half* bias, cudaStream_t s) {
+    if (!w.planar_q4) {
+        if (bias != nullptr) throw std::runtime_error("F16 経路は bias 未対応");
+        launch_f16_half(w, x, y, s);
+        return;
+    }
     const int threads = g_q4_threads_half;
     const int rows_per_block = (threads / 32) * 2;
     const int blocks = (w.rows + rows_per_block - 1) / rows_per_block;
@@ -1261,6 +1471,10 @@ static inline void launch_q4_half(const Q4Matrix& w, const __half* x, __half* y,
 }
 
 static inline void launch_q4_float(const Q4Matrix& w, const __half* x, float* y, cudaStream_t s) {
+    if (!w.planar_q4) {
+        launch_f16_float(w, x, y, s);
+        return;
+    }
     const int threads = g_q4_threads_float;
     const int rows_per_block = (threads / 32) * 2;
     const int blocks = (w.rows + rows_per_block - 1) / rows_per_block;
@@ -1268,6 +1482,11 @@ static inline void launch_q4_float(const Q4Matrix& w, const __half* x, float* y,
 }
 
 static float time_q4_half(const Q4Matrix& w, const __half* x, __half* y, int threads, cudaStream_t s) {
+    if (!w.planar_q4) {
+        launch_f16_half(w, x, y, s);
+        WD_CUDA(cudaStreamSynchronize(s));
+        return 1.0f;   // autotune の候補から外れないよう固定値
+    }
     const int old = g_q4_threads_half;
     g_q4_threads_half = threads;
     for (int i = 0; i < 3; ++i) launch_q4_half(w, x, y, nullptr, s);
@@ -1284,6 +1503,11 @@ static float time_q4_half(const Q4Matrix& w, const __half* x, __half* y, int thr
 }
 
 static float time_q4_float(const Q4Matrix& w, const __half* x, float* y, int threads, cudaStream_t s) {
+    if (!w.planar_q4) {
+        launch_f16_float(w, x, y, s);
+        WD_CUDA(cudaStreamSynchronize(s));
+        return 1.0f;
+    }
     const int old = g_q4_threads_float;
     g_q4_threads_float = threads;
     for (int i = 0; i < 3; ++i) launch_q4_float(w, x, y, s);
@@ -1515,7 +1739,11 @@ struct Runtime {
 
     void emit_step() {
         const int emb_blocks = (m.hidden + 255) / 256;
-        embedding_q4_kernel<<<emb_blocks, 256, 0, stream>>>(m.token_embd.q, m.token_embd.d, m.hidden, d_token, hidden.p);
+        if (m.token_embd.planar_q4) {
+            embedding_q4_kernel<<<emb_blocks, 256, 0, stream>>>(m.token_embd.q, m.token_embd.d, m.hidden, d_token, hidden.p);
+        } else {
+            embedding_f16_kernel<<<emb_blocks, 256, 0, stream>>>(m.token_embd.f16, m.hidden, d_token, hidden.p);
+        }
 
         for (int li = 0; li < m.layers; ++li) {
             Layer& l = m.block[li];

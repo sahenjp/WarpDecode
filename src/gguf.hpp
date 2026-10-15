@@ -36,6 +36,24 @@ enum class GgmlType : uint32_t {
     BF16 = 30,
 };
 
+// モデル読み込みのエラー表示用。GGUF の型番号を人が読める名前にする
+// (未対応の型を「Q4_K_M です」と出せないと、何を用意すればよいか分からない)。
+inline const char * ggml_type_name(GgmlType type) {
+    switch (type) {
+        case GgmlType::F32: return "F32";
+        case GgmlType::F16: return "F16";
+        case GgmlType::Q4_0: return "Q4_0";
+        case GgmlType::Q8_0: return "Q8_0";
+        case GgmlType::Q6_K: return "Q6_K";
+        case GgmlType::IQ3_XXS: return "IQ3_XXS";
+        case GgmlType::IQ4_NL: return "IQ4_NL";
+        case GgmlType::IQ3_S: return "IQ3_S";
+        case GgmlType::IQ2_S: return "IQ2_S";
+        case GgmlType::BF16: return "BF16";
+    }
+    return "unknown";
+}
+
 class MappedFile {
 public:
     explicit MappedFile(const std::string& path) {
