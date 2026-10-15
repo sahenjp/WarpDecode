@@ -559,6 +559,10 @@ constexpr int kQ38HcQ8PipeMinBlocks = 32;
 // with the pipeline enabled). Below the threshold the same kernel is 1.2-1.4x
 // faster than the plain dp4a kernel.
 constexpr int kQ38HcQ8PipeMaxRows = 1024;
+// A row this long is a pure walk over the weight stream and keeps gaining from a
+// deeper pipeline (A100 [320, 10240]: PIPE=16 25.9 us, PIPE=24 24.8 us,
+// PIPE=32 23.3 us). Shorter rows do not (they are launch/round-trip bound).
+constexpr int kQ38HcQ8PipeWideBlocks = 128;
 
 template <int PIPE>
 __global__ void q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_pipe_kernel(
@@ -1027,6 +1031,11 @@ inline void q38_hc_launch_exact_q8_0_gemv_f32(
     if (q38_hc_q8_down_dp4a_enabled() && cols % 32 == 0) {
         if (q38_hc_q8_pipe_enabled() && (cols >> 5) >= kQ38HcQ8PipeMinBlocks &&
             rows <= kQ38HcQ8PipeMaxRows) {
+            if ((cols >> 5) >= kQ38HcQ8PipeWideBlocks) {
+                q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_pipe_kernel<32><<<blocks, threads, 0, stream>>>(
+                    weight, activation, activation_scales, output, rows, cols);
+                return;
+            }
             q38_hc_q8_0_q8_0_exact_gemv_f32_dp4a_pipe_kernel<16><<<blocks, threads, 0, stream>>>(
                 weight, activation, activation_scales, output, rows, cols);
             return;

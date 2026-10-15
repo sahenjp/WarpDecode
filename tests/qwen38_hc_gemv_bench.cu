@@ -299,8 +299,8 @@ int main() {
     Timer timer;
 
     struct Shape { int rows, cols; const char * tag; };
-    const Shape shapes[] = {{320, 10240, "hc down"}, {10240, 320, "hc up"},
-                            {640, 2560, "shexp gate/up"}, {2560, 640, "shexp down"}};
+    const Shape shapes[] = {{320, 10240, "hc down"}, {640, 2560, "shexp gate/up"},
+                            {16, 2560, "gdn beta"}, {48, 2560, "gdn alpha"}};
 
     for (const Shape & s : shapes) {
         const size_t wbytes = (size_t)s.rows * (s.cols / 32) * 34u;
@@ -356,6 +356,8 @@ int main() {
         bench("pipe 4", [&] { k_pipe<4><<<blocks, threads>>>(dw, da, ds, out1, s.rows, s.cols); });
         bench("pipe 8", [&] { k_pipe<8><<<blocks, threads>>>(dw, da, ds, out1, s.rows, s.cols); });
         bench("pipe 16", [&] { k_pipe<16><<<blocks, threads>>>(dw, da, ds, out1, s.rows, s.cols); });
+        bench("pipe 24", [&] { k_pipe<24><<<blocks, threads>>>(dw, da, ds, out1, s.rows, s.cols); });
+        bench("pipe 32", [&] { k_pipe<32><<<blocks, threads>>>(dw, da, ds, out1, s.rows, s.cols); });
 
         std::printf("\n%-16s %5dx%-6d  %.1f KB  ref(scalar) %8.1f us  %7.1f GB/s\n",
                     s.tag, s.rows, s.cols, bytes / 1024.0, us0,

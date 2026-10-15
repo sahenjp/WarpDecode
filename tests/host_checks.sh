@@ -81,6 +81,11 @@ bash tests/qwen38_hc_legacy_skip_host_check.sh
 # Task G: expert 統合 MoE の加算順序と index 対応が従来と bit 一致することを確認する
 bash tests/moe_fused_grid_host_check.sh
 
+# Task W: routed expert の IQ2_S / IQ4_NL GEMV を ILP 段のソフトウェアパイプラインにしても
+# アキュムレータが消費する順序と float チェーンが変わらないこと (短い行・グループ/テール境界を含む)
+# を確認する
+bash tests/qwen38_expert_ilp_host_check.sh
+
 # Task N: CPU MoE の AVX2 カーネルがスカラー双対・int64 厳密ドット、および pinned llama.cpp の
 # AVX2 カーネル本文と bit 一致することを確認する (nvcc 不要)
 bash tests/qwen38_cpu_moe_host_check.sh
