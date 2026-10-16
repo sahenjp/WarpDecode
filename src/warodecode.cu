@@ -1358,7 +1358,26 @@ __global__ void embedding_q4_kernel(const uint8_t* q, const __half* d, int cols,
     out[c] = __float2half(static_cast<float>(qi) * half_to_float(d[bi]));
 }
 
-__global__ void rmsnorm_kernel(const __half* x, const __half* w, __half* y, int n, float eps) {
+// 32 値を 1 スレッドで Q8_0 に量子化する (ブロック単位で完結するので同期不要)。
+__device__ __forceinline__ void dense_quantize_block(const __half* p, int8_t* qd, __half* d) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(__half2float(p[i])));
+    const float scale = amax / 127.0f;
+    const float inv = amax == 0.0f ? 0.0f : 127.0f / amax;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        int q = static_cast<int>(lrintf(__half2float(p[i]) * inv));
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        qd[i] = static_cast<int8_t>(q);
+    }
+    *d = __float2half(scale);
+}
+
+// rmsnorm しつつ、続く GEMV 用に Q8_0 活性も同じカーネルで書く (活性量子化
+// カーネルを 1 層あたり 2 回ぶん消せる)。qs/d は nullptr 可。
+__global__ void rmsnorm_kernel(const __half* x, const __half* w, __half* y, int n, float eps,
+                               int8_t* qs, __half* ds) {
     __shared__ float smem[256];
     float s = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -1374,6 +1393,44 @@ __global__ void rmsnorm_kernel(const __half* x, const __half* w, __half* y, int 
     const float inv = rsqrtf(smem[0] / static_cast<float>(n) + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         y[i] = __float2half(half_to_float(x[i]) * inv * half_to_float(w[i]));
+    }
+    if (qs != nullptr && ds != nullptr) {
+        __syncthreads();   // y を全スレッドが書き終えてから読む
+        const int blocks = n >> 5;
+        for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
+            dense_quantize_block(y + b * 32, qs + b * 32, ds + b);
+        }
+    }
+}
+
+// 残差加算 + rmsnorm + 活性量子化を 1 回で行う (1 層あたり 2 回の残差加算と
+// 2 回の量子化カーネルを消せる)。proj が nullptr なら加算なし。
+__global__ void residual_rmsnorm_kernel(__half* hidden, const __half* proj, const __half* w,
+                                        __half* y, int n, float eps, int8_t* qs, __half* ds) {
+    __shared__ float smem[256];
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = half_to_float(hidden[i]);
+        if (proj != nullptr) v += half_to_float(proj[i]);
+        hidden[i] = __float2half(v);
+        s = fmaf(v, v, s);
+    }
+    smem[threadIdx.x] = s;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (threadIdx.x < stride) smem[threadIdx.x] += smem[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(smem[0] / static_cast<float>(n) + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        y[i] = __float2half(half_to_float(hidden[i]) * inv * half_to_float(w[i]));
+    }
+    if (qs != nullptr && ds != nullptr) {
+        __syncthreads();
+        const int blocks = n >> 5;
+        for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
+            dense_quantize_block(y + b * 32, qs + b * 32, ds + b);
+        }
     }
 }
 
@@ -1479,6 +1536,7 @@ __global__ void q4_0_q8_0_gemv_kernel(const uint8_t* __restrict__ q,
                                       const __half* __restrict__ d,
                                       const int8_t* __restrict__ aq,
                                       const __half* __restrict__ ad,
+                                      const __half* __restrict__ bias,
                                       void* __restrict__ y, int rows, int cols) {
     DENSE_GEMV_GEOMETRY
     const uint8_t* row_q = q + static_cast<size_t>(row) * blocks * 16u;
@@ -1497,6 +1555,7 @@ __global__ void q4_0_q8_0_gemv_kernel(const uint8_t* __restrict__ q,
 #pragma unroll
     for (int o = 8; o > 0; o >>= 1) sumf += __shfl_down_sync(0xffffffffu, sumf, o, 16);
     if (slane == 0) {
+        if (bias != nullptr) sumf += __half2float(bias[row]);
         if constexpr (OUT_F32) static_cast<float*>(y)[row] = sumf;
         else static_cast<__half*>(y)[row] = __float2half(sumf);
     }
@@ -1666,9 +1725,9 @@ __global__ void add_bias_half_kernel(__half* __restrict__ y, const __half* __res
 }
 
 static inline void launch_q8_half(const Q4Matrix& w, const __half* x, __half* y,
-                                   const __half* bias, cudaStream_t s) {
+                                   const __half* bias, cudaStream_t s, bool act_ready = false) {
     const int threads = 256;
-    dense_quantize_activation(x, w.cols, s);
+    if (!act_ready) dense_quantize_activation(x, w.cols, s);
     q8_0_q8_0_gemv_kernel<false><<<dense_gemv_blocks(w.rows, threads), threads, 0, s>>>(
         w.q8, g_dense_act_qs, g_dense_act_d, y, w.rows, w.cols);
     if (bias != nullptr) {
@@ -1676,36 +1735,36 @@ static inline void launch_q8_half(const Q4Matrix& w, const __half* x, __half* y,
     }
 }
 
-static inline void launch_q8_float(const Q4Matrix& w, const __half* x, float* y, cudaStream_t s) {
+static inline void launch_q8_float(const Q4Matrix& w, const __half* x, float* y,
+                                   cudaStream_t s, bool act_ready = false) {
     const int threads = 256;
-    dense_quantize_activation(x, w.cols, s);
+    if (!act_ready) dense_quantize_activation(x, w.cols, s);
     q8_0_q8_0_gemv_kernel<true><<<dense_gemv_blocks(w.rows, threads), threads, 0, s>>>(
         w.q8, g_dense_act_qs, g_dense_act_d, y, w.rows, w.cols);
 }
 
-static inline void launch_q4_half(const Q4Matrix& w, const __half* x, __half* y, const __half* bias, cudaStream_t s) {
+static inline void launch_q4_half(const Q4Matrix& w, const __half* x, __half* y,
+                                  const __half* bias, cudaStream_t s, bool act_ready = false) {
     if (!w.planar_q4) {
         launch_q8_half(w, x, y, bias, s);
         return;
     }
     const int threads = g_q4_threads_half;
-    dense_quantize_activation(x, w.cols, s);
+    if (!act_ready) dense_quantize_activation(x, w.cols, s);
     q4_0_q8_0_gemv_kernel<false><<<dense_gemv_blocks(w.rows, threads), threads, 0, s>>>(
-        w.q, w.d, g_dense_act_qs, g_dense_act_d, y, w.rows, w.cols);
-    if (bias != nullptr) {
-        add_bias_half_kernel<<<(w.rows + 255) / 256, 256, 0, s>>>(y, bias, w.rows);
-    }
+        w.q, w.d, g_dense_act_qs, g_dense_act_d, bias, y, w.rows, w.cols);
 }
 
-static inline void launch_q4_float(const Q4Matrix& w, const __half* x, float* y, cudaStream_t s) {
+static inline void launch_q4_float(const Q4Matrix& w, const __half* x, float* y,
+                                   cudaStream_t s, bool act_ready = false) {
     if (!w.planar_q4) {
         launch_q8_float(w, x, y, s);
         return;
     }
     const int threads = g_q4_threads_float;
-    dense_quantize_activation(x, w.cols, s);
+    if (!act_ready) dense_quantize_activation(x, w.cols, s);
     q4_0_q8_0_gemv_kernel<true><<<dense_gemv_blocks(w.rows, threads), threads, 0, s>>>(
-        w.q, w.d, g_dense_act_qs, g_dense_act_d, y, w.rows, w.cols);
+        w.q, w.d, g_dense_act_qs, g_dense_act_d, nullptr, y, w.rows, w.cols);
 }
 
 static float time_q4_half(const Q4Matrix& w, const __half* x, __half* y, int threads, cudaStream_t s) {
@@ -1892,12 +1951,34 @@ __global__ void residual_add_kernel(__half* x, const __half* y, int n) {
     }
 }
 
-__global__ void swiglu_kernel(const __half* gate_up, __half* out, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+// swiglu + 活性量子化。ワープの 32 レーンがちょうど 1 ブロック (32 値) になる
+// ので、shuffle だけでブロックのスケールが求まる。
+__global__ void swiglu_kernel(const __half* gate_up, __half* out, int n,
+                              int8_t* qs, __half* ds) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = i < n;
+    float v = 0.0f;
+    if (active) {
         const float g = half_to_float(gate_up[i]);
         const float u = half_to_float(gate_up[n + i]);
         const float silu = g / (1.0f + expf(-g));
-        out[i] = __float2half(silu * u);
+        v = silu * u;
+    }
+    float amax = active ? fabsf(v) : 0.0f;
+    if (qs != nullptr && ds != nullptr) {
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    }
+    if (active) {
+        out[i] = __float2half(v);
+        if (qs != nullptr && ds != nullptr) {
+            const float scale = amax / 127.0f;
+            const float inv = amax == 0.0f ? 0.0f : 127.0f / amax;
+            int q = static_cast<int>(lrintf(v * inv));
+            q = q > 127 ? 127 : (q < -127 ? -127 : q);
+            qs[i] = static_cast<int8_t>(q);
+            if ((i & 31) == 0) ds[i >> 5] = __float2half(scale);
+        }
     }
 }
 
@@ -1978,10 +2059,14 @@ struct Runtime {
                 m.token_embd.q8, m.hidden, d_token, hidden.p);
         }
 
+        const __half* pending_residual = nullptr;   // 直前の層の出力 (層 0 は無し)
         for (int li = 0; li < m.layers; ++li) {
             Layer& l = m.block[li];
-            rmsnorm_kernel<<<1, 256, 0, stream>>>(hidden.p, l.attn_norm.p, norm.p, m.hidden, m.rms_eps);
-            launch_q4_half(l.qkv, norm.p, qkv.p, l.qkv_bias.p, stream);
+            // 残差加算 + rmsnorm + Q8_0 活性化を 1 カーネルで。
+            residual_rmsnorm_kernel<<<1, 256, 0, stream>>>(
+                hidden.p, pending_residual, l.attn_norm.p, norm.p, m.hidden, m.rms_eps,
+                g_dense_act_qs, g_dense_act_d);
+            launch_q4_half(l.qkv, norm.p, qkv.p, l.qkv_bias.p, stream, /*act_ready=*/true);
             if (l.q_norm.p || l.k_norm.p) {
                 qk_norm_kernel<<<m.heads + m.kv_heads, 256, 0, stream>>>(qkv.p, l.q_norm.p, l.k_norm.p, m.heads, m.kv_heads, m.head_dim, m.rms_eps);
             }
@@ -1994,16 +2079,21 @@ struct Runtime {
             attn_threads = std::max(32, std::min(256, attn_threads));
             attention_decode_kernel<<<m.heads, attn_threads, 0, stream>>>(qkv.p, kc, vc, attn.p, d_pos, m.heads, m.kv_heads, m.head_dim);
             launch_q4_half(l.o, attn.p, proj.p, nullptr, stream);
-            residual_add_kernel<<<std::min(64, (m.hidden + 255) / 256), 256, 0, stream>>>(hidden.p, proj.p, m.hidden);
+            pending_residual = proj.p;
 
-            rmsnorm_kernel<<<1, 256, 0, stream>>>(hidden.p, l.ffn_norm.p, norm.p, m.hidden, m.rms_eps);
-            launch_q4_half(l.gate_up, norm.p, gate_up.p, nullptr, stream);
-            swiglu_kernel<<<std::min(128, (m.ffn + 255) / 256), 256, 0, stream>>>(gate_up.p, mlp.p, m.ffn);
-            launch_q4_half(l.down, mlp.p, proj.p, nullptr, stream);
-            residual_add_kernel<<<std::min(64, (m.hidden + 255) / 256), 256, 0, stream>>>(hidden.p, proj.p, m.hidden);
+            residual_rmsnorm_kernel<<<1, 256, 0, stream>>>(
+                hidden.p, pending_residual, l.ffn_norm.p, norm.p, m.hidden, m.rms_eps,
+                g_dense_act_qs, g_dense_act_d);
+            launch_q4_half(l.gate_up, norm.p, gate_up.p, nullptr, stream, /*act_ready=*/true);
+            swiglu_kernel<<<std::min(128, (m.ffn + 255) / 256), 256, 0, stream>>>(
+                gate_up.p, mlp.p, m.ffn, g_dense_act_qs, g_dense_act_d);
+            launch_q4_half(l.down, mlp.p, proj.p, nullptr, stream, /*act_ready=*/true);
+            pending_residual = proj.p;
         }
-        rmsnorm_kernel<<<1, 256, 0, stream>>>(hidden.p, m.output_norm.p, norm.p, m.hidden, m.rms_eps);
-        launch_q4_float(m.output, norm.p, logits.p, stream);
+        residual_rmsnorm_kernel<<<1, 256, 0, stream>>>(
+            hidden.p, pending_residual, m.output_norm.p, norm.p, m.hidden, m.rms_eps,
+            g_dense_act_qs, g_dense_act_d);
+        launch_q4_float(m.output, norm.p, logits.p, stream, /*act_ready=*/true);
         dense_ensure_argmax(m.vocab);
         dense_argmax_init_kernel<<<1, 1, 0, stream>>>(g_dense_argmax_key, dense_argmax_identity());
         dense_argmax_reduce_kernel<<<g_dense_argmax_blocks, 256, 0, stream>>>(
